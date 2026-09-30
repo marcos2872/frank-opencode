@@ -83,12 +83,16 @@ impl AppConfig {
             .join("config.toml")
     }
 
-    /// Load from file if present, else defaults. Never fails on missing file.
-    pub fn load(explicit: Option<PathBuf>) -> Self {
+    /// Load from file if present, else defaults.
+    /// A present-but-invalid file is an error (fail fast instead of
+    /// silently running with wrong port / dropped aliases).
+    pub fn load(explicit: Option<PathBuf>) -> Result<Self, String> {
         let path = Self::config_path(explicit);
         let mut cfg = match std::fs::read_to_string(&path) {
-            Ok(text) => toml::from_str(&text).unwrap_or_default(),
-            Err(_) => Self::default(),
+            Ok(text) => toml::from_str(&text)
+                .map_err(|e| format!("invalid config {}: {e}", path.display()))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),
+            Err(e) => return Err(format!("cannot read config {}: {e}", path.display())),
         };
         // Env overrides (FRANK_PORT / FRANK_AUTH_TOKEN).
         if let Ok(p) = std::env::var("FRANK_PORT") {
@@ -101,7 +105,7 @@ impl AppConfig {
                 cfg.auth_token = t;
             }
         }
-        cfg
+        Ok(cfg)
     }
 
     pub fn data_dir() -> PathBuf {
@@ -124,9 +128,20 @@ mod tests {
 
     #[test]
     fn missing_file_gives_defaults() {
-        let cfg = AppConfig::load(Some(PathBuf::from("/nonexistent-frank-test/config.toml")));
+        let cfg =
+            AppConfig::load(Some(PathBuf::from("/nonexistent-frank-test/config.toml"))).unwrap();
         assert_eq!(cfg.port, DEFAULT_PORT);
         assert!(cfg.aliases.is_empty());
+    }
+
+    #[test]
+    fn invalid_file_is_an_error_not_silent_defaults() {
+        let dir = std::env::temp_dir().join("frank-cfg-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("bad.toml");
+        std::fs::write(&path, "port = \"not-a-number\"\n").unwrap();
+        let err = AppConfig::load(Some(path)).unwrap_err();
+        assert!(err.contains("invalid config"), "{err}");
     }
 
     #[test]

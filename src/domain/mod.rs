@@ -94,6 +94,60 @@ pub struct AliasEntry {
     pub description: String,
 }
 
+/// Upstream wire protocol for a provider package.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Protocol {
+    Anthropic,
+    ChatCompletions,
+    Responses,
+}
+
+/// Map an OpenCode provider `package` to its wire protocol.
+///
+/// Explicit table first; unknown packages fall back to ChatCompletions with a
+/// `warn!` at the call site (pass provider_id + package for the log).
+pub fn protocol_for(package: &str) -> Protocol {
+    if package.contains("anthropic") {
+        Protocol::Anthropic
+    } else if package == "@opencode/ai/providers/openai" || package.contains("openai/responses") {
+        Protocol::Responses
+    } else {
+        Protocol::ChatCompletions
+    }
+}
+
+/// Returns true when the package is not one of the known shapes, so the
+/// caller can `warn!` (include provider_id + package). The gateway still
+/// routes it via the ChatCompletions fallback.
+pub fn is_known_package(package: &str) -> bool {
+    const KNOWN: [&str; 12] = [
+        "anthropic",
+        "openai",
+        "openrouter",
+        "google",
+        "vertex",
+        "azure",
+        "bedrock",
+        "xai",
+        "ollama",
+        "lmstudio",
+        "vllm",
+        "copilot",
+    ];
+    KNOWN.iter().any(|k| package.contains(k))
+}
+
+/// Strip a context-window hint suffix such as `[1m]` / `[200k]` that Claude
+/// Code appends to unknown gateway model ids. Returns the base id.
+pub fn strip_window_suffix(s: &str) -> &str {
+    let lower = s.to_lowercase();
+    for suffix in ["[1m]", "[200k]"] {
+        if lower.ends_with(suffix) {
+            return &s[..s.len() - suffix.len()];
+        }
+    }
+    s
+}
 /// Sanitize a model id into a URL/claude-safe slug.
 pub fn slugify(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -172,5 +226,39 @@ mod tests {
             slugify("OpenRouter/Claude Sonnet 4.5"),
             "openrouter-claude-sonnet-4-5"
         );
+    }
+
+    #[test]
+    fn protocol_table() {
+        use Protocol::*;
+        assert_eq!(protocol_for("@opencode/ai/providers/anthropic"), Anthropic);
+        assert_eq!(
+            protocol_for("@opencode/ai/providers/anthropic-compatible"),
+            Anthropic
+        );
+        assert_eq!(protocol_for("@opencode/ai/providers/openai"), Responses);
+        assert_eq!(
+            protocol_for("@opencode/ai/providers/openai/responses"),
+            Responses
+        );
+        assert_eq!(
+            protocol_for("@opencode/ai/providers/openai-compatible"),
+            ChatCompletions
+        );
+        assert_eq!(
+            protocol_for("@opencode/ai/providers/openrouter"),
+            ChatCompletions
+        );
+        assert!(is_known_package("@opencode/ai/providers/openrouter"));
+        assert!(!is_known_package("@acme/custom-thing"));
+        assert_eq!(protocol_for("@acme/custom-thing"), ChatCompletions);
+    }
+
+    #[test]
+    fn strips_window_hint_suffix() {
+        assert_eq!(strip_window_suffix("claude-x[1m]"), "claude-x");
+        assert_eq!(strip_window_suffix("claude-x[200K]"), "claude-x");
+        assert_eq!(strip_window_suffix("claude-x"), "claude-x");
+        assert_eq!(strip_window_suffix("a/b[1m]"), "a/b");
     }
 }

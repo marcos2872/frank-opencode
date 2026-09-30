@@ -5,6 +5,10 @@ edition = "2021"
 description = "Local Anthropic-compatible gateway exposing OpenCode models to Claude Code"
 license = "MIT"
 
+[lib]
+name = "frank_opencode"
+path = "src/lib.rs"
+
 [[bin]]
 name = "frank-opencode"
 path = "src/main.rs"
@@ -12,8 +16,7 @@ path = "src/main.rs"
 [dependencies]
 axum = { version = "0.7", features = ["macros"] }
 tokio = { version = "1", features = ["full"] }
-tower = "0.4"
-tower-http = { version = "0.5", features = ["cors", "trace"] }
+tower-http = { version = "0.5", features = ["trace"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }

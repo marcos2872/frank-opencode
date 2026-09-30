@@ -2,6 +2,7 @@
 port = 3737
 
 # Token Claude Code sends (ANTHROPIC_AUTH_TOKEN). Empty = accept any (localhost only).
+# When set, all endpoints except /health require it (x-api-key or Authorization: Bearer).
 auth_token = ""
 
 # Used when the client omits "model". Defaults to the first alias if empty.

@@ -191,9 +191,10 @@ pub fn anthropic_to_openai(body: &Value, upstream_model: &str) -> Value {
             .collect();
         out["tools"] = Value::Array(mapped);
         if let Some(tc) = body.get("tool_choice") {
-            // Anthropic {"type":"auto"|"any"|"tool",...} -> OpenAI "auto"|"required"|{"type":"function",...}
+            // Anthropic {"type":"auto"|"any"|"tool"|"none",...} -> OpenAI Chat.
             let choice = match tc.get("type").and_then(|t| t.as_str()) {
                 Some("any") => serde_json::json!("required"),
+                Some("none") => serde_json::json!("none"),
                 Some("tool") => {
                     if let Some(name) = tc.get("name").and_then(|n| n.as_str()) {
                         serde_json::json!({"type":"function","function":{"name":name}})
@@ -460,8 +461,10 @@ pub fn anthropic_to_responses(body: &Value, upstream_model: &str) -> Value {
             .collect();
         out["tools"] = Value::Array(mapped);
         if let Some(tc) = body.get("tool_choice") {
+            // Responses API accepts "auto" | "required" | "none" | {"type":"function",...}.
             out["tool_choice"] = match tc.get("type").and_then(|t| t.as_str()) {
                 Some("any") => serde_json::json!("required"),
+                Some("none") => serde_json::json!("none"),
                 Some("tool") => {
                     if let Some(name) = tc.get("name").and_then(|n| n.as_str()) {
                         serde_json::json!({"type":"function","name":name})
@@ -932,6 +935,32 @@ pub fn sse(v: &Value) -> String {
     )
 }
 
+/// Wrap a byte stream, injecting `event: ping` SSE frames whenever the
+/// upstream stays silent longer than `idle`. Keeps the client's stream
+/// watchdog fed during long reasoning pauses.
+pub fn with_heartbeat<S>(
+    stream: S,
+    idle: std::time::Duration,
+) -> impl futures::Stream<Item = Result<Vec<u8>, std::io::Error>>
+where
+    S: futures::Stream<Item = Result<Vec<u8>, std::io::Error>>,
+{
+    async_stream::stream! {
+        let mut inner = Box::pin(stream);
+        loop {
+            match tokio::time::timeout(idle, futures::StreamExt::next(&mut inner)).await {
+                Ok(Some(item)) => yield item,
+                Ok(None) => break,
+                Err(_) => {
+                    yield Ok::<_, std::io::Error>(
+                        "event: ping\ndata: {\"type\": \"ping\"}\n\n".as_bytes().to_vec(),
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// Rough token estimate for the optional count_tokens endpoint.
 pub fn estimate_tokens(body: &Value) -> u64 {
     let s = body.to_string();
@@ -970,6 +999,20 @@ mod tests {
         // tool result becomes tool role
         assert!(msgs.iter().any(|m| m["role"] == "tool"));
         assert_eq!(oai["tools"][0]["function"]["name"], "Read");
+    }
+
+    #[test]
+    fn tool_choice_none_maps_to_none() {
+        for f in [anthropic_to_openai, anthropic_to_responses] {
+            let body = serde_json::json!({
+                "model": "x",
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{"name": "Read", "description": "d", "input_schema": {"type": "object"}}],
+                "tool_choice": {"type": "none"},
+                "max_tokens": 5
+            });
+            assert_eq!(f(&body, "up")["tool_choice"], "none");
+        }
     }
 
     #[test]
@@ -1064,5 +1107,25 @@ mod tests {
         assert!(t.has_tools());
         let end = t.finish("tool_use", 3);
         assert!(end.iter().any(|e| e.contains("message_stop")));
+    }
+
+    // Short real-time durations (no paused clock needed).
+    #[tokio::test]
+    async fn heartbeat_fires_during_silence() {
+        use futures::StreamExt;
+        use std::time::Duration;
+        let slow = async_stream::stream! {
+            tokio::time::sleep(Duration::from_millis(180)).await;
+            yield Ok::<_, std::io::Error>(b"data".to_vec());
+        };
+        let mut hb = Box::pin(with_heartbeat(slow, Duration::from_millis(50)));
+        // ~50/100/150ms: pings; then the payload.
+        for _ in 0..3 {
+            let item = hb.next().await.unwrap().unwrap();
+            assert!(String::from_utf8_lossy(&item).contains("ping"));
+        }
+        let item = hb.next().await.unwrap().unwrap();
+        assert_eq!(item, b"data".to_vec());
+        assert!(hb.next().await.is_none());
     }
 }

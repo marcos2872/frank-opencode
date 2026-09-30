@@ -113,11 +113,14 @@ curl -s -X POST "$ANTHROPIC_BASE_URL/v1/messages" \
 | Symptom | Cause / fix |
 |---|---|
 | `401` “no stored credential for 'X'” | Run `opencode auth login` for that provider. |
+| `401` “invalid gateway credential” | `auth_token` is set in config: `ANTHROPIC_AUTH_TOKEN` must match it. |
 | `MissingSessionID` from Go | frank-opencode < 0.1.1; upgrade (session headers are now automatic). |
 | `FreeTierError` on `opencode/*` models | Console free tier only works inside OpenCode; those models are hidden from `/v1/models` by default (`include_free_tier = true` to show). Use an `opencode-go/*` model. |
 | Empty output with tiny `max_tokens` | Reasoning models spend budget in reasoning first; raise `max_tokens` (Claude Code does this by default). |
 | Models missing from `/model` | Set `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1`; ids must contain `claude`/`anthropic` (auto aliases do). |
 | `400` naming `context_management`/`output_config` | Upstream rejects a pre-release field; retry with `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1`. |
+| `"X" isn't described by this version's model catalog` | Expected: gateway ids are synthetic, so Claude Code assumes a 200k window. Map the alias with `behavesAs`/`modelOverrides` to the closest Claude model, append `[1m]` to the model name for 1M windows (the gateway strips it), or set `CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT=1`. |
+| `Waiting for API response · will retry` (stalls) | Long reasoning pauses with no stream bytes. The gateway injects `ping` frames during upstream silence; if it persists, check `frank.log` for upstream errors and consider raising `API_TIMEOUT_MS`. |
 
 ## Auto-mode notice ("session isn't eligible...")
 
@@ -136,9 +139,19 @@ tiny model requests billed as normal Go usage.
 ## Security
 
 - Binds `127.0.0.1` only. DB opened `READ_ONLY`. Secrets stay in memory (`secrecy`), never logged.
-- `~/.local/share/opencode/*` and pid/session files should remain `0600`.
+- State files (`frank.pid`, `frank.port`, `frank.session`, `frank.log`) are created `0600`.
+- When `auth_token` is set, every endpoint except `/health` requires it
+  (`x-api-key` or `Authorization: Bearer`).
+
+## Health
+
+`GET /health` (no auth) reports `ok` / `degraded` / `starting`, the model count,
+the effective default model, and `last_error` from the background catalog
+refresh (every `refresh_interval_secs`, min 60s).
 
 ## Limits (MVP)
 
-- `#variant` suffixes ignored. `count_tokens` is a char-based estimate.
+- `#variant` suffixes ignored. `count_tokens` is a rough char-based estimate.
 - Free-tier `opencode/*` models are blocked upstream outside OpenCode (hidden by default).
+- `frank.log` is append-only: truncate it occasionally (`: > frank.log`).
+- `--enable` refuses a different `--port` while running; `--disable` first.

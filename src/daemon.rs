@@ -36,40 +36,43 @@ fn pid_alive(pid: u32) -> bool {
     sys.process(Pid::from_u32(pid)).is_some()
 }
 
-fn health_ok(port: u16) -> bool {
-    let url = format!("http://127.0.0.1:{port}/health");
-    std::net::TcpStream::connect_timeout(
-        &format!("127.0.0.1:{port}").parse().unwrap(),
-        std::time::Duration::from_millis(300),
-    )
-    .is_ok()
-        && reqwest_blocking_health(&url)
-}
-
-fn reqwest_blocking_health(url: &str) -> bool {
-    // Minimal blocking GET without adding a blocking http client dep:
-    // use curl-less raw request via TCP would be overkill; shell out to the
-    // same binary path is unnecessary — a TCP connect + short HTTP probe:
+/// Single-connection health probe: TCP connect + `GET /health`, expect 200.
+/// (Previously this was two separate connects under a confusing name.)
+fn gateway_healthy(port: u16) -> bool {
     use std::io::{Read, Write};
     use std::net::TcpStream;
     use std::time::Duration;
-    let host_port = url
-        .trim_start_matches("http://")
-        .split('/')
-        .next()
-        .unwrap_or("");
-    let Ok(mut s) =
-        TcpStream::connect_timeout(&host_port.parse().unwrap(), Duration::from_millis(500))
-    else {
+    let addr: std::net::SocketAddr = match format!("127.0.0.1:{port}").parse() {
+        Ok(a) => a,
+        Err(_) => return false,
+    };
+    let Ok(mut s) = TcpStream::connect_timeout(&addr, Duration::from_millis(500)) else {
         return false;
     };
-    let _ = s.set_read_timeout(Some(Duration::from_millis(800)));
-    let _ = s.write_all(b"GET /health HTTP/1.0\r\nHost: x\r\n\r\n");
-    let mut buf = [0u8; 512];
+    let _ = s.set_read_timeout(Some(Duration::from_millis(1500)));
+    let _ = s.write_all(b"GET /health HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n");
+    let mut buf = [0u8; 1024];
     let Ok(n) = s.read(&mut buf) else {
         return false;
     };
     String::from_utf8_lossy(&buf[..n]).contains("200")
+}
+
+/// Write a small state file with owner-only permissions (0600 on unix).
+/// The README asks for 0600; `fs::write` alone would follow the umask (0644).
+pub(crate) fn write_private(path: PathBuf, content: &str) -> std::io::Result<()> {
+    use std::fs::OpenOptions;
+    let mut opts = OpenOptions::new();
+    opts.create(true).truncate(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(path).and_then(|mut f| {
+        use std::io::Write;
+        f.write_all(content.as_bytes())
+    })
 }
 
 pub fn stored_port() -> Option<u16> {
@@ -80,9 +83,15 @@ pub fn stored_port() -> Option<u16> {
 pub fn enable(port: u16, config_arg: Option<PathBuf>) -> anyhow::Result<()> {
     if let Some(pid) = read_pid() {
         if pid_alive(pid) {
-            let p = stored_port().unwrap_or(port);
-            println!("frank-opencode already running (pid {pid}, port {p})");
-            print_next_steps(p);
+            let running = stored_port().unwrap_or(crate::config::DEFAULT_PORT);
+            if running != port {
+                anyhow::bail!(
+                    "frank-opencode already running on :{running} (pid {pid}); \
+                     run `frank-opencode --disable` first to move it to :{port}"
+                );
+            }
+            println!("frank-opencode already running (pid {pid}, port {running})");
+            print_next_steps(running);
             return Ok(());
         }
         let _ = fs::remove_file(pid_file());
@@ -93,6 +102,11 @@ pub fn enable(port: u16, config_arg: Option<PathBuf>) -> anyhow::Result<()> {
         .create(true)
         .append(true)
         .open(log_file())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(log_file(), std::fs::Permissions::from_mode(0o600));
+    }
     let log_err = log.try_clone()?;
     let mut cmd = Command::new(exe);
     cmd.arg("--serve")
@@ -117,13 +131,13 @@ pub fn enable(port: u16, config_arg: Option<PathBuf>) -> anyhow::Result<()> {
         }
     }
     let child = cmd.spawn()?;
-    fs::write(pid_file(), child.id().to_string())?;
-    fs::write(port_file(), port.to_string())?;
+    write_private(pid_file(), &child.id().to_string())?;
+    write_private(port_file(), &port.to_string())?;
 
-    // Wait for health (up to ~8s: catalog fetch can be slow on first run).
+    // Wait for health (catalog now loads in background, so this is fast).
     for _ in 0..40 {
         std::thread::sleep(std::time::Duration::from_millis(200));
-        if health_ok(port) {
+        if gateway_healthy(port) {
             println!(
                 "frank-opencode enabled on http://127.0.0.1:{port} (pid {})",
                 child.id()
@@ -151,6 +165,7 @@ pub fn disable() -> anyhow::Result<()> {
     };
     if !pid_alive(pid) {
         let _ = fs::remove_file(pid_file());
+        let _ = fs::remove_file(port_file());
         println!("frank-opencode was not running (stale pidfile removed)");
         return Ok(());
     }
@@ -173,6 +188,7 @@ pub fn disable() -> anyhow::Result<()> {
         anyhow::bail!("could not stop pid {pid}; kill it manually");
     }
     let _ = fs::remove_file(pid_file());
+    let _ = fs::remove_file(port_file());
     println!("frank-opencode disabled (pid {pid} stopped)");
     Ok(())
 }
@@ -181,7 +197,7 @@ pub fn status() -> anyhow::Result<()> {
     match read_pid() {
         Some(pid) if pid_alive(pid) => {
             let port = stored_port().unwrap_or(crate::config::DEFAULT_PORT);
-            let h = if health_ok(port) {
+            let h = if gateway_healthy(port) {
                 "healthy"
             } else {
                 "unreachable"

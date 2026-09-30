@@ -1,11 +1,5 @@
-mod api;
-mod cli;
-mod config;
-mod daemon;
-mod domain;
-mod infra;
-
 use clap::Parser;
+use frank_opencode::{api, cli, config, daemon, infra};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -17,7 +11,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = cli::Cli::parse();
-    let mut cfg = config::AppConfig::load(cli.config.clone());
+    let mut cfg = config::AppConfig::load(cli.config.clone()).map_err(|e| anyhow::anyhow!(e))?;
     if let Some(p) = cli.port {
         cfg.port = p;
     }
@@ -61,14 +55,48 @@ async fn serve(cfg: config::AppConfig) -> anyhow::Result<()> {
     let db = infra::opencode::resolve_db_path(&cfg.opencode_bin);
     tracing::info!(db = %db.display(), port, "starting frank-opencode");
     let state = api::server::AppState::new(cfg, db);
-    match state.refresh().await {
-        Ok(n) => tracing::info!(models = n, "catalog loaded"),
-        Err(e) => tracing::warn!("catalog load failed (will retry on restart): {e}"),
-    }
-    let app = api::server::router(state);
+
+    // Bind first so a stuck catalog fetch can't block boot; the catalog
+    // loads in the background and /health reports degraded until then.
+    // Afterwards it refreshes every `refresh_interval_secs` (>= 60s).
+    let app = api::server::router(state.clone());
     let addr = format!("127.0.0.1:{port}");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!("listening on http://{addr}");
-    axum::serve(listener, app).await?;
+    let refresher = state.clone();
+    tokio::spawn(async move {
+        match refresher.refresh().await {
+            Ok(n) => tracing::info!(models = n, "catalog loaded"),
+            Err(e) => tracing::warn!("initial catalog load failed: {e}"),
+        }
+        let interval = refresher.config.refresh_interval_secs.max(60);
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+            match refresher.refresh().await {
+                Ok(n) => tracing::debug!(models = n, "catalog refreshed"),
+                Err(e) => tracing::warn!("catalog refresh failed: {e}"),
+            }
+        }
+    });
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
     Ok(())
+}
+
+/// SIGTERM (from `--disable`) and Ctrl-C drain in-flight SSE streams.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("SIGTERM handler");
+        tokio::select! {
+            _ = term.recv() => {},
+            _ = tokio::signal::ctrl_c() => {},
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }

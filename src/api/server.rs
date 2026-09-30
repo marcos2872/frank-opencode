@@ -1,16 +1,20 @@
 //! HTTP layer: Axum handlers. Business decisions live in domain/infra.
 
 use crate::config::AppConfig;
-use crate::domain::{auto_alias, AliasEntry, CatalogEntry, ModelRef};
+use crate::domain::{
+    auto_alias, is_known_package, protocol_for, strip_window_suffix, AliasEntry, CatalogEntry,
+    ModelRef, Protocol,
+};
 use crate::infra::opencode::{fetch_catalog, upstream_bearer, CredentialStore};
 use crate::infra::upstream::{
     anthropic_to_openai, anthropic_to_responses, estimate_tokens, join_url, openai_to_anthropic,
-    responses_to_anthropic, sse, ResponsesTranslator, StreamTranslator,
+    responses_to_anthropic, sse, with_heartbeat, ResponsesTranslator, StreamTranslator,
 };
 use axum::{
     body::Body,
     extract::State,
     http::{HeaderMap, StatusCode},
+    middleware,
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -19,13 +23,20 @@ use futures::StreamExt;
 use secrecy::ExposeSecret;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 use tokio::sync::RwLock;
+
+/// Idle gap after which translated/passthrough SSE streams emit `ping`
+/// (keeps Claude Code's stream watchdog fed during long reasoning pauses).
+pub const HEARTBEAT_IDLE: Duration = Duration::from_secs(20);
 
 #[derive(Clone)]
 pub struct AppState {
     pub config: AppConfig,
     pub catalog: Arc<RwLock<Vec<CatalogEntry>>>,
     pub aliases: Arc<RwLock<Vec<AliasEntry>>>,
+    pub last_refresh: Arc<RwLock<Option<SystemTime>>>,
+    pub last_error: Arc<RwLock<Option<String>>>,
     pub http: reqwest::Client,
     pub db_path: PathBuf,
 }
@@ -36,6 +47,8 @@ impl AppState {
             config,
             catalog: Arc::new(RwLock::new(vec![])),
             aliases: Arc::new(RwLock::new(vec![])),
+            last_refresh: Arc::new(RwLock::new(None)),
+            last_error: Arc::new(RwLock::new(None)),
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(600))
                 .user_agent(format!("frank-opencode/{}", env!("CARGO_PKG_VERSION")))
@@ -48,8 +61,43 @@ impl AppState {
     /// Rebuild catalog + alias map. Manual aliases win; disabled are skipped.
     /// Console free-tier (`opencode/*`) models are skipped unless
     /// `include_free_tier` is set: they 403 outside OpenCode.
+    /// Failures keep the previous catalog and are recorded for `/health`.
     pub async fn refresh(&self) -> Result<usize, String> {
-        let entries = fetch_catalog(&self.config.opencode_bin)?;
+        let bin = self.config.opencode_bin.clone();
+        let fetch = tokio::task::spawn_blocking(move || fetch_catalog(&bin));
+        let entries = match tokio::time::timeout(Duration::from_secs(20), fetch).await {
+            Ok(Ok(Ok(entries))) => entries,
+            Ok(Ok(Err(e))) => {
+                let msg = format!("catalog fetch failed: {e}");
+                *self.last_error.write().await = Some(msg.clone());
+                return Err(msg);
+            }
+            Ok(Err(e)) => {
+                let msg = format!("catalog task failed: {e}");
+                *self.last_error.write().await = Some(msg.clone());
+                return Err(msg);
+            }
+            Err(_) => {
+                let msg = "catalog fetch timed out after 20s".to_string();
+                *self.last_error.write().await = Some(msg.clone());
+                return Err(msg);
+            }
+        };
+        for e in &entries {
+            tracing::debug!(
+                provider_id = %e.provider_id,
+                model_id = %e.model_id,
+                package = %e.package,
+                "catalog entry"
+            );
+            if !is_known_package(&e.package) {
+                tracing::warn!(
+                    provider_id = %e.provider_id,
+                    package = %e.package,
+                    "unknown provider package, using ChatCompletions fallback"
+                );
+            }
+        }
         let usable: Vec<&CatalogEntry> = entries
             .iter()
             .filter(|e| self.config.include_free_tier || e.provider_id != "opencode")
@@ -101,7 +149,22 @@ impl AppState {
         let n = usable.len();
         *self.catalog.write().await = entries;
         *self.aliases.write().await = aliases;
+        *self.last_refresh.write().await = Some(SystemTime::now());
+        *self.last_error.write().await = None;
         Ok(n)
+    }
+
+    /// Single source of truth for the default model (config or first alias).
+    pub async fn effective_default(&self) -> String {
+        if !self.config.default_model.is_empty() {
+            return self.config.default_model.clone();
+        }
+        self.aliases
+            .read()
+            .await
+            .first()
+            .map(|a| a.gateway_id.clone())
+            .unwrap_or_default()
     }
 
     async fn resolve(&self, requested: &str) -> Option<CatalogEntry> {
@@ -127,7 +190,22 @@ impl AppState {
             }
         }
         // Plain model id (first enabled match)?
-        catalog.iter().find(|e| e.model_id == requested).cloned()
+        // Ambiguity is order-dependent across providers, so sort for
+        // determinism and warn with the candidates instead of failing.
+        let mut hits: Vec<CatalogEntry> = catalog
+            .iter()
+            .filter(|e| e.model_id == requested)
+            .cloned()
+            .collect();
+        hits.sort_by_key(|e| e.qualified());
+        if hits.len() > 1 {
+            tracing::warn!(
+                model = requested,
+                candidates = ?hits.iter().map(|e| e.qualified()).collect::<Vec<_>>(),
+                "ambiguous model id, using first; prefer an alias or provider/model"
+            );
+        }
+        hits.into_iter().next()
     }
 }
 
@@ -142,24 +220,60 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/models", get(list_models))
         .route("/v1/messages/count_tokens", post(count_tokens))
         .route("/v1/messages", post(messages))
+        .route_layer(middleware::from_fn_with_state(state.clone(), require_token))
+        .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(state)
+}
+
+/// Gateway credential check. `/health` stays open (daemon probes + `enable`
+/// waiter are unauthenticated); everything else requires the configured
+/// `auth_token` in either `x-api-key` or `Authorization: Bearer` when set.
+async fn require_token(
+    State(s): State<AppState>,
+    req: axum::extract::Request,
+    next: middleware::Next,
+) -> Response {
+    if req.uri().path() == "/health" || s.config.auth_token.is_empty() {
+        return next.run(req).await;
+    }
+    let headers = req.headers();
+    let bearer = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or("");
+    let key = headers
+        .get("x-api-key")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if bearer == s.config.auth_token || key == s.config.auth_token {
+        next.run(req).await
+    } else {
+        anthropic_error(
+            StatusCode::UNAUTHORIZED,
+            "authentication_error",
+            "invalid gateway credential (check ANTHROPIC_AUTH_TOKEN)",
+        )
+    }
 }
 
 async fn health(State(s): State<AppState>) -> impl IntoResponse {
     let aliases = s.aliases.read().await;
-    let default = if s.config.default_model.is_empty() {
-        aliases
-            .first()
-            .map(|a| a.gateway_id.clone())
-            .unwrap_or_default()
+    let last_error = s.last_error.read().await.clone();
+    let refreshed = s.last_refresh.read().await.is_some();
+    let status = if last_error.is_some() {
+        "degraded"
+    } else if refreshed {
+        "ok"
     } else {
-        s.config.default_model.clone()
+        "starting"
     };
     Json(serde_json::json!({
-        "status": "ok",
+        "status": status,
         "version": env!("CARGO_PKG_VERSION"),
-        "default_model": default,
+        "default_model": s.effective_default().await,
         "models": aliases.len(),
+        "last_error": last_error,
     }))
 }
 
@@ -195,7 +309,7 @@ fn fallback_session_id() -> String {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let _ = std::fs::write(&path, &id);
+    let _ = crate::daemon::write_private(path, &id);
     id
 }
 
@@ -240,15 +354,16 @@ async fn messages(
     headers: HeaderMap,
     Json(mut body): Json<Value>,
 ) -> Response {
-    let requested = body
+    let raw = body
         .get("model")
         .and_then(|m| m.as_str())
         .unwrap_or("")
         .to_string();
-    let requested = if requested.is_empty() {
-        s.config.default_model.clone()
+    // Accept Claude Code's `[1m]`/`[200k]` window hints on unknown gateway ids.
+    let requested = if raw.is_empty() {
+        s.effective_default().await
     } else {
-        requested
+        strip_window_suffix(&raw).to_string()
     };
     if requested.is_empty() {
         return anthropic_error(
@@ -289,21 +404,25 @@ async fn messages(
         );
     };
 
-    if entry.is_anthropic_package() {
-        forward_anthropic(
-            &s, &headers, &mut body, &entry, &base, &bearer, &requested, stream,
-        )
-        .await
-    } else if entry.is_responses_package() {
-        forward_responses(
-            &s, &headers, &body, &entry, &base, &bearer, &requested, stream,
-        )
-        .await
-    } else {
-        forward_openai(
-            &s, &headers, &body, &entry, &base, &bearer, &requested, stream,
-        )
-        .await
+    match protocol_for(&entry.package) {
+        Protocol::Anthropic => {
+            forward_anthropic(
+                &s, &headers, &mut body, &entry, &base, &bearer, &requested, stream,
+            )
+            .await
+        }
+        Protocol::Responses => {
+            forward_responses(
+                &s, &headers, &body, &entry, &base, &bearer, &requested, stream,
+            )
+            .await
+        }
+        Protocol::ChatCompletions => {
+            forward_openai(
+                &s, &headers, &body, &entry, &base, &bearer, &requested, stream,
+            )
+            .await
+        }
     }
 }
 
@@ -359,9 +478,13 @@ async fn forward_anthropic(
         return (status, [("content-type", "application/json")], text).into_response();
     }
     if stream {
-        let stream = resp
-            .bytes_stream()
-            .map(|c| c.map_err(std::io::Error::other));
+        // Byte passthrough, but inject `ping` during upstream silence so the
+        // client's stream watchdog doesn't abort long thinking pauses.
+        let stream = with_heartbeat(
+            resp.bytes_stream()
+                .map(|c| c.map(|b| b.to_vec()).map_err(std::io::Error::other)),
+            HEARTBEAT_IDLE,
+        );
         Response::builder()
             .status(200)
             .header("content-type", "text/event-stream")
@@ -382,6 +505,9 @@ async fn forward_anthropic(
         };
         if v.get("model").is_some() {
             v["model"] = Value::String(gateway_model.to_string());
+        }
+        if let Some(uid) = v.get("id").and_then(|x| x.as_str()) {
+            tracing::debug!(upstream_id = uid, model = gateway_model, "upstream ok");
         }
         Json(v).into_response()
     }
@@ -438,6 +564,9 @@ async fn forward_responses(
                 )
             }
         };
+        if let Some(uid) = v.get("id").and_then(|x| x.as_str()) {
+            tracing::debug!(upstream_id = uid, model = gateway_model, "upstream ok");
+        }
         return Json(responses_to_anthropic(&v, gateway_model)).into_response();
     }
     // Translated streaming: Responses SSE -> Anthropic SSE.
@@ -494,7 +623,7 @@ async fn forward_responses(
         .status(200)
         .header("content-type", "text/event-stream")
         .header("cache-control", "no-cache")
-        .body(Body::from_stream(out))
+        .body(Body::from_stream(with_heartbeat(out, HEARTBEAT_IDLE)))
         .unwrap()
 }
 
@@ -550,6 +679,16 @@ async fn forward_openai(
                 )
             }
         };
+        if let Some(uid) = v
+            .get("choices")
+            .and_then(|c| c.as_array())
+            .and_then(|a| a.first())
+            .and_then(|c| c.get("id"))
+            .or_else(|| v.get("id"))
+            .and_then(|x| x.as_str())
+        {
+            tracing::debug!(upstream_id = uid, model = gateway_model, "upstream ok");
+        }
         return Json(openai_to_anthropic(&v, gateway_model)).into_response();
     }
     // Translated streaming: OpenAI SSE -> Anthropic SSE.
@@ -607,6 +746,6 @@ async fn forward_openai(
         .status(200)
         .header("content-type", "text/event-stream")
         .header("cache-control", "no-cache")
-        .body(Body::from_stream(out))
+        .body(Body::from_stream(with_heartbeat(out, HEARTBEAT_IDLE)))
         .unwrap()
 }
