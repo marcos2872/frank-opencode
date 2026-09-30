@@ -258,9 +258,12 @@ async fn require_token(
 }
 
 async fn health(State(s): State<AppState>) -> impl IntoResponse {
-    let aliases = s.aliases.read().await;
+    // Short-lived locks only: `effective_default()` takes `aliases` itself,
+    // so don't hold that guard across the call.
+    let model_count = s.aliases.read().await.len();
     let last_error = s.last_error.read().await.clone();
     let refreshed = s.last_refresh.read().await.is_some();
+    let default_model = s.effective_default().await;
     let status = if last_error.is_some() {
         "degraded"
     } else if refreshed {
@@ -271,8 +274,8 @@ async fn health(State(s): State<AppState>) -> impl IntoResponse {
     Json(serde_json::json!({
         "status": status,
         "version": env!("CARGO_PKG_VERSION"),
-        "default_model": s.effective_default().await,
-        "models": aliases.len(),
+        "default_model": default_model,
+        "models": model_count,
         "last_error": last_error,
     }))
 }

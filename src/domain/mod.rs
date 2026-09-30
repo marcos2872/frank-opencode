@@ -137,16 +137,25 @@ pub fn is_known_package(package: &str) -> bool {
     KNOWN.iter().any(|k| package.contains(k))
 }
 
-/// Strip a context-window hint suffix such as `[1m]` / `[200k]` that Claude
-/// Code appends to unknown gateway model ids. Returns the base id.
+/// Strip a context-window hint suffix such as `[1m]` / `[200k]` / `[500k]`
+/// that Claude Code appends to unknown gateway model ids. Returns the base id.
+/// Any trailing `[<digits>k|m]` (case-insensitive) is stripped; anything else
+/// (e.g. `[foo]`, `[12]`) is left untouched.
 pub fn strip_window_suffix(s: &str) -> &str {
-    let lower = s.to_lowercase();
-    for suffix in ["[1m]", "[200k]"] {
-        if lower.ends_with(suffix) {
-            return &s[..s.len() - suffix.len()];
-        }
+    if !s.ends_with(']') {
+        return s;
     }
-    s
+    let Some(open) = s.rfind('[') else {
+        return s;
+    };
+    let inner = s[open + 1..s.len() - 1].to_lowercase();
+    let (digits, unit) = inner.split_at(inner.len().saturating_sub(1));
+    if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) && matches!(unit, "k" | "m")
+    {
+        &s[..open]
+    } else {
+        s
+    }
 }
 /// Sanitize a model id into a URL/claude-safe slug.
 pub fn slugify(s: &str) -> String {
@@ -258,7 +267,16 @@ mod tests {
     fn strips_window_hint_suffix() {
         assert_eq!(strip_window_suffix("claude-x[1m]"), "claude-x");
         assert_eq!(strip_window_suffix("claude-x[200K]"), "claude-x");
+        assert_eq!(strip_window_suffix("claude-x[500k]"), "claude-x");
+        assert_eq!(strip_window_suffix("claude-x[2M]"), "claude-x");
         assert_eq!(strip_window_suffix("claude-x"), "claude-x");
         assert_eq!(strip_window_suffix("a/b[1m]"), "a/b");
+        // Not a window hint: left untouched.
+        assert_eq!(strip_window_suffix("claude-x[foo]"), "claude-x[foo]");
+        assert_eq!(strip_window_suffix("claude-x[12]"), "claude-x[12]");
+        assert_eq!(strip_window_suffix("claude-x[]"), "claude-x[]");
+        assert_eq!(strip_window_suffix("claude-x[k]"), "claude-x[k]");
+        assert_eq!(strip_window_suffix("claude-x"), "claude-x");
+        assert_eq!(strip_window_suffix("no-bracket"), "no-bracket");
     }
 }

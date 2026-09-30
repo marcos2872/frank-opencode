@@ -1,10 +1,18 @@
 //! Integration tests against a seeded gateway (no `opencode` binary needed).
 
+use axum::{
+    extract::State,
+    response::{IntoResponse, Response},
+    routing::post,
+    Json, Router,
+};
 use frank_opencode::api::server::{router, AppState};
 use frank_opencode::config::AppConfig;
 use frank_opencode::domain::{AliasEntry, CatalogEntry, CatalogSettings};
 use serde_json::{json, Value};
 use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 fn test_config() -> AppConfig {
     AppConfig {
@@ -172,4 +180,296 @@ async fn ambiguous_model_id_resolves_deterministically() {
             .contains("a-provider"),
         "{first}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// End-to-end with a mocked upstream: real HTTP on 127.0.0.1, no `opencode`
+// binary, no network. Exercises request translation, forwarding, response
+// translation and session headers for all three wire protocols.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Default)]
+struct MockUpstream {
+    calls: Arc<Mutex<Vec<(String, Value)>>>,
+    sessions: Arc<Mutex<Vec<String>>>,
+    chat_streaming: bool,
+}
+
+async fn note(st: &MockUpstream, headers: &axum::http::HeaderMap, path: &str, body: Value) {
+    st.calls.lock().await.push((path.to_string(), body));
+    if let Some(s) = headers
+        .get("x-opencode-session")
+        .and_then(|v| v.to_str().ok())
+    {
+        st.sessions.lock().await.push(s.to_string());
+    }
+}
+
+async fn mock_chat(
+    State(st): State<MockUpstream>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    note(&st, &headers, "chat/completions", body).await;
+    if st.chat_streaming {
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hel\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],",
+            "\"usage\":{\"completion_tokens\":2}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        return Response::builder()
+            .header("content-type", "text/event-stream")
+            .body(axum::body::Body::from(sse))
+            .unwrap();
+    }
+    Json(json!({
+        "id": "chatcmpl-test",
+        "choices": [{"finish_reason": "stop", "message": {"content": "mock chat reply"}}],
+        "usage": {"prompt_tokens": 3, "completion_tokens": 5}
+    }))
+    .into_response()
+}
+
+async fn mock_responses(
+    State(st): State<MockUpstream>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    note(&st, &headers, "responses", body).await;
+    Json(json!({
+        "id": "resp-test",
+        "status": "completed",
+        "output": [{"type": "message", "content": [{"type": "output_text", "text": "mock responses reply"}]}],
+        "usage": {"input_tokens": 3, "output_tokens": 5}
+    }))
+    .into_response()
+}
+
+async fn mock_messages(
+    State(st): State<MockUpstream>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let model = body.get("model").cloned().unwrap_or(Value::Null);
+    note(&st, &headers, "messages", body).await;
+    Json(json!({
+        "id": "msg_upstream",
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        "content": [{"type": "text", "text": "mock anthropic reply"}],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 1, "output_tokens": 2}
+    }))
+    .into_response()
+}
+
+async fn spawn_mock(mock: MockUpstream) -> String {
+    let app = Router::new()
+        .route("/chat/completions", post(mock_chat))
+        .route("/responses", post(mock_responses))
+        .route("/messages", post(mock_messages))
+        .with_state(mock);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{addr}")
+}
+
+/// Catalog entry pointing at the mock upstream. Provider `opencode` with an
+/// inline api_key needs no credential DB, so the forward path is exercised.
+fn mock_entry(base_url: &str, package: &str, model: &str) -> CatalogEntry {
+    CatalogEntry {
+        id: model.to_string(),
+        model_id: model.to_string(),
+        provider_id: "opencode".to_string(),
+        name: model.to_string(),
+        package: package.to_string(),
+        settings: CatalogSettings {
+            base_url: Some(base_url.to_string()),
+            api_key: Some("test-upstream-key".to_string()),
+            provider: None,
+        },
+        enabled: true,
+    }
+}
+
+async fn calls_to(mock: &MockUpstream, path: &str) -> Vec<Value> {
+    mock.calls
+        .lock()
+        .await
+        .iter()
+        .filter(|(p, _)| p == path)
+        .map(|(_, b)| b.clone())
+        .collect()
+}
+
+fn msg_body_tools(model: &str) -> Value {
+    json!({
+        "model": model,
+        "max_tokens": 8,
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [{"name": "Read", "description": "d", "input_schema": {"type": "object"}}],
+        "tool_choice": {"type": "none"}
+    })
+}
+
+const CHAT_PKG: &str = "@opencode/ai/providers/openai-compatible";
+const RESPONSES_PKG: &str = "@opencode/ai/providers/openai";
+const ANTHROPIC_PKG: &str = "@opencode/ai/providers/anthropic";
+
+#[tokio::test]
+async fn e2e_chat_completions_round_trip() {
+    let mock = MockUpstream::default();
+    let base = spawn_mock(mock.clone()).await;
+    let state = seeded_state(
+        test_config(),
+        vec![mock_entry(&base, CHAT_PKG, "mock-chat")],
+        vec![alias("claude-mock-chat", "opencode/mock-chat")],
+    )
+    .await;
+    let server = axum_test::TestServer::new(router(state)).unwrap();
+    let resp = server
+        .post("/v1/messages")
+        .add_header("x-api-key", "test-secret")
+        .json(&msg_body("claude-mock-chat"))
+        .await;
+    assert_eq!(resp.status_code(), 200);
+    let body: Value = resp.json();
+    assert_eq!(body["model"], "claude-mock-chat");
+    assert_eq!(body["content"][0]["text"], "mock chat reply");
+    assert_eq!(body["stop_reason"], "end_turn");
+    assert_eq!(body["usage"]["input_tokens"], 3);
+    assert_eq!(body["usage"]["output_tokens"], 5);
+
+    // Upstream saw the translated request with its own model id.
+    let calls = calls_to(&mock, "chat/completions").await;
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["model"], "mock-chat");
+    assert_eq!(calls[0]["messages"][0]["content"], "hi");
+    // The Go routing header is always sent (fallback session id here).
+    let sessions = mock.sessions.lock().await;
+    assert_eq!(sessions.len(), 1);
+    assert!(sessions[0].starts_with("frank-"), "{}", sessions[0]);
+}
+
+#[tokio::test]
+async fn e2e_responses_round_trip() {
+    let mock = MockUpstream::default();
+    let base = spawn_mock(mock.clone()).await;
+    let state = seeded_state(
+        test_config(),
+        vec![mock_entry(&base, RESPONSES_PKG, "mock-resp")],
+        vec![alias("claude-mock-resp", "opencode/mock-resp")],
+    )
+    .await;
+    let server = axum_test::TestServer::new(router(state)).unwrap();
+    let resp = server
+        .post("/v1/messages")
+        .add_header("x-api-key", "test-secret")
+        .json(&msg_body("claude-mock-resp"))
+        .await;
+    assert_eq!(resp.status_code(), 200);
+    let body: Value = resp.json();
+    assert_eq!(body["model"], "claude-mock-resp");
+    assert_eq!(body["content"][0]["text"], "mock responses reply");
+    assert_eq!(body["usage"]["output_tokens"], 5);
+
+    let calls = calls_to(&mock, "responses").await;
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["model"], "mock-resp");
+    assert!(calls[0]["input"].is_array());
+}
+
+#[tokio::test]
+async fn e2e_anthropic_passthrough() {
+    let mock = MockUpstream::default();
+    let base = spawn_mock(mock.clone()).await;
+    let state = seeded_state(
+        test_config(),
+        vec![mock_entry(&base, ANTHROPIC_PKG, "mock-anth")],
+        vec![alias("claude-mock-anth", "opencode/mock-anth")],
+    )
+    .await;
+    let server = axum_test::TestServer::new(router(state)).unwrap();
+    let resp = server
+        .post("/v1/messages")
+        .add_header("x-api-key", "test-secret")
+        .json(&msg_body("claude-mock-anth"))
+        .await;
+    assert_eq!(resp.status_code(), 200);
+    let body: Value = resp.json();
+    // Gateway rewrites the upstream model to the gateway id for the client.
+    assert_eq!(body["model"], "claude-mock-anth");
+    assert_eq!(body["content"][0]["text"], "mock anthropic reply");
+
+    let calls = calls_to(&mock, "messages").await;
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["model"], "mock-anth");
+    assert_eq!(calls[0]["max_tokens"], 8);
+}
+
+#[tokio::test]
+async fn e2e_tool_choice_none_reaches_upstream() {
+    let mock = MockUpstream::default();
+    let base = spawn_mock(mock.clone()).await;
+    let state = seeded_state(
+        test_config(),
+        vec![mock_entry(&base, CHAT_PKG, "mock-chat")],
+        vec![alias("claude-mock-chat", "opencode/mock-chat")],
+    )
+    .await;
+    let server = axum_test::TestServer::new(router(state)).unwrap();
+    let resp = server
+        .post("/v1/messages")
+        .add_header("x-api-key", "test-secret")
+        .json(&msg_body_tools("claude-mock-chat"))
+        .await;
+    assert_eq!(resp.status_code(), 200);
+    let calls = calls_to(&mock, "chat/completions").await;
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["tool_choice"], "none");
+    assert_eq!(calls[0]["tools"][0]["function"]["name"], "Read");
+}
+
+#[tokio::test]
+async fn e2e_chat_streaming_translated_to_anthropic_sse() {
+    let mock = MockUpstream {
+        chat_streaming: true,
+        ..MockUpstream::default()
+    };
+    let base = spawn_mock(mock.clone()).await;
+    let state = seeded_state(
+        test_config(),
+        vec![mock_entry(&base, CHAT_PKG, "mock-chat")],
+        vec![alias("claude-mock-chat", "opencode/mock-chat")],
+    )
+    .await;
+    let server = axum_test::TestServer::new(router(state)).unwrap();
+    let mut body = msg_body("claude-mock-chat");
+    body["stream"] = Value::Bool(true);
+    let resp = server
+        .post("/v1/messages")
+        .add_header("x-api-key", "test-secret")
+        .json(&body)
+        .await;
+    assert_eq!(resp.status_code(), 200);
+    assert_eq!(
+        resp.header("content-type").to_str().unwrap(),
+        "text/event-stream"
+    );
+    let text = resp.text();
+    assert!(text.contains("message_start"), "{text}");
+    assert!(text.contains("text_delta"), "{text}");
+    assert!(text.contains("hel"), "{text}");
+    assert!(text.contains("lo"), "{text}");
+    assert!(text.contains("message_stop"), "{text}");
+    // Upstream got the streaming request.
+    let calls = calls_to(&mock, "chat/completions").await;
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["stream"], true);
 }

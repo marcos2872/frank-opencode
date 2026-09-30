@@ -59,7 +59,9 @@ fn gateway_healthy(port: u16) -> bool {
 }
 
 /// Write a small state file with owner-only permissions (0600 on unix).
-/// The README asks for 0600; `fs::write` alone would follow the umask (0644).
+/// The README asks for 0600; `fs::write` alone would follow the umask (0644),
+/// and `mode(0o600)` only applies at creation, so enforce afterwards too in
+/// case the file pre-existed with wider permissions.
 pub(crate) fn write_private(path: PathBuf, content: &str) -> std::io::Result<()> {
     use std::fs::OpenOptions;
     let mut opts = OpenOptions::new();
@@ -69,10 +71,16 @@ pub(crate) fn write_private(path: PathBuf, content: &str) -> std::io::Result<()>
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
-    opts.open(path).and_then(|mut f| {
+    opts.open(&path).and_then(|mut f| {
         use std::io::Write;
         f.write_all(content.as_bytes())
-    })
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
 }
 
 pub fn stored_port() -> Option<u16> {
@@ -98,12 +106,17 @@ pub fn enable(port: u16, config_arg: Option<PathBuf>) -> anyhow::Result<()> {
     }
     fs::create_dir_all(dir())?;
     let exe = std::env::current_exe()?;
-    let log = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_file())?;
+    let mut log_opts = fs::OpenOptions::new();
+    log_opts.create(true).append(true);
     #[cfg(unix)]
     {
+        use std::os::unix::fs::OpenOptionsExt;
+        log_opts.mode(0o600);
+    }
+    let log = log_opts.open(log_file())?;
+    #[cfg(unix)]
+    {
+        // `mode` only applies at creation; enforce for pre-existing files too.
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(log_file(), std::fs::Permissions::from_mode(0o600));
     }
@@ -217,4 +230,40 @@ fn print_next_steps(port: u16) {
     println!("  export ANTHROPIC_AUTH_TOKEN=dummy");
     println!("  export CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1");
     println!("  claude");
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn mode_of(path: &PathBuf) -> u32 {
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn write_private_creates_0600() {
+        let dir = std::env::temp_dir().join("frank-perm-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join(format!("new-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        write_private(path.clone(), "secret").unwrap();
+        assert_eq!(mode_of(&path), 0o600, "{}", path.display());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "secret");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn write_private_tightens_preexisting_file() {
+        let dir = std::env::temp_dir().join("frank-perm-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join(format!("pre-{}.txt", std::process::id()));
+        std::fs::write(&path, "old").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(mode_of(&path), 0o644);
+        write_private(path.clone(), "new").unwrap();
+        assert_eq!(mode_of(&path), 0o600, "{}", path.display());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+        let _ = std::fs::remove_file(&path);
+    }
 }
