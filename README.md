@@ -119,6 +119,20 @@ curl -s -X POST "$ANTHROPIC_BASE_URL/v1/messages" \
 | Models missing from `/model` | Set `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1`; ids must contain `claude`/`anthropic` (auto aliases do). |
 | `400` naming `context_management`/`output_config` | Upstream rejects a pre-release field; retry with `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1`. |
 
+## Auto-mode notice ("session isn't eligible...")
+
+Expected when using any gateway, not an error: Anthropic moved auto-mode classifier
+checks server-side (free), but sessions routed through `127.0.0.1` can't use them —
+upstream here is OpenCode Go, never the Anthropic API. Press **Enter** to continue
+(snoozed 24h on that machine), or silence it permanently:
+
+```bash
+export CLAUDE_CODE_AUTO_MODE_SERVER=0
+```
+
+or in the `env` block of `~/.claude/settings.json`. Fallback classifier calls are
+tiny model requests billed as normal Go usage.
+
 ## Security
 
 - Binds `127.0.0.1` only. DB opened `READ_ONLY`. Secrets stay in memory (`secrecy`), never logged.
