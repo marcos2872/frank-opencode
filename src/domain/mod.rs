@@ -1,0 +1,176 @@
+//! Domain: pure types and rules. No tokio, axum, rusqlite here.
+
+use serde::{Deserialize, Serialize};
+
+/// Reference to a model inside OpenCode: `provider/model-id`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ModelRef {
+    pub provider_id: String,
+    pub model_id: String,
+}
+
+impl ModelRef {
+    /// Parse `provider/model`, where model may itself contain `/`.
+    pub fn parse(s: &str) -> Option<Self> {
+        let (provider, model) = s.split_once('/')?;
+        if provider.is_empty() || model.is_empty() || provider.contains('#') {
+            return None;
+        }
+        // Strip optional #variant suffix for resolution (variant ignored in MVP).
+        let model = model.split_once('#').map(|(m, _)| m).unwrap_or(model);
+        if model.is_empty() {
+            return None;
+        }
+        Some(Self {
+            provider_id: provider.to_string(),
+            model_id: model.to_string(),
+        })
+    }
+
+    #[allow(dead_code)]
+    pub fn qualified(&self) -> String {
+        format!("{}/{}", self.provider_id, self.model_id)
+    }
+}
+
+/// One model as reported by `opencode api get /api/model`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CatalogEntry {
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub id: String,
+    #[serde(rename = "modelID", default)]
+    pub model_id: String,
+    #[serde(rename = "providerID", default)]
+    pub provider_id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub package: String,
+    #[serde(default)]
+    pub settings: CatalogSettings,
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct CatalogSettings {
+    #[serde(rename = "baseURL", default)]
+    pub base_url: Option<String>,
+    #[serde(rename = "apiKey", default)]
+    pub api_key: Option<String>,
+    #[serde(default)]
+    pub provider: Option<String>,
+}
+
+impl CatalogEntry {
+    pub fn qualified(&self) -> String {
+        format!("{}/{}", self.provider_id, self.model_id)
+    }
+
+    pub fn is_anthropic_package(&self) -> bool {
+        self.package.contains("anthropic")
+    }
+
+    /// Models served through the OpenAI Responses API (`/responses`):
+    /// Go's GPT/Grok/Muse rows. Distinct from `openai-compatible` (+ `/chat`).
+    pub fn is_responses_package(&self) -> bool {
+        self.package == "@opencode/ai/providers/openai" || self.package.contains("openai/responses")
+    }
+
+    pub fn base_url(&self) -> Option<&str> {
+        self.settings.base_url.as_deref()
+    }
+}
+
+/// Gateway alias exposed on `GET /v1/models`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AliasEntry {
+    /// ID seen by Claude Code, e.g. `claude-sonnet-4-6-frank`.
+    pub gateway_id: String,
+    /// OpenCode reference, e.g. `opencode-go/kimi-k2.7-code`.
+    pub opencode_ref: String,
+    pub display_name: String,
+    pub description: String,
+}
+
+/// Sanitize a model id into a URL/claude-safe slug.
+pub fn slugify(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_dash = false;
+    for c in s.to_lowercase().chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c);
+            prev_dash = false;
+        } else if !prev_dash {
+            out.push('-');
+            prev_dash = true;
+        }
+    }
+    out.trim_matches('-').to_string()
+}
+
+/// Build the automatic gateway alias for a catalog entry.
+///
+/// The `claude-` prefix is intentional: Claude Code gateway discovery only
+/// keeps `/v1/models` entries whose id contains `claude` or `anthropic`.
+pub fn auto_alias(entry: &CatalogEntry) -> AliasEntry {
+    let slug = slugify(&format!("{}-{}", entry.provider_id, entry.model_id));
+    let gateway_id = format!("claude-{slug}");
+    AliasEntry {
+        gateway_id,
+        opencode_ref: entry.qualified(),
+        display_name: format!("{} ({})", entry.name, entry.provider_id),
+        description: format!("via frank-opencode · {}", entry.qualified()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn parses_provider_model_with_slashes() {
+        let r = ModelRef::parse("openrouter/anthropic/claude-sonnet-4-5").unwrap();
+        assert_eq!(r.provider_id, "openrouter");
+        assert_eq!(r.model_id, "anthropic/claude-sonnet-4-5");
+    }
+
+    #[test]
+    fn strips_variant_suffix() {
+        let r = ModelRef::parse("openai/gpt-5.2#high").unwrap();
+        assert_eq!(r.model_id, "gpt-5.2");
+    }
+
+    #[test]
+    fn rejects_invalid_refs() {
+        assert!(ModelRef::parse("no-slash").is_none());
+        assert!(ModelRef::parse("/empty-provider").is_none());
+        assert!(ModelRef::parse("provider/").is_none());
+    }
+
+    #[test]
+    fn auto_alias_contains_claude_prefix() {
+        let e = CatalogEntry {
+            id: "kimi-k2.7-code".into(),
+            model_id: "kimi-k2.7-code".into(),
+            provider_id: "opencode-go".into(),
+            name: "Kimi K2.7 Code".into(),
+            package: "@opencode/ai/providers/openai-compatible".into(),
+            settings: CatalogSettings::default(),
+            enabled: true,
+        };
+        let a = auto_alias(&e);
+        assert!(a.gateway_id.contains("claude"));
+        assert_eq!(a.opencode_ref, "opencode-go/kimi-k2.7-code");
+    }
+
+    #[test]
+    fn slugify_collapses_separators() {
+        assert_eq!(
+            slugify("OpenRouter/Claude Sonnet 4.5"),
+            "openrouter-claude-sonnet-4-5"
+        );
+    }
+}

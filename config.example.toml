@@ -1,0 +1,36 @@
+# ports below are examples; use --port or FRANK_PORT to change
+port = 3737
+
+# Token Claude Code sends (ANTHROPIC_AUTH_TOKEN). Empty = accept any (localhost only).
+auth_token = ""
+
+# Used when the client omits "model". Defaults to the first alias if empty.
+default_model = "claude-opencode-go-kimi-k2-7-code"
+
+# Re-discovery interval for `opencode api get /api/model` (seconds).
+refresh_interval_secs = 300
+
+# OpenCode binary used for catalog + db-path discovery.
+opencode_bin = "opencode"
+
+# Include Console free-tier (`opencode/*`, public key) models in /v1/models.
+# They 403 outside OpenCode, so they are hidden by default.
+include_free_tier = false
+
+# Manual aliases win over auto-generated ones.
+# Key = gateway id seen by Claude Code (keep "claude"/"anthropic" in it
+# so /v1/models discovery lists it in /model).
+[aliases."claude-sonnet-4-6-frank"]
+opencode = "opencode-go/kimi-k2.7-code"
+display_name = "Sonnet 4.6 (Kimi K2.7 Code via Go)"
+description = "Coding default"
+
+[aliases."claude-opus-frank"]
+opencode = "opencode-go/glm-5.3"
+display_name = "Opus (GLM 5.3 via Go)"
+
+# Refs (gateway id or opencode ref) hidden from /v1/models.
+[disabled]
+models = [
+  # "opencode-go/hy4-preview",
+]
