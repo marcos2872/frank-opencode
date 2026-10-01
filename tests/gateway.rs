@@ -100,7 +100,9 @@ async fn models_expose_context_window_when_catalog_knows_it() {
         .await
         .json();
     let item = &data["data"][0];
-    assert_eq!(item["id"], "claude-x");
+    // Known window → announced via the `[Nm]` suffix on the id (what mainline
+    // Claude Code reads) plus the structured `context_window` field.
+    assert_eq!(item["id"], "claude-x[1m]");
     assert_eq!(item["context_window"], 1_000_000);
 
     // Without a catalog `limit`, the field is omitted (not null): clients
@@ -122,6 +124,28 @@ async fn models_expose_context_window_when_catalog_knows_it() {
     let item = &data["data"][0];
     assert_eq!(item["id"], "claude-y");
     assert!(item.get("context_window").is_none(), "{item}");
+
+    // A window below 1M still announces `context_window` but no `[1m]`
+    // suffix: mainline Claude Code would only read the 1M literal.
+    let mut e = entry("opencode-go", "qwen3-8-max");
+    e.limit = Some(CatalogLimit {
+        context: Some(128_000),
+        input: None,
+        output: None,
+    });
+    let mut a = alias("claude-z", "opencode-go/qwen3-8-max");
+    a.context_window = e.context_window();
+    let server =
+        axum_test::TestServer::new(router(seeded_state(test_config(), vec![e], vec![a]).await))
+            .unwrap();
+    let data: Value = server
+        .get("/v1/models")
+        .add_header("x-api-key", "test-secret")
+        .await
+        .json();
+    let item = &data["data"][0];
+    assert_eq!(item["id"], "claude-z");
+    assert_eq!(item["context_window"], 128_000);
 }
 
 #[tokio::test]

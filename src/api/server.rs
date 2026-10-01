@@ -2,8 +2,8 @@
 
 use crate::config::AppConfig;
 use crate::domain::{
-    auto_alias, is_known_package, protocol_for, strip_window_suffix, AliasEntry, CatalogEntry,
-    ModelRef, Protocol,
+    auto_alias, is_known_package, protocol_for, strip_window_suffix, window_suffix, AliasEntry,
+    CatalogEntry, ModelRef, Protocol,
 };
 use crate::infra::opencode::{fetch_catalog, upstream_bearer, CredentialStore};
 use crate::infra::upstream::{
@@ -353,6 +353,13 @@ async fn list_models(State(s): State<AppState>) -> impl IntoResponse {
             // Omitted when unknown so clients fall back to their default.
             if let Some(w) = a.context_window {
                 item["context_window"] = Value::from(w);
+                // Mainline Claude Code reads a window only from the literal
+                // `[1m]` suffix on the id (never arbitrary `[<n>k]`), so only
+                // windows >= 1M get a suffix. `resolve()` strips it before
+                // matching, so the internal gateway_id is untouched.
+                if let Some(sfx) = window_suffix(w) {
+                    item["id"] = Value::String(format!("{a}{sfx}", a = a.gateway_id));
+                }
             }
             item
         })

@@ -123,7 +123,7 @@ Verifique antes de abrir o Claude Code:
 ```bash
 # 0. Catálogo carregado? status "ok" E "models" != 0 (vide troubleshooting se for)
 curl -s http://127.0.0.1:3737/health       # {"status":"ok","models":58,...}  ("starting" = catálogo ainda não carregado)
-curl -s http://127.0.0.1:3737/v1/models     # {"data":[{"id":"claude-...","display_name":...,"context_window":1000000,...}],...}
+curl -s http://127.0.0.1:3737/v1/models     # {"data":[{"id":"claude-...[1m]","context_window":1000000,...}],...}  ("[1m]" só quando a janela real >= 1M)
 
 # 1. Chat de ponta a ponta
 curl -s -X POST "$ANTHROPIC_BASE_URL/v1/messages" \
@@ -164,6 +164,35 @@ parâmetro do wire protocol do upstream:
 - **Passthrough Anthropic**: sem equivalente (`reasoning_effort` não existe no
   Messages API) — a variante é aceita e ignorada, e o modelo usa seu default.
 
+#### Janela de contexto manual (quando o auto-sufixo não basta)
+
+O gateway anuncia em `/v1/models` a janela do catálogo (`limit.context`) como
+`context_window` e, para janelas >= 1M, como sufixo `[1m]` no id — o único
+sufixo que a mainline do Claude Code lê. **Janelas < 1M** e o aviso
+`"X" isn't described by this version's model catalog` não são resolvidos pelo
+gateway; nessas situações defina a janela manualmente no lado do Claude Code:
+
+```jsonc
+// ~/.claude/settings.json
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:3737",
+    "ANTHROPIC_AUTH_TOKEN": "dummy"
+  },
+  "modelOverrides": {
+    "claude-opencode-go-kimi-k2-7-code": {
+      "behavesAs": "claude-sonnet-4-5",   // herda janela/uso do modelo Claude mais próximo
+      "inputWindowHint": 262144           // ou fixe a janela em tokens diretamente
+    }
+  }
+}
+```
+
+Alternativas: sufixe o modelo manualmente — `"model": "claude-...[1m]"` apenas
+para janelas de 1M (o gateway remove o sufixo ao resolver) — ou, como último
+recurso, `CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT=1` (desliga a
+checagem de janela para ids desconhecidos, perdendo a conta real de tokens).
+
 ## Solução de problemas
 
 | Sintoma | Causa / correção |
@@ -176,7 +205,7 @@ parâmetro do wire protocol do upstream:
 | Modelos faltando no `/model` | Sete `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1`; ids precisam conter `claude`/`anthropic` (os aliases automáticos já contêm). |
 | `/health` mostra `"models":0` e `/v1/models` vazio | O catálogo foi lido uma única vez no boot quando o serviço/backend do OpenCode ainda não estava pronto: `opencode api get /api/model` pode (re)iniciar o serviço, e o primeiro fetch volta com catálogo vazio sem registrar erro (`last_error:null`). Como não há refresh, o picker do Claude Code fica sem modelos. Corrija com `frank-opencode --disable && frank-opencode --enable` — de preferência com `opencode service status` saudável antes, e evite `--enable` imediatamente após um `opencode auth login`. |
 | `400` citando `context_management`/`output_config` | O upstream rejeita um campo pré-release; tente com `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1`. |
-| `"X" isn't described by this version's model catalog` | Esperado: ids do gateway são sintéticos e o Claude Code assume janela de 200k. O gateway anuncia a janela real do catálogo do OpenCode (`limit.context`) em `/v1/models` sempre que o catálogo a expõe — valide com `curl -s http://127.0.0.1:3737/v1/models | jq '.data[] | select(.id|startswith("claude-")) | {id, context_window}'`. Se o campo não vier, persista com `behavesAs`/`modelOverrides` para o modelo Claude mais próximo ou sufixe `[1m]`/`[200k]` no nome do modelo (o gateway remove o sufixo); em último caso, `CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT=1`. Sufixos aceitos: `[1m]`, `[200k]`, `[500k]`, `[2M]` (case-insensitive). |
+| `"X" isn't described by this version's model catalog` | Esperado: ids do gateway são sintéticos e o Claude Code assume janela de 200k. O gateway anuncia a janela real do catálogo do OpenCode (`limit.context`) em `/v1/models` — como campo `context_window` e, para janelas >= 1M, como sufixo `[1m]` no próprio id (o único sufixo que a mainline do Claude Code lê; o gateway remove o sufixo ao resolver). Valide com `curl -s http://127.0.0.1:3737/v1/models | jq '.data[] | {id, context_window}'`. Janelas < 1M continuam com valor padrão no cliente: persista com `behavesAs`/`modelOverrides` para o modelo Claude mais próximo, ou em último caso `CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT=1`. |
 | `Waiting for API response · will retry` (travamentos) | Pausas longas de reasoning sem bytes no stream. O gateway injeta frames `ping` durante o silêncio do upstream; se persistir, cheque `frank.log` por erros do upstream e considere aumentar `API_TIMEOUT_MS`. |
 
 > **Contexto:** o Claude Code pode mostrar *"There's an issue with the selected model

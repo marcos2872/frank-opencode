@@ -255,6 +255,14 @@ pub fn strip_window_suffix(s: &str) -> &str {
         s
     }
 }
+/// The `[1m]` suffix for a context window announced on `/v1/models`.
+/// Mainline Claude Code only reads a window from the literal `[1m]` suffix
+/// (regex `/\[1m\]/i`), never from arbitrary `[<digits>k|m]` — so a window
+/// below 1M yields no suffix (`None`) and a window at/above 1M announces
+/// `[1m]` (rounded down, never claiming more than the real window).
+pub fn window_suffix(tokens: u64) -> Option<String> {
+    (tokens >= 1_000_000).then(|| "[1m]".to_string())
+}
 /// Sanitize a model id into a URL/claude-safe slug.
 pub fn slugify(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -440,5 +448,21 @@ mod tests {
         assert_eq!(strip_window_suffix("claude-x[k]"), "claude-x[k]");
         assert_eq!(strip_window_suffix("claude-x"), "claude-x");
         assert_eq!(strip_window_suffix("no-bracket"), "no-bracket");
+    }
+
+    #[test]
+    fn window_suffix_only_1m() {
+        // Mainline Claude Code reads a window only from the literal `[1m]`
+        // suffix; sub-1M windows announce nothing.
+        assert_eq!(window_suffix(1_000_000), Some("[1m]".to_string()));
+        assert_eq!(window_suffix(1_050_000), Some("[1m]".to_string()));
+        assert_eq!(window_suffix(1_999_999), Some("[1m]".to_string()));
+        assert_eq!(window_suffix(2_000_000), Some("[1m]".to_string()));
+        assert_eq!(window_suffix(200_000), None);
+        assert_eq!(window_suffix(128_000), None);
+        assert_eq!(window_suffix(105_000), None);
+        assert_eq!(window_suffix(0), None);
+        // Round trip: what we announce is what the gateway strips again.
+        assert_eq!(strip_window_suffix("claude-x[1m]"), "claude-x");
     }
 }
