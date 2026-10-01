@@ -4,7 +4,7 @@
 //!   (forward `anthropic-version` / `anthropic-beta` / body unchanged).
 //! - `openai*` packages: translate Anthropic <-> OpenAI Chat Completions.
 
-use crate::domain::{protocol_for_entry, CatalogEntry, Protocol};
+use crate::domain::{protocol_for_entry, CatalogEntry, Protocol, ThinkingConfig};
 use serde_json::Value;
 
 // ---------------------------------------------------------------------------
@@ -22,6 +22,66 @@ pub fn join_url(base: &str, path: &str) -> String {
 // ---------------------------------------------------------------------------
 // Anthropic -> OpenAI Chat Completions
 // ---------------------------------------------------------------------------
+
+fn image_part_to_openai(b: &Value) -> Option<Value> {
+    let src = b.get("source")?;
+    let mt = src
+        .get("media_type")
+        .and_then(Value::as_str)
+        .unwrap_or("image/jpeg");
+    let data = src.get("data").and_then(Value::as_str)?;
+    (!data.is_empty()).then(|| {
+        serde_json::json!({
+            "type": "image_url",
+            "image_url": {"url": format!("data:{mt};base64,{data}")}
+        })
+    })
+}
+
+fn image_part_to_responses(b: &Value) -> Option<Value> {
+    let src = b.get("source")?;
+    let mt = src
+        .get("media_type")
+        .and_then(Value::as_str)
+        .unwrap_or("image/jpeg");
+    let data = src.get("data").and_then(Value::as_str)?;
+    (!data.is_empty()).then(|| {
+        serde_json::json!({
+            "type": "input_image",
+            "image_url": format!("data:{mt};base64,{data}")
+        })
+    })
+}
+
+/// Split a `tool_result` into its text and the images nested in its content.
+///
+/// Neither Chat Completions nor Responses has an error flag on a tool output,
+/// so a failed result (`is_error`) is made explicit in the payload text
+/// instead of being silently flattened to its (possibly empty) content.
+fn tool_result_parts(b: &Value) -> (String, Vec<Value>, Vec<Value>) {
+    let is_error = b.get("is_error").and_then(Value::as_bool).unwrap_or(false);
+    let mut text = block_text(b).unwrap_or_default();
+    if is_error {
+        text = if text.is_empty() {
+            "Error: tool execution failed".to_string()
+        } else {
+            format!("Error: {text}")
+        };
+    }
+    let mut images_oai: Vec<Value> = vec![];
+    let mut images_resp: Vec<Value> = vec![];
+    if let Some(parts) = b.get("content").and_then(Value::as_array) {
+        for p in parts {
+            if let Some(img) = image_part_to_openai(p) {
+                images_oai.push(img);
+            }
+            if let Some(img) = image_part_to_responses(p) {
+                images_resp.push(img);
+            }
+        }
+    }
+    (text, images_oai, images_resp)
+}
 
 fn block_text(b: &Value) -> Option<String> {
     match b.get("type").and_then(|t| t.as_str()) {
@@ -82,7 +142,7 @@ pub fn anthropic_to_openai(body: &Value, upstream_model: &str) -> Value {
                     let mut texts: Vec<String> = vec![];
                     let mut tool_calls: Vec<Value> = vec![];
                     let mut images: Vec<Value> = vec![];
-                    let mut tool_results: Vec<(String, String)> = vec![];
+                    let mut tool_results: Vec<(String, String, Vec<Value>)> = vec![];
                     for b in blocks {
                         match b.get("type").and_then(|t| t.as_str()) {
                             Some("text") => {
@@ -122,8 +182,8 @@ pub fn anthropic_to_openai(body: &Value, upstream_model: &str) -> Value {
                                     .and_then(|x| x.as_str())
                                     .unwrap_or("")
                                     .to_string();
-                                let txt = block_text(b).unwrap_or_default();
-                                tool_results.push((id, txt));
+                                let (txt, nested_images, _) = tool_result_parts(b);
+                                tool_results.push((id, txt, nested_images));
                             }
                             _ => {}
                         }
@@ -135,14 +195,40 @@ pub fn anthropic_to_openai(body: &Value, upstream_model: &str) -> Value {
                         // upstreams 400 otherwise ("must be followed by tool
                         // messages"). Any accompanying text goes AFTER as its
                         // own user message.
-                        for (id, txt) in tool_results {
+                        let mut trailing_content: Vec<Value> = vec![];
+                        for (id, txt, nested_images) in tool_results {
                             messages.push(serde_json::json!({
                                 "role": "tool", "tool_call_id": id, "content": txt
                             }));
+                            if !nested_images.is_empty() {
+                                if !txt.is_empty() {
+                                    trailing_content
+                                        .push(serde_json::json!({"type":"text","text":txt}));
+                                }
+                                trailing_content.extend(nested_images);
+                            }
                         }
                         let t = texts.join("\n");
                         if !t.trim().is_empty() {
-                            messages.push(serde_json::json!({"role": "user", "content": t}));
+                            trailing_content.push(serde_json::json!({"type":"text","text":t}));
+                        }
+                        if !trailing_content.is_empty() {
+                            // Text-only trailing content stays a plain
+                            // string: strict OpenAI-compatible upstreams are
+                            // less tolerant of a content-part array. Images
+                            // nested in a tool_result force the array shape.
+                            let content = if trailing_content.iter().all(|p| p["type"] == "text") {
+                                Value::String(
+                                    trailing_content
+                                        .iter()
+                                        .filter_map(|p| p["text"].as_str())
+                                        .collect::<Vec<_>>()
+                                        .join("\n"),
+                                )
+                            } else {
+                                Value::Array(trailing_content)
+                            };
+                            messages.push(serde_json::json!({"role":"user","content":content}));
                         }
                     } else if !tool_calls.is_empty() {
                         let mut msg = serde_json::json!({
@@ -240,44 +326,193 @@ pub fn anthropic_to_openai(body: &Value, upstream_model: &str) -> Value {
 // ---------------------------------------------------------------------------
 
 /// Normalize a variant's reasoning label into the OpenAI `reasoning_effort`
-/// enum (`low`/`medium`/`high`, new models also accept `minimal`/`xhigh`).
-/// Labels with no equivalent — e.g. Anthropic style `max` thinking budget —
-/// map to the highest generic effort so semantics degrade instead of error.
+/// enum. Anthropic's `max` label has no OpenAI equivalent and degrades to
+/// `high`; an explicit `none` is preserved so it cannot become maximum
+/// reasoning by accident.
 pub fn normalize_reasoning(label: &str) -> &str {
     match label.to_ascii_lowercase().trim() {
-        // OpenAI native subset.
+        "none" => "none",
         "minimal" => "minimal",
         "low" => "low",
-        "medium" | "high" => "high",        // medium saturates to high
-        "xhigh" | "max" | "none" => "high", // no OpenAI equivalent -> high
+        "medium" => "medium",
+        "high" => "high",
+        "xhigh" | "max" => "high",
         _ => "high",
     }
 }
 
+/// The `thinking` object sent when a Messages-API variant turns thinking on.
+/// The catalog already fixed the display mode for these variants, so the
+/// gateway forwards exactly that.
+const THINKING_ADAPTIVE_JSON: &str = r#"{"type":"adaptive","display":"summarized"}"#;
+
+/// A variant that has a catalog definition but no safe representation on the
+/// Messages API. Surfaced as a 400 instead of a silent no-op, so a user who
+/// asked for `#xhigh` on an Anthropic model learns it was not applied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnthropicVariantError {
+    pub model: String,
+    pub variant: String,
+}
+
+impl std::fmt::Display for AnthropicVariantError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "variant '{}' on '{}' has no Messages API representation \
+             (thinking/effort); it cannot be applied",
+            self.variant, self.model
+        )
+    }
+}
+
+/// What a variant resolves to for its wire protocol, or an error when the
+/// target protocol has no safe representation for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VariantPlan {
+    /// No settings to apply (variant unknown, or declares nothing).
+    None,
+    /// Chat Completions: `reasoning_effort` string, or remove the key (`none`).
+    ChatReasoning(String),
+    /// Responses: `reasoning.effort` plus optional `include` parts.
+    ResponsesReasoning {
+        effort: String,
+        include: Option<Vec<String>>,
+    },
+    /// Messages API: `thinking` object (`null` = the variant disables it),
+    /// optional `include` parts.
+    AnthropicThinking { thinking: Value },
+}
+
+/// Resolve how `variant` applies to `entry`'s protocol, or `Err` when the
+/// Messages API cannot represent it safely.
+pub fn variant_plan(
+    entry: &CatalogEntry,
+    variant: &str,
+) -> Result<VariantPlan, AnthropicVariantError> {
+    let Some(v) = entry.variant(variant) else {
+        return Ok(VariantPlan::None);
+    };
+    let err = || AnthropicVariantError {
+        model: entry.qualified(),
+        variant: variant.to_string(),
+    };
+    match protocol_for_entry(entry) {
+        Protocol::ChatCompletions => match v.settings.reasoning_effort.as_deref() {
+            Some(r) => Ok(VariantPlan::ChatReasoning(
+                normalize_reasoning(r).to_string(),
+            )),
+            None => Ok(VariantPlan::None),
+        },
+        Protocol::Responses => match v.settings.reasoning_effort.as_deref() {
+            Some(r) => Ok(VariantPlan::ResponsesReasoning {
+                effort: normalize_reasoning(r).to_string(),
+                include: v.settings.include.clone(),
+            }),
+            None => Ok(VariantPlan::None),
+        },
+        // Messages API has no `reasoningEffort` parameter. A variant carries
+        // either a `thinking` object (forwarded verbatim) and/or an `effort`
+        // label (mapped to the closest thinking mode); anything else is not
+        // representable and is rejected rather than silently dropped.
+        Protocol::Anthropic => {
+            let thinking = match &v.settings.thinking {
+                Some(ThinkingConfig::Typed { kind, .. })
+                    if kind.eq_ignore_ascii_case("disabled") =>
+                {
+                    Value::Null
+                }
+                Some(_) => serde_json::from_str(THINKING_ADAPTIVE_JSON).unwrap_or(Value::Null),
+                None => match v.settings.effort.as_deref() {
+                    // Explicit no-thinking variant.
+                    Some(e) if e.eq_ignore_ascii_case("none") => Value::Null,
+                    Some(e) => thinking_for_effort(e),
+                    // `reasoningEffort` alone on a Messages-API model was the
+                    // old silent no-op; keep rejecting it.
+                    None if v.settings.reasoning_effort.is_some() => return Err(err()),
+                    None => return Ok(VariantPlan::None),
+                },
+            };
+            Ok(VariantPlan::AnthropicThinking { thinking })
+        }
+    }
+}
+
+/// Map a Messages-API effort label onto a `thinking` object. Unknown labels
+/// degrade to adaptive thinking rather than dropping the request.
+fn thinking_for_effort(effort: &str) -> Value {
+    match effort.to_ascii_lowercase().trim() {
+        // The catalog's `thinking: {"type":"disabled"}` equivalent.
+        "none" => Value::Null,
+        // Anthropic accepts `thinking: {"type":"enabled"}` at a lower effort.
+        "minimal" | "low" => serde_json::json!({"type": "enabled"}),
+        _ => serde_json::from_str(THINKING_ADAPTIVE_JSON).unwrap_or(Value::Null),
+    }
+}
+
 /// Apply a selected variant to a translated request body.
-/// The field that carries the variant's parameters depends on the wire
-/// protocol (same table as `protocol_for_entry`):
 ///
-/// - `Anthropic`: `reasoning_effort` is not a Messages param; a variant that
-///   declares `reasoningEffort` is a no-op (we cannot guess a thinking
-///   budget). Direct calls get whatever the upstream model defaults to.
-/// - `ChatCompletions`: `reasoning_effort` (OpenAI-compatible gateways).
-/// - `Responses`: `reasoning` (OpenAI Responses API key).
+/// The field that carries the variant depends on the wire protocol (same
+/// table as `protocol_for_entry`):
+///
+/// - `ChatCompletions`: `reasoning_effort` (removed for an explicit `none`).
+/// - `Responses`: `reasoning.effort` plus the variant's `include` parts.
+/// - `Anthropic`: `thinking` (and `include` where the catalog lists it);
+///   a variant with no representable fields is rejected by
+///   [`apply_variant_checked`].
 ///
 /// Unknown variant labels pass through unchanged (callers validate).
-pub fn apply_variant(mut body: Value, entry: &CatalogEntry, variant: &str) -> Value {
-    let Some(v) = entry.variant(variant) else {
-        return body;
-    };
-    let Some(effort) = v.settings.reasoning_effort.as_deref() else {
-        return body;
-    };
-    let key = match protocol_for_entry(entry) {
-        Protocol::Anthropic => return body,
-        Protocol::Responses => "reasoning",
-        Protocol::ChatCompletions => "reasoning_effort",
-    };
-    body[key] = Value::String(normalize_reasoning(effort).to_string());
+pub fn apply_variant(body: Value, entry: &CatalogEntry, variant: &str) -> Value {
+    match variant_plan(entry, variant) {
+        Ok(plan) => apply_plan(body, plan),
+        // Direct (unchecked) callers keep the previous lenient behavior.
+        Err(_) => body,
+    }
+}
+
+/// Apply a variant, surfacing a Messages-API variant the gateway cannot
+/// represent (see [`variant_plan`]).
+pub fn apply_variant_checked(
+    body: Value,
+    entry: &CatalogEntry,
+    variant: &str,
+) -> Result<Value, AnthropicVariantError> {
+    let plan = variant_plan(entry, variant)?;
+    Ok(apply_plan(body, plan))
+}
+
+fn apply_plan(mut body: Value, plan: VariantPlan) -> Value {
+    match plan {
+        VariantPlan::None => {}
+        VariantPlan::ChatReasoning(effort) => {
+            if effort == "none" {
+                if let Some(o) = body.as_object_mut() {
+                    o.remove("reasoning_effort");
+                }
+            } else {
+                body["reasoning_effort"] = Value::String(effort);
+            }
+        }
+        VariantPlan::ResponsesReasoning { effort, include } => {
+            body["reasoning"] = serde_json::json!({"effort": effort});
+            if let Some(include) = include {
+                body["include"] = Value::Array(include.into_iter().map(Value::String).collect());
+            }
+        }
+        VariantPlan::AnthropicThinking { thinking } => {
+            match thinking {
+                // The variant turns thinking off explicitly.
+                Value::Null => {
+                    if let Some(o) = body.as_object_mut() {
+                        o.insert("thinking".into(), serde_json::json!({"type":"disabled"}));
+                    }
+                }
+                other => {
+                    body["thinking"] = other;
+                }
+            }
+        }
+    }
     body
 }
 
@@ -415,19 +650,8 @@ pub fn anthropic_to_responses(body: &Value, upstream_model: &str) -> Value {
                                 }
                             }
                             Some("image") => {
-                                if let Some(src) = b.get("source") {
-                                    let mt = src
-                                        .get("media_type")
-                                        .and_then(|x| x.as_str())
-                                        .unwrap_or("image/jpeg");
-                                    let data =
-                                        src.get("data").and_then(|x| x.as_str()).unwrap_or("");
-                                    if !data.is_empty() {
-                                        images.push(serde_json::json!({
-                                            "type": "input_image",
-                                            "image_url": format!("data:{mt};base64,{data}")
-                                        }));
-                                    }
+                                if let Some(img) = image_part_to_responses(b) {
+                                    images.push(img);
                                 }
                             }
                             Some("tool_use") => {
@@ -444,11 +668,22 @@ pub fn anthropic_to_responses(body: &Value, upstream_model: &str) -> Value {
                                     .and_then(|x| x.as_str())
                                     .unwrap_or("")
                                     .to_string();
+                                let (txt, _, nested_images) = tool_result_parts(b);
                                 outputs.push(serde_json::json!({
                                     "type": "function_call_output",
                                     "call_id": id,
-                                    "output": block_text(b).unwrap_or_default()
+                                    "output": txt
                                 }));
+                                // Responses has no error flag and no place for
+                                // images inside a function_call_output, so they
+                                // follow as a user input_image message. The
+                                // ordered input list keeps them in place.
+                                if !nested_images.is_empty() {
+                                    input.push(serde_json::json!({
+                                        "role": "user",
+                                        "content": nested_images
+                                    }));
+                                }
                             }
                             _ => {}
                         }
@@ -629,6 +864,7 @@ pub struct ResponsesTranslator {
     pub text_closed: bool,
     pub tool_blocks: Vec<ResponsesToolBlock>,
     pub message_started: bool,
+    pub input_tokens: u64,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -663,7 +899,7 @@ impl ResponsesTranslator {
             "message": {"id": self.msg_id, "type": "message", "role": "assistant",
                 "model": self.gateway_model, "content": [],
                 "stop_reason": null, "stop_sequence": null,
-                "usage": {"input_tokens": 0, "output_tokens": 0}}
+                "usage": {"input_tokens": self.input_tokens, "output_tokens": 0}}
         }))]
     }
 
@@ -693,6 +929,9 @@ impl ResponsesTranslator {
     fn start_tool(&mut self, pos: usize, out: &mut Vec<String>) {
         if self.tool_blocks[pos].started {
             return;
+        }
+        if !self.text_open {
+            self.ensure_text(out);
         }
         if self.tool_blocks[pos].id.is_empty() {
             self.tool_blocks[pos].id = format!("toolu_{pos}");
@@ -784,6 +1023,21 @@ impl ResponsesTranslator {
                     }
                 }
             }
+            // The upstream reports a mid-stream failure. Surface it as an
+            // Anthropic `error` event; the caller also appends one after
+            // `message_stop` for `response.failed`.
+            Some("error") => {
+                let e = ev.get("error").unwrap_or(ev);
+                let msg = e
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("upstream error");
+                let ty = e
+                    .get("type")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("api_error");
+                out.push(sse_error(ty, msg));
+            }
             _ => {}
         }
         out
@@ -793,7 +1047,12 @@ impl ResponsesTranslator {
         self.tool_blocks.iter().any(|b| b.started)
     }
 
-    pub fn finish(&mut self, stop_reason: &str, output_tokens: u64) -> Vec<String> {
+    pub fn finish(
+        &mut self,
+        stop_reason: &str,
+        input_tokens: u64,
+        output_tokens: u64,
+    ) -> Vec<String> {
         let mut out = vec![];
         if self.text_open && !self.text_closed {
             self.text_closed = true;
@@ -811,7 +1070,7 @@ impl ResponsesTranslator {
         out.push(sse(&serde_json::json!({
             "type": "message_delta",
             "delta": {"stop_reason": stop_reason, "stop_sequence": null},
-            "usage": {"output_tokens": output_tokens}
+            "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens}
         })));
         out.push(sse(&serde_json::json!({"type": "message_stop"})));
         out
@@ -831,6 +1090,7 @@ pub struct StreamTranslator {
     pub text_closed: bool,
     pub tool_blocks: Vec<ToolBlock>,
     pub message_started: bool,
+    pub input_tokens: u64,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -864,7 +1124,7 @@ impl StreamTranslator {
             "message": {"id": self.msg_id, "type": "message", "role": "assistant",
                 "model": self.gateway_model, "content": [],
                 "stop_reason": null, "stop_sequence": null,
-                "usage": {"input_tokens": 0, "output_tokens": 0}}
+                "usage": {"input_tokens": self.input_tokens, "output_tokens": 0}}
         }))]
     }
 
@@ -902,6 +1162,23 @@ impl StreamTranslator {
         if let Some(calls) = delta.get("tool_calls").and_then(|c| c.as_array()) {
             for tc in calls {
                 let idx = tc.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
+                let has_identity = tc
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| !s.is_empty())
+                    || tc
+                        .get("function")
+                        .and_then(|f| f.get("name"))
+                        .and_then(Value::as_str)
+                        .is_some_and(|s| !s.is_empty())
+                    || tc
+                        .get("function")
+                        .and_then(|f| f.get("arguments"))
+                        .and_then(Value::as_str)
+                        .is_some_and(|s| !s.is_empty());
+                if has_identity && !self.text_open {
+                    self.ensure_text(&mut out);
+                }
                 while self.tool_blocks.len() <= idx {
                     let n = self.tool_blocks.len();
                     self.tool_blocks.push(ToolBlock {
@@ -922,7 +1199,7 @@ impl StreamTranslator {
                         }
                     }
                 }
-                if !block.started && (!block.name.is_empty() || !block.id.is_empty()) {
+                if !block.started && has_identity {
                     block.started = true;
                     if block.id.is_empty() {
                         block.id = format!("toolu_{idx}");
@@ -953,7 +1230,12 @@ impl StreamTranslator {
         out
     }
 
-    pub fn finish(&mut self, stop_reason: &str, output_tokens: u64) -> Vec<String> {
+    pub fn finish(
+        &mut self,
+        stop_reason: &str,
+        input_tokens: u64,
+        output_tokens: u64,
+    ) -> Vec<String> {
         let mut out = vec![];
         if self.text_open && !self.text_closed {
             self.text_closed = true;
@@ -971,7 +1253,7 @@ impl StreamTranslator {
         out.push(sse(&serde_json::json!({
             "type": "message_delta",
             "delta": {"stop_reason": stop_reason, "stop_sequence": null},
-            "usage": {"output_tokens": output_tokens}
+            "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens}
         })));
         out.push(sse(&serde_json::json!({"type": "message_stop"})));
         out
@@ -984,6 +1266,16 @@ pub fn sse(v: &Value) -> String {
         v.get("type").and_then(|t| t.as_str()).unwrap_or("message"),
         v
     )
+}
+
+/// Anthropic `error` SSE frame. The Messages API allows an `error` event
+/// mid-stream (after `message_start`), so a translator can report an upstream
+/// failure instead of ending the stream silently.
+pub fn sse_error(err_type: &str, message: &str) -> String {
+    sse(&serde_json::json!({
+        "type": "error",
+        "error": {"type": err_type, "message": message}
+    }))
 }
 
 /// Wrap a byte stream, injecting `event: ping` SSE frames whenever the
@@ -1149,9 +1441,7 @@ mod tests {
                     id,
                     settings: crate::domain::ModelVariantSettings {
                         reasoning_effort: effort,
-                        thinking: None,
-                        budget_tokens: None,
-                        include: None,
+                        ..Default::default()
                     },
                 })
                 .collect(),
@@ -1161,9 +1451,9 @@ mod tests {
     #[test]
     fn normalize_reasoning_clamps_to_openai_enum() {
         assert_eq!(normalize_reasoning("low"), "low");
-        assert_eq!(normalize_reasoning("medium"), "high");
+        assert_eq!(normalize_reasoning("medium"), "medium");
         assert_eq!(normalize_reasoning("high"), "high");
-        assert_eq!(normalize_reasoning("xhigh"), "high");
+        assert_eq!(normalize_reasoning("none"), "none");
         assert_eq!(normalize_reasoning("MAX"), "high");
         assert_eq!(normalize_reasoning("garbage"), "high");
     }
@@ -1187,20 +1477,186 @@ mod tests {
         );
         let body = serde_json::json!({"model": "x", "input": []});
         let out = apply_variant(body, &e, "low");
-        assert_eq!(out["reasoning"], "low");
-        assert!(out.get("reasoning_effort").is_none());
+        assert_eq!(out["reasoning"]["effort"], "low");
+        assert!(out["reasoning"].is_object());
     }
 
     #[test]
-    fn apply_variant_noop_for_anthropic_and_unknown() {
+    fn anthropic_variant_without_representation_is_rejected() {
+        // `reasoningEffort` alone has no Messages API parameter: surfaced as
+        // an error rather than a silent no-op.
         let e = entry_with_variants(
             "@opencode/ai/providers/anthropic",
             vec![("high".to_string(), Some("high".to_string()))],
         );
         let body = serde_json::json!({"model": "x"});
-        assert_eq!(apply_variant(body.clone(), &e, "high"), body);
-        // Unknown variant label -> untouched too.
+        assert!(apply_variant_checked(body.clone(), &e, "high").is_err());
+        // Unknown variant label stays untouched for both entry points.
         assert_eq!(apply_variant(body.clone(), &e, "nope"), body);
+        assert_eq!(
+            apply_variant_checked(body.clone(), &e, "nope").unwrap(),
+            body
+        );
+    }
+
+    fn anthropic_variant(
+        pkg: &str,
+        id: &str,
+        thinking: Option<crate::domain::ThinkingConfig>,
+        effort: Option<&str>,
+        reasoning_effort: Option<&str>,
+    ) -> CatalogEntry {
+        let mut e = entry_with_variants(pkg, vec![]);
+        e.variants.push(crate::domain::ModelVariant {
+            id: id.to_string(),
+            settings: crate::domain::ModelVariantSettings {
+                reasoning_effort: reasoning_effort.map(str::to_string),
+                thinking,
+                effort: effort.map(str::to_string),
+                ..Default::default()
+            },
+        });
+        e
+    }
+
+    #[test]
+    fn anthropic_variant_maps_thinking_object_and_effort() {
+        // Catalog `thinking` object is forwarded verbatim.
+        let e = anthropic_variant(
+            "@opencode/ai/providers/anthropic",
+            "high",
+            Some(crate::domain::ThinkingConfig::Typed {
+                kind: "adaptive".to_string(),
+                display: Some("summarized".to_string()),
+            }),
+            None,
+            None,
+        );
+        let out = apply_variant_checked(serde_json::json!({"model": "x"}), &e, "high").unwrap();
+        assert_eq!(out["thinking"]["type"], "adaptive");
+        assert_eq!(out["thinking"]["display"], "summarized");
+
+        // A `disabled` variant turns thinking off explicitly.
+        let e = anthropic_variant(
+            "@opencode/ai/providers/anthropic",
+            "none",
+            Some(crate::domain::ThinkingConfig::Typed {
+                kind: "disabled".to_string(),
+                display: None,
+            }),
+            None,
+            None,
+        );
+        let out = apply_variant_checked(serde_json::json!({"model": "x"}), &e, "none").unwrap();
+        assert_eq!(out["thinking"]["type"], "disabled");
+    }
+
+    #[test]
+    fn anthropic_variant_effort_only_maps_to_thinking() {
+        let e = anthropic_variant(
+            "@opencode/ai/providers/anthropic",
+            "high",
+            None,
+            Some("high"),
+            None,
+        );
+        let out = apply_variant_checked(serde_json::json!({"model": "x"}), &e, "high").unwrap();
+        assert_eq!(out["thinking"]["type"], "adaptive");
+
+        // `none` disables thinking.
+        let e = anthropic_variant(
+            "@opencode/ai/providers/anthropic",
+            "none",
+            None,
+            Some("none"),
+            None,
+        );
+        let out = apply_variant_checked(serde_json::json!({"model": "x"}), &e, "none").unwrap();
+        assert_eq!(out["thinking"]["type"], "disabled");
+    }
+
+    #[test]
+    fn responses_variant_carries_include_parts() {
+        let mut e = entry_with_variants(
+            "@opencode/ai/providers/openai",
+            vec![("high".to_string(), Some("high".to_string()))],
+        );
+        e.variants[0].settings.include = Some(vec!["reasoning.encrypted_content".to_string()]);
+        let out = apply_variant(serde_json::json!({"model": "x"}), &e, "high");
+        assert_eq!(out["reasoning"]["effort"], "high");
+        assert_eq!(out["include"][0], "reasoning.encrypted_content");
+    }
+
+    #[test]
+    fn chat_variant_none_removes_reasoning_effort() {
+        let e = entry_with_variants(
+            "@opencode/ai/providers/openai-compatible",
+            vec![("none".to_string(), Some("none".to_string()))],
+        );
+        let out = apply_variant(
+            serde_json::json!({"model": "x", "reasoning_effort": "high"}),
+            &e,
+            "none",
+        );
+        assert!(out.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn tool_result_error_and_images_survive_translation() {
+        let body = serde_json::json!({
+            "model": "x",
+            "messages": [
+                {"role": "user", "content": "look"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "t1", "name": "Read", "input": {}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "is_error": true,
+                     "content": [
+                        {"type": "text", "text": "boom"},
+                        {"type": "image", "source": {"type":"base64","media_type":"image/png","data":"QUJD"}}
+                     ]}
+                ]}
+            ],
+            "max_tokens": 10
+        });
+
+        // Chat Completions: explicit error text + nested image in a follow-up.
+        let oai = anthropic_to_openai(&body, "up");
+        let msgs = oai["messages"].as_array().unwrap();
+        let tool = msgs.iter().find(|m| m["role"] == "tool").unwrap();
+        assert_eq!(tool["content"], "Error: boom");
+        let img_holder = msgs
+            .iter()
+            .find(|m| m["role"] == "user" && m["content"].is_array())
+            .expect("trailing user message with nested image");
+        let parts = img_holder["content"].as_array().unwrap();
+        assert!(parts.iter().any(|p| p["type"] == "image_url"));
+
+        // Responses: function_call_output text is prefixed, image follows as
+        // an input_image item.
+        let resp = anthropic_to_responses(&body, "up");
+        let input = resp["input"].as_array().unwrap();
+        let out = input
+            .iter()
+            .find(|i| i["type"] == "function_call_output")
+            .unwrap();
+        assert_eq!(out["output"], "Error: boom");
+        assert!(input
+            .iter()
+            .any(|i| i["role"] == "user" && i["content"][0]["type"] == "input_image"));
+    }
+
+    #[test]
+    fn responses_error_event_is_surfaced() {
+        let mut tr = ResponsesTranslator::new("gw");
+        let _ = tr.prefix();
+        let out = tr.feed(&serde_json::json!({
+            "type": "error",
+            "error": {"type": "api_error", "message": "overloaded"}
+        }));
+        assert!(out.iter().any(|e| e.contains("event: error")));
+        assert!(out.iter().any(|e| e.contains("overloaded")));
     }
 
     #[test]
@@ -1299,7 +1755,7 @@ mod tests {
         let c2 = serde_json::json!({"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "c1", "function": {"name": "Read", "arguments": "{\"p\":"}}]}}]});
         let e2 = t.feed(&c2);
         assert!(e2.iter().any(|e| e.contains("tool_use")));
-        let end = t.finish("tool_use", 3);
+        let end = t.finish("tool_use", 0, 3);
         assert!(end.iter().any(|e| e.contains("message_stop")));
     }
 
@@ -1364,8 +1820,94 @@ mod tests {
         });
         assert!(t.feed(&d2).iter().any(|e| e.contains("input_json_delta")));
         assert!(t.has_tools());
-        let end = t.finish("tool_use", 3);
+        let end = t.finish("tool_use", 0, 3);
         assert!(end.iter().any(|e| e.contains("message_stop")));
+    }
+
+    #[test]
+    fn stream_translator_opens_tool_when_args_arrive_first() {
+        // Strict gateways may stream arguments before the id/name. The block
+        // must still open (with a generated id/name), and the text block keeps
+        // index 0 so tool indices stay monotonic.
+        let mut t = StreamTranslator::new("gw");
+        let _ = t.prefix();
+        let ev = t.feed(&serde_json::json!({
+            "choices": [{"delta": {"tool_calls": [
+                {"index": 0, "function": {"arguments": "{\"p\":"}}
+            ]}}]
+        }));
+        let started = ev
+            .iter()
+            .find(|e| e.contains("content_block_start") && e.contains("tool_use"))
+            .expect("tool block opened from arguments alone");
+        assert!(started.contains("\"index\":1"), "{started}");
+        assert!(ev.iter().any(|e| e.contains("input_json_delta")));
+        // Second (text) delta still lands on index 0, not on the tool block.
+        let ev = t.feed(&serde_json::json!({"choices": [{"delta": {"content": "x"}}]}));
+        assert!(ev
+            .iter()
+            .any(|e| e.contains("\"index\":0") && e.contains("text_delta")));
+    }
+
+    #[test]
+    fn stream_translator_indices_are_monotonic() {
+        let mut t = StreamTranslator::new("gw");
+        let _ = t.prefix();
+        let ev = t.feed(&serde_json::json!({
+            "choices": [{"delta": {"tool_calls": [
+                {"index": 0, "id": "a", "function": {"name": "Read", "arguments": "{}"}},
+                {"index": 1, "id": "b", "function": {"name": "Bash", "arguments": "{}"}}
+            ]}}]
+        }));
+        let indices: Vec<usize> = ev
+            .iter()
+            .filter(|e| e.contains("content_block_start"))
+            .filter_map(|e| {
+                let json = e.split_once("data: ").map(|(_, d)| d.trim())?;
+                serde_json::from_str::<Value>(json)
+                    .ok()?
+                    .get("index")
+                    .and_then(Value::as_u64)
+                    .map(|n| n as usize)
+            })
+            .collect();
+        assert_eq!(indices, vec![0, 1, 2], "{ev:?}");
+        assert!(indices.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    #[test]
+    fn responses_reasoning_item_is_omitted_not_fabricated() {
+        // Responses `reasoning` items carry no Anthropic-valid form (no real
+        // signature or redacted content), so they are dropped rather than
+        // emitted as a fake `thinking` block.
+        let resp = serde_json::json!({
+            "id": "resp_1",
+            "status": "completed",
+            "output": [
+                {"type": "reasoning", "summary": [{"type": "summary_text", "text": "why"}]},
+                {"type": "message", "content": [{"type": "output_text", "text": "answer"}]}
+            ],
+            "usage": {"input_tokens": 1, "output_tokens": 2}
+        });
+        let a = responses_to_anthropic(&resp, "gw");
+        let content = a["content"].as_array().unwrap();
+        assert!(!content.iter().any(|c| c["type"] == "thinking"));
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "answer");
+    }
+
+    #[test]
+    fn responses_stream_usage_lands_in_message_delta() {
+        let mut t = ResponsesTranslator::new("gw");
+        let _ = t.prefix();
+        t.input_tokens = 11;
+        let end = t.finish("end_turn", 11, 4);
+        let delta = end
+            .iter()
+            .find(|e| e.contains("message_delta"))
+            .expect("message_delta");
+        assert!(delta.contains("\"input_tokens\":11"), "{delta}");
+        assert!(delta.contains("\"output_tokens\":4"), "{delta}");
     }
 
     // Short real-time durations (no paused clock needed).

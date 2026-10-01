@@ -14,7 +14,14 @@ cargo run -- --refresh        # print catalog + gateway aliases, exit
 cargo run -- --serve          # foreground server on 127.0.0.1:3737
 ```
 
-Daemon lifecycle: `frank-opencode --enable | --disable | --status`. State files
+CI: `.github/workflows/ci.yml` runs `cargo fmt --all --check`, `cargo clippy
+--all-targets -- -D warnings` and `cargo test --all-targets` on every push and
+PR. `main` is protected — the `test` check is required and the branch must be up
+to date, so a PR cannot merge with failing tests (admins may still push
+directly). An opt-in pre-commit hook (`.githooks/pre-commit`, same three
+commands) is enabled per clone with `git config core.hooksPath .githooks`.
+
+Daemon lifecycle: `frank-opencode --enable [--port PORT] | --disable | --status`. Configuration is loaded from `~/.config/frank-opencode/config.toml` (or `--config`/`FRANK_CONFIG`), with `FRANK_PORT` and `FRANK_AUTH_TOKEN` overrides. State files
 (pid, port, session id, log) live in `~/.local/share/frank-opencode/` and are
 created 0600 via `daemon::write_private`.
 
@@ -29,10 +36,12 @@ Layers:
 
 - **`domain/`** — pure types and rules, no async. `ModelRef` (provider/model,
   `#variant` suffix), `CatalogEntry` (deserializes `opencode api get /api/model`
-  output, including `variants`), `protocol_for(package)` → wire protocol,
-  `auto_alias` (gateway id must contain `claude`/`anthropic` for Claude Code's
-  `/v1/models` discovery), `strip_window_suffix` (`[1m]`/`[200k]` hints Claude
-  Code appends to unknown ids).
+  output, including `variants`, per-model headers/body defaults, context limits,
+  and distinct catalog `id` rows), `protocol_for_entry` → wire protocol (including
+  `settings.endpoint` for mixed `github-copilot` catalogs), `auto_alias` (gateway
+  id must contain `claude`/`anthropic` for Claude Code's `/v1/models` discovery),
+  optional `desktop_aliases` rewriting for Claude Desktop's denylist, and
+  `strip_window_suffix` (`[1m]`/`[200k]` hints Claude Code appends to unknown ids).
 - **`infra/opencode.rs`** — OpenCode state. Credentials ONLY from the SQLite
   `credential` table (read-only; never `auth.json` as source of truth; never
   parse `opencode.jsonc`). Catalog via `opencode api get /api/model`. DB path
@@ -41,15 +50,27 @@ Layers:
   - `anthropic_to_openai` / `openai_to_anthropic` (Chat Completions)
   - `anthropic_to_responses` / `responses_to_anthropic` (Responses API)
   - `StreamTranslator` / `ResponsesTranslator` (SSE → Anthropic SSE)
-  - `apply_variant` — merge the selected variant's `reasoning_effort` into the
-    **translated** body (translators drop unknown fields). Key per protocol:
-    Chat = `reasoning_effort` (labels outside OpenAI's enum saturate to `high`),
-    Responses = `reasoning`, Anthropic = no-op.
+  - `apply_variant` / `apply_variant_checked` — merge the selected variant into
+    the **translated** body (translators drop unknown fields). Key per protocol:
+    Chat = `reasoning_effort` (removed for `none`), Responses = `reasoning`
+    object + `include`, Anthropic = `thinking` object (`adaptive`/`disabled`)
+    from the variant's `thinking`/`effort`. A Messages-API variant with no
+    representable field (`reasoningEffort` alone) is a 400, not a silent no-op.
+  - catalog defaults — merge per-model `headers` and `body` fields (for example
+    fast-mode beta headers and `speed`) into forwarded requests.
   - `estimate_tokens` — per-part local count for `count_tokens` (no tokenizer).
   - `with_heartbeat` — injects `event: ping` during upstream silence.
+  - `sse_error` — Anthropic mid-stream `error` event, used when the upstream
+    stream fails or reports `response.failed` after opening.
 - **`api/server.rs`** — Axum handlers. `body` flows: resolve model → pick
-  forward by `protocol_for` → translate → applies variant → forward with
-  `Bearer` credential + session headers (`x-opencode-session`, always sent).
+  forward by `protocol_for_entry` (catalog `settings.endpoint` can override the
+  package for mixed `github-copilot` rows) → translate → merge catalog defaults
+  → apply variant → forward with `Bearer` credential + session headers
+  (`x-opencode-session`, always sent). The reqwest client uses a short
+  `connect_timeout` and a generous total `timeout` (`connect_timeout_secs` /
+  `request_timeout_secs`), because the total also bounds streaming responses.
+  Non-2xx upstream bodies are normalized to the Anthropic error shape
+  (`upstream_error_response`), keeping the raw body only in the log.
 
 ## Conventions & gotchas
 
@@ -64,6 +85,9 @@ Layers:
   persisted fallback in `frank.session`).
 - **count_tokens**: Anthropic packages proxy to `{baseURL}/messages/count_tokens`
   with fallback to `estimate_tokens`; other packages always estimate locally.
+  The proxy applies the resolved variant and the catalog body defaults so the
+  count matches the real forward, and forwards the client's `anthropic-beta` /
+  `anthropic-version` and session headers.
 - **Error shape**: always `{"type":"error","error":{"type":...,"message":...}}`
   with Anthropic error types (`not_found_error`, `authentication_error`,
   `invalid_request_error`, `api_error`).
