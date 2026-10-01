@@ -5,11 +5,16 @@ modelos do OpenCode v2 ao Claude Code. Escuta apenas em `127.0.0.1` e **nunca**
 fala com a Anthropic — o upstream é o backend Go/Console do OpenCode, roteado
 pelo pacote (provider).
 
-```
-Claude Code ── Anthropic Messages ──▶ frank-opencode (127.0.0.1:3737)
-                                        │  resolve model → protocol_for → traduz → aplica variante
-                                        ▼
-                                OpenCode Go backend (via credential da SQLite)
+```mermaid
+flowchart LR
+    CC["Claude Code"]
+    GW["frank-opencode<br/>(127.0.0.1:3737)"]
+    UP["OpenCode Go backend"]
+    DB[("SQLite<br/>(credential)")]
+
+    CC -->|"Anthropic Messages"| GW
+    GW -->|"resolve model → protocol_for → traduz → aplica variante"| UP
+    UP -.->|"credencial (só-leitura)"| DB
 ```
 
 ## Camadas
