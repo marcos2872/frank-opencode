@@ -143,8 +143,9 @@ Você escolhe modelos dentro do Claude Code via `/model`, alimentado por `GET /v
 
 - **Automático:** cada modelo habilitado do OpenCode ganha um alias `claude-<provider>-<model>`
   (o prefixo `claude-` é obrigatório — a descoberta do Claude Code só mantém ids contendo
-  `claude`/`anthropic`). O catálogo é lido uma única vez no boot: para refletir modelos
-  novos/removidos, reinicie o gateway (`--refresh` só pré-visualiza o que o boot carregaria).
+  `claude`/`anthropic`). O catálogo é lido no boot com retry (veja "Solução de problemas"
+  para o caso `models:0`): para refletir modelos novos/removidos depois disso, reinicie o
+  gateway (`--refresh` só pré-visualiza o que o boot carregaria).
 - **Manual:** `[aliases."<gateway-id>"]` no `config.toml` tem precedência sobre os automáticos;
   `[disabled]` esconde refs do picker.
 - `POST /v1/messages` também aceita refs diretas (`opencode-go/kimi-k2.7-code`) e
@@ -205,7 +206,7 @@ checagem de janela para ids desconhecidos, perdendo a conta real de tokens).
 | `FreeTierError` em modelos `opencode/*` | Free tier do Console só funciona dentro do OpenCode; esses modelos ficam ocultos de `/v1/models` por padrão (`include_free_tier = true` para exibir). Use um modelo `opencode-go/*`. |
 | Saída vazia com `max_tokens` minúsculo | Modelos de reasoning gastam o orçamento no reasoning primeiro; aumente `max_tokens` (o Claude Code já faz isso por padrão). |
 | Modelos faltando no `/model` | Sete `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1`; ids precisam conter `claude`/`anthropic` (os aliases automáticos já contêm). |
-| `/health` mostra `"models":0` e `/v1/models` vazio | O catálogo foi lido uma única vez no boot quando o serviço/backend do OpenCode ainda não estava pronto: `opencode api get /api/model` pode (re)iniciar o serviço, e o primeiro fetch volta com catálogo vazio sem registrar erro (`last_error:null`). Como não há refresh, o picker do Claude Code fica sem modelos. Corrija com `frank-opencode --disable && frank-opencode --enable` — de preferência com `opencode service status` saudável antes, e evite `--enable` imediatamente após um `opencode auth login`. |
+| `/health` mostra `"models":0` e `/v1/models` vazio | O catálogo é lido no boot quando o serviço/backend do OpenCode ainda não estava pronto: `opencode api get /api/model` pode (re)iniciar o serviço, e o primeiro fetch volta com catálogo vazio sem registrar erro (`last_error:null`). O gateway agora **tenta até 6 vezes com backoff** no boot enquanto o catálogo vier vazio (e marca `/health` como `degraded` quando esgota); se mesmo assim seguir vazio, verifique `opencode service status` e reinicie com `frank-opencode --disable && frank-opencode --enable`. |
 | `400` citando `context_management`/`output_config` | O upstream rejeita um campo pré-release; tente com `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1`. |
 | `"X" isn't described by this version's model catalog` | Esperado: ids do gateway são sintéticos e o Claude Code assume janela de 200k. O gateway anuncia a janela real do catálogo do OpenCode (`limit.context`) em `/v1/models` — como campo `context_window` e, para janelas >= 1M, como sufixo `[1m]` no próprio id (o único sufixo que a mainline do Claude Code lê; o gateway remove o sufixo ao resolver). Valide com `curl -s http://127.0.0.1:3737/v1/models | jq '.data[] | {id, context_window}'`. Janelas < 1M continuam com valor padrão no cliente: persista com `behavesAs`/`modelOverrides` para o modelo Claude mais próximo, ou em último caso `CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT=1`. |
 | `Waiting for API response · will retry` (travamentos) | Pausas longas de reasoning sem bytes no stream. O gateway injeta frames `ping` durante o silêncio do upstream; se persistir, cheque `frank.log` por erros do upstream e considere aumentar `API_TIMEOUT_MS`. |
@@ -242,8 +243,11 @@ requisições minúsculas cobradas como uso normal do Go.
 ## Health
 
 `GET /health` (sem auth) reporta `ok` / `degraded` / `starting`, a contagem de modelos,
-o modelo padrão efetivo e o `last_error` do load do catálogo no boot (não há refresh
-automático — para atualizar o catálogo, reinicie o gateway).
+o modelo padrão efetivo e o `last_error` do load do catálogo no boot. No boot o catálogo
+é tentado até 6 vezes com backoff crescente (~2s → 16s) enquanto vier vazio (comum quando
+`opencode api` (re)inicia o serviço); esgotadas as tentativas com 0 modelos, `last_error`
+fica preenchido e o status vira `degraded`, em vez de parecer `ok` com catálogo vazio.
+Não há refresh automático depois do boot — para atualizar o catálogo, reinicie o gateway.
 
 ## Limites (MVP)
 

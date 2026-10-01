@@ -1,4 +1,5 @@
-//! Integration tests against a seeded gateway (no `opencode` binary needed).
+//! Integration tests against a seeded gateway. The boot-retry tests use a
+//! fake `opencode` shim binary; everything else needs no real binary.
 
 use axum::{
     extract::State,
@@ -758,4 +759,177 @@ async fn count_tokens_missing_messages_is_400() {
     assert_eq!(resp.status_code(), 400);
     let body: Value = resp.json();
     assert_eq!(body["error"]["type"], "invalid_request_error");
+}
+
+// ---------------------------------------------------------------------------
+// Boot catalog retry (issue #1): a fake `opencode` shim whose behavior is
+// driven by a state file, rewritten by the test between retries. `refresh()`
+// runs the `opencode_bin` command, so we point AppConfig at an absolute path
+// to a temp shim script — PATH left untouched, tests stay parallel-safe.
+// ---------------------------------------------------------------------------
+
+const RETRY_ATTEMPTS: usize = 6;
+const RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(5);
+
+fn shim_dir() -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "frank-retry-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ))
+}
+
+/// State file the shim reads on every call. Phase 1 = empty catalog,
+/// phase 2 = catalog with one model, `fail` = exit non-zero.
+enum ShimPhase {
+    Empty,
+    Fail,
+    Model,
+}
+
+fn shim_state_file() -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "frank-retry-state-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ))
+}
+
+fn write_phase(state_file: &PathBuf, phase: &ShimPhase) {
+    std::fs::write(
+        state_file,
+        match phase {
+            ShimPhase::Empty => "empty",
+            ShimPhase::Fail => "fail",
+            ShimPhase::Model => "model",
+        },
+    )
+    .expect("write shim state");
+}
+
+/// JSON body on stdout for one enabled model with the given gateway id.
+fn catalog_body(model: &str) -> Value {
+    json!({
+        "data": [{
+            "id": model,
+            "modelID": model,
+            "providerID": "opencode",
+            "name": model,
+            "package": "@opencode/ai/providers/anthropic",
+            "settings": {},
+            "limit": {"context": 1_000_000},
+            "enabled": true,
+            "variants": []
+        }]
+    })
+}
+
+/// Write a self-contained `opencode` shim: it reads its phase from the state
+/// file and prints a preset catalog (or exits 1 for `fail`). The `model`
+/// phase prints the catalog for `model`.
+fn write_shim(dir: &PathBuf, state_file: &PathBuf, model: &str) -> String {
+    let body = catalog_body(model).to_string();
+    std::fs::create_dir_all(dir).expect("create shim dir");
+    let path = dir.join("opencode");
+    let script = format!(
+        "#!/bin/sh\n\
+         phase=\"$(cat '{}')\"\n\
+         if [ \"$phase\" = \"fail\" ]; then\n  exit 1\nfi\n\
+         if [ \"$phase\" = \"model\" ]; then\n  cat <<'EOM'\n{body}\nEOM\n  exit 0\nfi\n\
+         cat <<'EOM'\n{{\"data\":[]}}\nEOM\n",
+        state_file.display()
+    );
+    std::fs::write(&path, script).expect("write shim");
+    std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+        .expect("chmod shim");
+    path.to_string_lossy().to_string()
+}
+
+/// State whose AppConfig points `opencode_bin` at a shim script.
+/// `include_free_tier` is set so the shim's `opencode/*` model counts as
+/// usable (otherwise `refresh()` filters free-tier entries out and the
+/// catalog is always empty no matter what the shim returns).
+async fn shim_state(bin: &str) -> AppState {
+    let mut cfg = test_config();
+    cfg.opencode_bin = bin.to_string();
+    cfg.include_free_tier = true;
+    seeded_state(cfg, vec![], vec![]).await
+}
+
+#[tokio::test]
+async fn boot_retry_converges_when_catalog_starts_empty() {
+    let dir = shim_dir();
+    let state_file = shim_state_file();
+    write_phase(&state_file, &ShimPhase::Empty);
+    let state = shim_state(&write_shim(&dir, &state_file, "boot-retry-model")).await;
+
+    // The catalog warms up after the first attempts: flip the phase while the
+    // retry is sleeping between attempts. Early attempts see `Empty` and are
+    // retried; a later attempt picks up the populated catalog.
+    let state_file2 = state_file.clone();
+    let flipper = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        write_phase(&state_file2, &ShimPhase::Model);
+    });
+    let n = state
+        .refresh_with_retry(RETRY_ATTEMPTS, RETRY_BACKOFF)
+        .await;
+    flipper.await.expect("flipper join");
+
+    assert_eq!(n, 1);
+    // The converged load cleared the transient empty error.
+    assert!(state.last_error.read().await.is_none());
+    let aliases = state.aliases.read().await;
+    assert!(aliases
+        .iter()
+        .any(|a| a.gateway_id == "claude-opencode-boot-retry-model"));
+}
+
+#[tokio::test]
+async fn boot_retry_marks_degraded_on_persistent_empty() {
+    let dir = shim_dir();
+    let state_file = shim_state_file();
+    write_phase(&state_file, &ShimPhase::Empty);
+    let state = shim_state(&write_shim(&dir, &state_file, "never-model")).await;
+
+    let n = state
+        .refresh_with_retry(RETRY_ATTEMPTS, RETRY_BACKOFF)
+        .await;
+    assert_eq!(n, 0);
+    let err = state
+        .last_error
+        .read()
+        .await
+        .clone()
+        .expect("last_error set");
+    assert!(
+        err.contains("still empty after 6 attempts"),
+        "unexpected: {err}"
+    );
+}
+
+#[tokio::test]
+async fn boot_retry_recovers_after_failures() {
+    let dir = shim_dir();
+    let state_file = shim_state_file();
+    write_phase(&state_file, &ShimPhase::Fail);
+    let state = shim_state(&write_shim(&dir, &state_file, "recovered-model")).await;
+
+    // Fetch failures (exit 1) initially, then the service becomes healthy.
+    let state_file2 = state_file.clone();
+    let flipper = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        write_phase(&state_file2, &ShimPhase::Model);
+    });
+    let n = state
+        .refresh_with_retry(RETRY_ATTEMPTS, RETRY_BACKOFF)
+        .await;
+    flipper.await.expect("flipper join");
+
+    assert_eq!(n, 1);
+    assert!(state.last_error.read().await.is_none());
+    let aliases = state.aliases.read().await;
+    assert!(aliases
+        .iter()
+        .any(|a| a.gateway_id == "claude-opencode-recovered-model"));
 }

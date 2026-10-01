@@ -31,6 +31,17 @@ use tokio::sync::RwLock;
 /// (keeps Claude Code's stream watchdog fed during long reasoning pauses).
 pub const HEARTBEAT_IDLE: Duration = Duration::from_secs(20);
 
+/// Boot catalog loader: number of `refresh()` calls before giving up.
+/// `opencode api` can (re)start the OpenCode service and the first fetch often
+/// returns an *empty* catalog (HTTP ok, `data: []`) while it warms up, so the
+/// daemon retries instead of snapshotting `models: 0` forever.
+pub const BOOT_CATALOG_ATTEMPTS: usize = 6;
+/// Initial delay between boot catalog attempts (doubles up to
+/// `BOOT_CATALOG_MAX_BACKOFF`). Tolerates a service still warming up while
+/// keeping total boot delay bounded.
+pub const BOOT_CATALOG_BACKOFF: Duration = Duration::from_secs(2);
+pub const BOOT_CATALOG_MAX_BACKOFF: Duration = Duration::from_secs(16);
+
 #[derive(Clone)]
 pub struct AppState {
     pub config: AppConfig,
@@ -160,6 +171,61 @@ impl AppState {
         *self.last_refresh.write().await = Some(SystemTime::now());
         *self.last_error.write().await = None;
         Ok(n)
+    }
+
+    /// Boot loader: retry `refresh()` until the catalog is non-empty or
+    /// `attempts` are exhausted. `opencode api` can (re)start the OpenCode
+    /// service, so the first fetch often returns an *empty* catalog (HTTP ok,
+    /// `data: []`) while it warms up — without this the daemon would snapshot
+    /// `models: 0` until a manual restart. Failures and empty loads keep the
+    /// previous catalog and are recorded for `/health`; a non-empty load
+    /// clears the error as usual.
+    pub async fn refresh_with_retry(&self, attempts: usize, backoff: Duration) -> usize {
+        let mut delay = backoff;
+        // n<0 means no successful load; used only to disambiguate the final
+        // message (failures vs. persistent empty).
+        let mut n: i64 = -1;
+        for attempt in 1..=attempts {
+            match self.refresh().await {
+                Ok(loaded) if loaded > 0 => return loaded,
+                Ok(_) => {
+                    n = 0;
+                    let msg = format!(
+                        "catalog loaded empty (attempt {attempt}/{attempts}); retrying in {}s",
+                        delay.as_secs()
+                    );
+                    tracing::warn!(%msg);
+                    *self.last_error.write().await = Some(msg);
+                }
+                Err(e) => {
+                    tracing::warn!(err = %e, attempt, "catalog load attempt failed");
+                }
+            }
+            tokio::time::sleep(delay).await;
+            delay = std::cmp::min(delay * 2, BOOT_CATALOG_MAX_BACKOFF);
+        }
+        // Always record the final state so /health never looks `ok` with an
+        // empty catalog. `last_error` is Some -> status `degraded`.
+        let total = (1..attempts)
+            .fold(Duration::ZERO, |acc, i| {
+                acc + std::cmp::min(backoff * 2u32.pow(i as u32), BOOT_CATALOG_MAX_BACKOFF)
+            })
+            .as_secs();
+        let msg = if n < 0 {
+            format!(
+                "catalog fetch failed on all {attempts} attempts ({total}s of retries); \
+                 check the OpenCode service (`opencode service status`) and restart the gateway"
+            )
+        } else {
+            format!(
+                "catalog still empty after {attempts} attempts ({total}s of retries); \
+                 loaded{n} models — check the OpenCode service (`opencode service status`) and \
+                 restart the gateway"
+            )
+        };
+        *self.last_error.write().await = Some(msg.clone());
+        tracing::warn!(%msg);
+        n.max(0) as usize
     }
 
     /// Single source of truth for the default model (config or first alias).

@@ -66,9 +66,20 @@ async fn serve(cfg: config::AppConfig) -> anyhow::Result<()> {
     tracing::info!("listening on http://{addr}");
     let loader = state.clone();
     tokio::spawn(async move {
-        match loader.refresh().await {
-            Ok(n) => tracing::info!(models = n, "catalog loaded"),
-            Err(e) => tracing::warn!("initial catalog load failed: {e}"),
+        // Retry while the catalog comes back empty: `opencode api` can
+        // (re)start the OpenCode service, and the first fetch often returns
+        // `data: []` while it warms up. A single read would snapshot
+        // `models: 0` until a manual restart (issue #1).
+        let n = loader
+            .refresh_with_retry(
+                api::server::BOOT_CATALOG_ATTEMPTS,
+                api::server::BOOT_CATALOG_BACKOFF,
+            )
+            .await;
+        if n > 0 {
+            tracing::info!(models = n, "catalog loaded");
+        } else {
+            tracing::warn!("catalog still empty after retries; /health reports degraded");
         }
     });
     axum::serve(listener, app)
