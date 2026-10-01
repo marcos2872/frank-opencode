@@ -111,14 +111,21 @@ impl AppState {
             .config
             .aliases
             .iter()
-            .map(|(gw, a)| AliasEntry {
-                gateway_id: gw.clone(),
-                opencode_ref: a.opencode.clone(),
-                display_name: a.display_name.clone().unwrap_or_else(|| gw.clone()),
-                description: a
-                    .description
-                    .clone()
-                    .unwrap_or_else(|| format!("via frank-opencode · {}", a.opencode)),
+            .map(|(gw, a)| {
+                let window = entries
+                    .iter()
+                    .find(|e| e.qualified() == a.opencode)
+                    .and_then(|e| e.context_window());
+                AliasEntry {
+                    gateway_id: gw.clone(),
+                    opencode_ref: a.opencode.clone(),
+                    display_name: a.display_name.clone().unwrap_or_else(|| gw.clone()),
+                    description: a
+                        .description
+                        .clone()
+                        .unwrap_or_else(|| format!("via frank-opencode · {}", a.opencode)),
+                    context_window: window,
+                }
             })
             .collect();
         manual.sort_by(|a, b| a.gateway_id.cmp(&b.gateway_id));
@@ -336,12 +343,18 @@ async fn list_models(State(s): State<AppState>) -> impl IntoResponse {
     let data: Vec<Value> = aliases
         .iter()
         .map(|a| {
-            serde_json::json!({
+            let mut item = serde_json::json!({
                 "id": a.gateway_id,
                 "display_name": a.display_name,
                 "description": a.description,
                 "owned_by": "frank-opencode",
-            })
+            });
+            // Context window from the OpenCode catalog (`limit.context`).
+            // Omitted when unknown so clients fall back to their default.
+            if let Some(w) = a.context_window {
+                item["context_window"] = Value::from(w);
+            }
+            item
         })
         .collect();
     Json(serde_json::json!({"object": "list", "data": data}))

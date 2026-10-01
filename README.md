@@ -121,6 +121,11 @@ Persistindo em `~/.claude/settings.json` (escopo do usuário, nunca no arquivo c
 Verifique antes de abrir o Claude Code:
 
 ```bash
+# 0. Catálogo carregado? status "ok" E "models" != 0 (vide troubleshooting se for)
+curl -s http://127.0.0.1:3737/health       # {"status":"ok","models":58,...}  ("starting" = catálogo ainda não carregado)
+curl -s http://127.0.0.1:3737/v1/models     # {"data":[{"id":"claude-...","display_name":...,"context_window":1000000,...}],...}
+
+# 1. Chat de ponta a ponta
 curl -s -X POST "$ANTHROPIC_BASE_URL/v1/messages" \
   -H "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN" \
   -H "anthropic-version: 2023-06-01" \
@@ -169,8 +174,9 @@ parâmetro do wire protocol do upstream:
 | `FreeTierError` em modelos `opencode/*` | Free tier do Console só funciona dentro do OpenCode; esses modelos ficam ocultos de `/v1/models` por padrão (`include_free_tier = true` para exibir). Use um modelo `opencode-go/*`. |
 | Saída vazia com `max_tokens` minúsculo | Modelos de reasoning gastam o orçamento no reasoning primeiro; aumente `max_tokens` (o Claude Code já faz isso por padrão). |
 | Modelos faltando no `/model` | Sete `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1`; ids precisam conter `claude`/`anthropic` (os aliases automáticos já contêm). |
+| `/health` mostra `"models":0` e `/v1/models` vazio | O catálogo foi lido uma única vez no boot quando o serviço/backend do OpenCode ainda não estava pronto: `opencode api get /api/model` pode (re)iniciar o serviço, e o primeiro fetch volta com catálogo vazio sem registrar erro (`last_error:null`). Como não há refresh, o picker do Claude Code fica sem modelos. Corrija com `frank-opencode --disable && frank-opencode --enable` — de preferência com `opencode service status` saudável antes, e evite `--enable` imediatamente após um `opencode auth login`. |
 | `400` citando `context_management`/`output_config` | O upstream rejeita um campo pré-release; tente com `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1`. |
-| `"X" isn't described by this version's model catalog` | Esperado: ids do gateway são sintéticos, então o Claude Code assume janela de 200k. Mapeie o alias com `behavesAs`/`modelOverrides` para o modelo Claude mais próximo, sufixe `[1m]` no nome do modelo para janelas de 1M (o gateway remove o sufixo), ou sete `CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT=1`. Ex.: `"model": "claude-opencode-go-deepseek-v4-flash[1m]"` — sufixos aceitos: `[1m]`, `[200k]`, `[500k]`, `[2M]` (case-insensitive). |
+| `"X" isn't described by this version's model catalog` | Esperado: ids do gateway são sintéticos e o Claude Code assume janela de 200k. O gateway anuncia a janela real do catálogo do OpenCode (`limit.context`) em `/v1/models` sempre que o catálogo a expõe — valide com `curl -s http://127.0.0.1:3737/v1/models | jq '.data[] | select(.id|startswith("claude-")) | {id, context_window}'`. Se o campo não vier, persista com `behavesAs`/`modelOverrides` para o modelo Claude mais próximo ou sufixe `[1m]`/`[200k]` no nome do modelo (o gateway remove o sufixo); em último caso, `CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT=1`. Sufixos aceitos: `[1m]`, `[200k]`, `[500k]`, `[2M]` (case-insensitive). |
 | `Waiting for API response · will retry` (travamentos) | Pausas longas de reasoning sem bytes no stream. O gateway injeta frames `ping` durante o silêncio do upstream; se persistir, cheque `frank.log` por erros do upstream e considere aumentar `API_TIMEOUT_MS`. |
 
 > **Contexto:** o Claude Code pode mostrar *"There's an issue with the selected model

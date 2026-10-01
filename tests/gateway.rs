@@ -8,7 +8,7 @@ use axum::{
 };
 use frank_opencode::api::server::{router, AppState};
 use frank_opencode::config::AppConfig;
-use frank_opencode::domain::{AliasEntry, CatalogEntry, CatalogSettings};
+use frank_opencode::domain::{AliasEntry, CatalogEntry, CatalogLimit, CatalogSettings};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -33,6 +33,7 @@ fn entry(provider: &str, model: &str) -> CatalogEntry {
             api_key: None,
             provider: None,
         },
+        limit: None,
         enabled: true,
         variants: vec![],
     }
@@ -44,6 +45,7 @@ fn alias(gateway: &str, opencode_ref: &str) -> AliasEntry {
         opencode_ref: opencode_ref.to_string(),
         display_name: gateway.to_string(),
         description: "test".to_string(),
+        context_window: None,
     }
 }
 
@@ -75,6 +77,51 @@ async fn health_is_open_without_token() {
     assert_eq!(resp.status_code(), 200);
     let body: Value = resp.json();
     assert_eq!(body["status"], "starting");
+}
+
+#[tokio::test]
+async fn models_expose_context_window_when_catalog_knows_it() {
+    // `limit.context` comes from `opencode api get /api/model`, same shape the
+    // catalog reports (also exercised by the domain test `context_window_from_catalog_limit`).
+    let mut e = entry("opencode-go", "deepseek-v4-flash");
+    e.limit = Some(CatalogLimit {
+        context: Some(1_000_000),
+        input: Some(900_000),
+        output: Some(128_000),
+    });
+    // Seeded state skips `refresh()`, so propagate the window as it would.
+    let mut a = alias("claude-x", "opencode-go/deepseek-v4-flash");
+    a.context_window = e.context_window();
+    let state = seeded_state(test_config(), vec![e], vec![a]).await;
+    let server = axum_test::TestServer::new(router(state)).unwrap();
+    let data: Value = server
+        .get("/v1/models")
+        .add_header("x-api-key", "test-secret")
+        .await
+        .json();
+    let item = &data["data"][0];
+    assert_eq!(item["id"], "claude-x");
+    assert_eq!(item["context_window"], 1_000_000);
+
+    // Without a catalog `limit`, the field is omitted (not null): clients
+    // then fall back to their default window.
+    let server = axum_test::TestServer::new(router(
+        seeded_state(
+            test_config(),
+            vec![entry("opencode-go", "kimi-k2.7-code")],
+            vec![alias("claude-y", "opencode-go/kimi-k2.7-code")],
+        )
+        .await,
+    ))
+    .unwrap();
+    let data: Value = server
+        .get("/v1/models")
+        .add_header("x-api-key", "test-secret")
+        .await
+        .json();
+    let item = &data["data"][0];
+    assert_eq!(item["id"], "claude-y");
+    assert!(item.get("context_window").is_none(), "{item}");
 }
 
 #[tokio::test]
@@ -295,6 +342,7 @@ fn mock_entry(base_url: &str, package: &str, model: &str) -> CatalogEntry {
             api_key: Some("test-upstream-key".to_string()),
             provider: None,
         },
+        limit: None,
         enabled: true,
         variants: vec![],
     }

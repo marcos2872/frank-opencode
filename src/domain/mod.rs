@@ -68,6 +68,8 @@ pub struct CatalogEntry {
     #[serde(default)]
     pub settings: CatalogSettings,
     #[serde(default)]
+    pub limit: Option<CatalogLimit>,
+    #[serde(default)]
     pub enabled: bool,
     #[serde(default)]
     pub variants: Vec<ModelVariant>,
@@ -81,6 +83,21 @@ pub struct CatalogSettings {
     pub api_key: Option<String>,
     #[serde(default)]
     pub provider: Option<String>,
+}
+
+/// Token limits as reported by `opencode api get /api/model` (`limit` field).
+/// `context` is the full context window in tokens; `input`/`output` are
+/// narrower budgets. The gateway only announces `context`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CatalogLimit {
+    #[serde(default)]
+    pub context: Option<u64>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub input: Option<u64>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub output: Option<u64>,
 }
 
 /// One named variant of a model, as reported by `opencode api get /api/model`,
@@ -147,6 +164,12 @@ impl CatalogEntry {
         self.settings.base_url.as_deref()
     }
 
+    /// Context window in tokens as declared by the OpenCode catalog
+    /// (`limit.context`), if the catalog exposes it.
+    pub fn context_window(&self) -> Option<u64> {
+        self.limit.as_ref().and_then(|l| l.context)
+    }
+
     /// The declared variant with the given label, if any.
     pub fn variant(&self, label: &str) -> Option<&ModelVariant> {
         self.variants.iter().find(|v| v.id == label)
@@ -162,6 +185,11 @@ pub struct AliasEntry {
     pub opencode_ref: String,
     pub display_name: String,
     pub description: String,
+    /// Context window announced on `/v1/models` (tokens), from the catalog's
+    /// `limit.context`. `None` when the catalog does not expose it (the field
+    /// is then omitted from the JSON, so clients fall back to their default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
 }
 
 /// Upstream wire protocol for a provider package.
@@ -255,6 +283,7 @@ pub fn auto_alias(entry: &CatalogEntry) -> AliasEntry {
         opencode_ref: entry.qualified(),
         display_name: format!("{} ({})", entry.name, entry.provider_id),
         description: format!("via frank-opencode · {}", entry.qualified()),
+        context_window: entry.context_window(),
     }
 }
 
@@ -309,12 +338,57 @@ mod tests {
             name: "Kimi K2.7 Code".into(),
             package: "@opencode/ai/providers/openai-compatible".into(),
             settings: CatalogSettings::default(),
+            limit: None,
             enabled: true,
             variants: vec![],
         };
         let a = auto_alias(&e);
         assert!(a.gateway_id.contains("claude"));
         assert_eq!(a.opencode_ref, "opencode-go/kimi-k2.7-code");
+        assert_eq!(a.context_window, None);
+    }
+
+    #[test]
+    fn context_window_from_catalog_limit() {
+        use serde_json::json;
+        let e: CatalogEntry = serde_json::from_value(json!({
+            "modelID": "gemini-3.5-flash",
+            "providerID": "github-copilot",
+            "name": "Gemini 3.5 Flash",
+            "package": "@opencode/ai/providers/openai-compatible",
+            "enabled": true,
+            "variants": [],
+            "limit": {"context": 1000000, "input": 936000, "output": 64000}
+        }))
+        .unwrap();
+        assert_eq!(e.context_window(), Some(1_000_000));
+        // Catalog without a `limit` field keeps the window unset.
+        let e2: CatalogEntry = serde_json::from_value(json!({
+            "modelID": "x",
+            "providerID": "p",
+            "package": "anthropic",
+            "enabled": true
+        }))
+        .unwrap();
+        assert_eq!(e2.context_window(), None);
+        // Alias serialization omits the field when unset and includes it when set.
+        let a = AliasEntry {
+            gateway_id: "claude-x".into(),
+            opencode_ref: "p/x".into(),
+            display_name: "X".into(),
+            description: "d".into(),
+            context_window: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&a).unwrap(),
+            r#"{"gateway_id":"claude-x","opencode_ref":"p/x","display_name":"X","description":"d"}"#
+        );
+        let a2 = AliasEntry {
+            context_window: Some(1_000_000),
+            ..a
+        };
+        let s = serde_json::to_string(&a2).unwrap();
+        assert!(s.contains(r#""context_window":1000000"#), "{s}");
     }
 
     #[test]

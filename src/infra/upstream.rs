@@ -1135,6 +1135,7 @@ mod tests {
             name: "m".to_string(),
             package: pkg.to_string(),
             settings: CatalogSettings::default(),
+            limit: None,
             enabled: true,
             variants: variants
                 .into_iter()
