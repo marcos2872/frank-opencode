@@ -1,9 +1,11 @@
 # frank-opencode
 
-Gateway local compatível com Anthropic que expõe seus **modelos do OpenCode** (v2) ao **Claude Code**.
+Gateway local compatível com Anthropic que expõe seus **modelos do OpenCode** (v2) ao **Claude Code** — sem precisar de uma chave da Anthropic.
 
-Roda apenas em `127.0.0.1`, reutiliza o login do OpenCode já existente na máquina e traduz
-Anthropic Messages ↔ upstream (passthrough Anthropic ou OpenAI Chat Completions).
+- Escuta **apenas em `127.0.0.1`** e nunca fala com a API da Anthropic: o upstream é o backend Go/Console do OpenCode.
+- Reutiliza o **login do OpenCode** já existente na máquina (lê a credencial do SQLite, em memória).
+- Traduz Anthropic Messages ↔ upstream (passthrough Anthropic, OpenAI Chat Completions ou Responses API, conforme o modelo).
+- Roda como daemon em background com `--enable` / `--status` / `--disable`.
 
 ```bash
 frank-opencode --enable    # inicia em background
@@ -22,43 +24,43 @@ frank-opencode --disable   # para
 | Modelos Responses-API (linhas Go GPT/Grok/Muse) | Traduzidos para `{baseURL}/responses` e de volta, incl. function calls e streaming. |
 | Roteamento do OpenCode Go | Repassa o header nativo de sessão do Claude Code + sempre envia `x-opencode-session` (fallback estável persistido no data dir); User-Agent distintivo `frank-opencode/x.y.z`. |
 
-## Modo dev
+## Instalação (release)
 
-Pré-requisitos: Rust stable, `opencode` v2 logado (`opencode auth login`).
-
-```bash
-cargo test                    # testes unitários (tradução, aliases, config)
-cargo clippy -- -D warnings   # lint (precisa estar limpo)
-cargo fmt --check
-
-cargo run -- --refresh        # imprime catálogo: N modelos habilitados + aliases do gateway
-cargo run -- --serve          # servidor em foreground na :3737 (RUST_LOG=debug p/ logs)
-cargo run -- --serve --port 3739
-
-curl -s http://127.0.0.1:3737/health
-curl -s "http://127.0.0.1:3737/v1/models?limit=1000" | head -c 500
-```
-
-Instalando o binário:
+Baixe o binário da **última release** e instale:
 
 ```bash
-cargo install --path .
-# depois `frank-opencode` fica no PATH
+# 1. Obtenha a URL do binário mais recente
+URL=$(gh release view --repo marcos2872/frank-opencode --json assets \
+  --jq '.assets[] | select(.name=="frank-opencode-linux-x86_64") | .url')
+#    (sem gh instalado, copie o link direto da página da release)
+
+# 2. Baixe, torne executável e mova para o PATH
+curl -L "$URL" -o /tmp/frank-opencode
+install -m 0755 /tmp/frank-opencode ~/.local/bin/frank-opencode
+
+# 3. Confira a versão
+frank-opencode --version
 ```
 
-## Daemon
+> Caminho alternativo: `cargo install --path .` ou `cargo install --git https://github.com/marcos2872/frank-opencode`.
+
+### Publicando releases
+
+As releases são publicadas automaticamente por uma **GitHub Action** sempre que uma tag `v*` é criada:
 
 ```bash
-frank-opencode --enable [--port 3737]   # pidfile ~/.local/share/frank-opencode/frank.pid
-frank-opencode --status
-frank-opencode --disable
+git tag v0.1.0
+git push origin v0.1.0   # a action builda e anexa o binário à release
 ```
 
-Logs: `~/.local/share/frank-opencode/frank.log`.
+## Pré-requisitos
+
+- **OpenCode v2** instalado e logado (`opencode auth login`) — é quem autentica no Console e fornece o catálogo de modelos.
+- `curl` e (opcionalmente) o `gh` CLI para baixar o binário.
 
 ## Config
 
-Arquivo: `~/.config/frank-opencode/config.toml` (ver `config.example.toml`).
+Arquivo: `~/.config/frank-opencode/config.toml` (veja [`config.example.toml`](config.example.toml)).
 Overrides por env: `FRANK_PORT`, `FRANK_AUTH_TOKEN`, `FRANK_CONFIG`.
 `FRANK_AUTH_TOKEN` (quando não-vazio) sobrescreve o `auth_token` do arquivo.
 
@@ -80,7 +82,7 @@ mkdir -p ~/.config/frank-opencode
 frank-opencode --disable
 frank-opencode --enable   # ou --enable --port XXXX se usa porta custom
 
-# 4. Use o MESMO valor no Claude Code (ver "Setup no Claude Code" abaixo)
+# 4. Use o MESMO valor no Claude Code (ver "Rodando o Claude Code" abaixo)
 export ANTHROPIC_AUTH_TOKEN="SEU_TOKEN_AQUI"
 ```
 
@@ -95,33 +97,7 @@ Regras:
 - Trocar o token exige reiniciar (`--disable` + `--enable`); só editar o
   arquivo não afeta o daemon já rodando.
 
-## Escolhendo modelos no Claude Code — modelMap
-
-Sim, você escolhe modelos dentro do Claude Code via `/model`, alimentado por `GET /v1/models`.
-
-- **Automático:** cada modelo habilitado do OpenCode ganha um alias `claude-<provider>-<model>`
-  (o prefixo `claude-` é obrigatório — a descoberta do Claude Code só mantém ids contendo
-  `claude`/`anthropic`). Atualize com `--refresh` ou reinicie.
-- **Manual:** `[aliases."<gateway-id>"]` no `config.toml` tem precedência sobre os automáticos;
-  `[disabled]` esconde refs do picker.
-- `POST /v1/messages` também aceita refs diretas (`opencode-go/kimi-k2.7-code`) e
-  model ids simples, mesmo fora da lista.
-
-### Variantes (`#variant`)
-
-Modelos que declaram variantes no catálogo do OpenCode (ex.: reasoning effort)
-aceitam o sufixo `#<variant>` no id — em aliases, refs diretas e ids simples
-(`claude-opencode-go-my-model#high`). A variante é validada contra o catálogo
-(404 com a lista de variantes disponíveis se não existir) e traduzida para o
-parâmetro do wire protocol do upstream:
-
-- **OpenAI-compatible** (`/chat/completions`): `reasoning_effort` (labels fora do
-  enum da OpenAI, como `xhigh`/`max`, são saturados para `high`).
-- **Responses API**: `reasoning`.
-- **Passthrough Anthropic**: sem equivalente (`reasoning_effort` não existe no
-  Messages API) — a variante é aceita e ignorada, e o modelo usa seu default.
-
-## Setup no Claude Code
+## Rodando o Claude Code
 
 ```bash
 export ANTHROPIC_BASE_URL=http://127.0.0.1:3737
@@ -156,6 +132,33 @@ curl -s -X POST "$ANTHROPIC_BASE_URL/v1/messages" \
 
 `/status` dentro do Claude Code deve mostrar sua `Anthropic base URL`.
 
+### Escolhendo modelos — modelMap
+
+Você escolhe modelos dentro do Claude Code via `/model`, alimentado por `GET /v1/models`.
+
+- **Automático:** cada modelo habilitado do OpenCode ganha um alias `claude-<provider>-<model>`
+  (o prefixo `claude-` é obrigatório — a descoberta do Claude Code só mantém ids contendo
+  `claude`/`anthropic`). O catálogo é lido uma única vez no boot: para refletir modelos
+  novos/removidos, reinicie o gateway (`--refresh` só pré-visualiza o que o boot carregaria).
+- **Manual:** `[aliases."<gateway-id>"]` no `config.toml` tem precedência sobre os automáticos;
+  `[disabled]` esconde refs do picker.
+- `POST /v1/messages` também aceita refs diretas (`opencode-go/kimi-k2.7-code`) e
+  model ids simples, mesmo fora da lista.
+
+#### Variantes (`#variant`)
+
+Modelos que declaram variantes no catálogo do OpenCode (ex.: reasoning effort)
+aceitam o sufixo `#<variant>` no id — em aliases, refs diretas e ids simples
+(`claude-opencode-go-my-model#high`). A variante é validada contra o catálogo
+(404 com a lista de variantes disponíveis se não existir) e traduzida para o
+parâmetro do wire protocol do upstream:
+
+- **OpenAI-compatible** (`/chat/completions`): `reasoning_effort` (labels fora do
+  enum da OpenAI, como `xhigh`/`max`, são saturados para `high`).
+- **Responses API**: `reasoning`.
+- **Passthrough Anthropic**: sem equivalente (`reasoning_effort` não existe no
+  Messages API) — a variante é aceita e ignorada, e o modelo usa seu default.
+
 ## Solução de problemas
 
 | Sintoma | Causa / correção |
@@ -167,10 +170,17 @@ curl -s -X POST "$ANTHROPIC_BASE_URL/v1/messages" \
 | Saída vazia com `max_tokens` minúsculo | Modelos de reasoning gastam o orçamento no reasoning primeiro; aumente `max_tokens` (o Claude Code já faz isso por padrão). |
 | Modelos faltando no `/model` | Sete `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1`; ids precisam conter `claude`/`anthropic` (os aliases automáticos já contêm). |
 | `400` citando `context_management`/`output_config` | O upstream rejeita um campo pré-release; tente com `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1`. |
-| `"X" isn't described by this version's model catalog` | Esperado: ids do gateway são sintéticos, então o Claude Code assume janela de 200k. Mapeie o alias com `behavesAs`/`modelOverrides` para o modelo Claude mais próximo, sufixe `[1m]` no nome do modelo para janelas de 1M (o gateway remove o sufixo), ou sete `CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT=1`. |
+| `"X" isn't described by this version's model catalog` | Esperado: ids do gateway são sintéticos, então o Claude Code assume janela de 200k. Mapeie o alias com `behavesAs`/`modelOverrides` para o modelo Claude mais próximo, sufixe `[1m]` no nome do modelo para janelas de 1M (o gateway remove o sufixo), ou sete `CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT=1`. Ex.: `"model": "claude-opencode-go-deepseek-v4-flash[1m]"` — sufixos aceitos: `[1m]`, `[200k]`, `[500k]`, `[2M]` (case-insensitive). |
 | `Waiting for API response · will retry` (travamentos) | Pausas longas de reasoning sem bytes no stream. O gateway injeta frames `ping` durante o silêncio do upstream; se persistir, cheque `frank.log` por erros do upstream e considere aumentar `API_TIMEOUT_MS`. |
 
-## Aviso de auto-mode ("session isn't eligible...")
+> **Contexto:** o Claude Code pode mostrar *"There's an issue with the selected model
+> (claude-…)"* de forma intermitente mesmo com o gateway saudável. Essa mensagem é genérica —
+> qualquer 4xx do upstream cujo texto cite o modelo a dispara (indisponibilidade pontual ou
+> limite de uso do provedor, ex. `opencode.ai/zen/go`). Ela **não** significa que o alias sumiu
+> do catálogo: como o catálogo é lido só no boot, `/v1/models` e `/health` continuam normais
+> nesses momentos. Se o modelo realmente sumir do lado do provedor, reinicie o gateway.
+
+### Aviso de auto-mode ("session isn't eligible...")
 
 Esperado ao usar qualquer gateway, não é erro: a Anthropic moveu as checagens
 do classificador do auto-mode para server-side (grátis), mas sessões roteadas via
@@ -195,8 +205,8 @@ requisições minúsculas cobradas como uso normal do Go.
 ## Health
 
 `GET /health` (sem auth) reporta `ok` / `degraded` / `starting`, a contagem de modelos,
-o modelo padrão efetivo e o `last_error` do refresh do catálogo em background
-(a cada `refresh_interval_secs`, mín. 60s).
+o modelo padrão efetivo e o `last_error` do load do catálogo no boot (não há refresh
+automático — para atualizar o catálogo, reinicie o gateway).
 
 ## Limites (MVP)
 
@@ -206,3 +216,9 @@ o modelo padrão efetivo e o `last_error` do refresh do catálogo em background
 - Modelos free-tier `opencode/*` são bloqueados no upstream fora do OpenCode (ocultos por padrão).
 - `frank.log` é só-append: trunque de vez em quando (`: > frank.log`).
 - `--enable` recusa uma `--port` diferente com ele rodando; dê `--disable` antes.
+
+## Documentação
+
+- [Desenvolvimento](docs/dev.md) — como rodar em dev, testes, lint.
+- [Arquitetura](docs/arquitetura.md) — como o gateway é estruturado (domínio, infra, API).
+- [Claude Desktop](docs/desktop.md) — configuração no app Desktop (pesquisa não testada).

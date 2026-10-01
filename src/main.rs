@@ -58,24 +58,17 @@ async fn serve(cfg: config::AppConfig) -> anyhow::Result<()> {
 
     // Bind first so a stuck catalog fetch can't block boot; the catalog
     // loads in the background and /health reports degraded until then.
-    // Afterwards it refreshes every `refresh_interval_secs` (>= 60s).
+    // No periodic refresh: the catalog is read once at startup (update it
+    // by restarting the gateway, or preview with `--refresh`).
     let app = api::server::router(state.clone());
     let addr = format!("127.0.0.1:{port}");
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!("listening on http://{addr}");
-    let refresher = state.clone();
+    let loader = state.clone();
     tokio::spawn(async move {
-        match refresher.refresh().await {
+        match loader.refresh().await {
             Ok(n) => tracing::info!(models = n, "catalog loaded"),
             Err(e) => tracing::warn!("initial catalog load failed: {e}"),
-        }
-        let interval = refresher.config.refresh_interval_secs.max(60);
-        loop {
-            tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
-            match refresher.refresh().await {
-                Ok(n) => tracing::debug!(models = n, "catalog refreshed"),
-                Err(e) => tracing::warn!("catalog refresh failed: {e}"),
-            }
         }
     });
     axum::serve(listener, app)

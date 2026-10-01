@@ -8,9 +8,6 @@ auth_token = ""
 # Used when the client omits "model". Defaults to the first alias if empty.
 default_model = "claude-opencode-go-kimi-k2-7-code"
 
-# Re-discovery interval for `opencode api get /api/model` (seconds).
-refresh_interval_secs = 300
-
 # OpenCode binary used for catalog + db-path discovery.
 opencode_bin = "opencode"
 

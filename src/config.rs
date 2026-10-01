@@ -30,8 +30,6 @@ pub struct AppConfig {
     pub auth_token: String,
     #[serde(default)]
     pub default_model: String,
-    #[serde(default = "default_refresh_secs")]
-    pub refresh_interval_secs: u64,
     #[serde(default)]
     pub opencode_bin: String,
     #[serde(default)]
@@ -48,17 +46,12 @@ fn default_port() -> u16 {
     DEFAULT_PORT
 }
 
-fn default_refresh_secs() -> u64 {
-    300
-}
-
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
             port: DEFAULT_PORT,
             auth_token: String::new(),
             default_model: String::new(),
-            refresh_interval_secs: default_refresh_secs(),
             opencode_bin: "opencode".to_string(),
             aliases: HashMap::new(),
             disabled: DisabledConfig::default(),

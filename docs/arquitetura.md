@@ -1,0 +1,73 @@
+# Arquitetura
+
+`frank-opencode` é um gateway local compatível com Anthropic que expõe os
+modelos do OpenCode v2 ao Claude Code. Escuta apenas em `127.0.0.1` e **nunca**
+fala com a Anthropic — o upstream é o backend Go/Console do OpenCode, roteado
+pelo pacote (provider).
+
+```
+Claude Code ── Anthropic Messages ──▶ frank-opencode (127.0.0.1:3737)
+                                        │  resolve model → protocol_for → traduz → aplica variante
+                                        ▼
+                                OpenCode Go backend (via credential da SQLite)
+```
+
+## Camadas
+
+- **`domain/`** — tipos e regras puras, sem async. `ModelRef` (provider/model,
+  sufixo `#variant`), `CatalogEntry` (deserializa a saída de
+  `opencode api get /api/model`, incl. `variants`), `protocol_for(package)` →
+  protocolo de wire, `auto_alias` (o id do gateway precisa conter
+  `claude`/`anthropic` para a descoberta de `/v1/models` do Claude Code),
+  `strip_window_suffix` (`[1m]`/`[200k]` hints que o Claude Code anexa a ids desconhecidos).
+- **`infra/opencode.rs`** — estado do OpenCode. Credenciais **somente** da tabela
+  `credential` da SQLite (read-only; `auth.json` nunca é fonte de verdade; nunca
+  parseia `opencode.jsonc`). Catálogo via `opencode api get /api/model`. Caminho
+  do DB via `opencode debug paths db`.
+- **`infra/upstream.rs`** — tradutores puros (sem HTTP):
+  - `anthropic_to_openai` / `openai_to_anthropic` (Chat Completions)
+  - `anthropic_to_responses` / `responses_to_anthropic` (Responses API)
+  - `StreamTranslator` / `ResponsesTranslator` (SSE → Anthropic SSE)
+  - `apply_variant` — mescla o `reasoning_effort` da variante selecionada no
+    body **já traduzido** (os tradutores descartam campos desconhecidos). Chave
+    por protocolo: Chat = `reasoning_effort` (labels fora do enum da OpenAI
+    saturam para `high`), Responses = `reasoning`, Anthropic = no-op.
+  - `estimate_tokens` — contagem local por partes para `count_tokens` (sem tokenizer).
+  - `with_heartbeat` — injeta `event: ping` durante o silêncio do upstream.
+- **`api/server.rs`** — handlers Axum. Fluxo do body: resolve model → escolhe o
+  forward por `protocol_for` → traduz → aplica variante → forward com o
+  `Bearer` da credencial + headers de sessão (`x-opencode-session`, sempre enviado).
+
+## Convenções e pegadinhas
+
+- **Resolução de modelo** (`AppState::resolve`): alias → `provider/model` → id
+  simples (ids ambíguos ordenam por nome qualificado, com aviso). Variantes são
+  validadas contra o catálogo; label desconhecido → 404 listando as disponíveis.
+- **Free-tier**: modelos `opencode/*` dão 403 fora do OpenCode, então ficam
+  ocultos de `/v1/models` a menos que `include_free_tier = true`. Usam a chave
+  pública de `settings.apiKey` (`upstream_bearer`).
+- **Headers de sessão**: o forward para o Go sempre envia `x-opencode-session`
+  (o `x-claude-code-session-id` do cliente, depois `x-opencode-session`, senão um
+  fallback persistido em `frank.session`).
+- **count_tokens**: pacotes Anthropic fazem proxy para
+  `{baseURL}/messages/count_tokens` com fallback em `estimate_tokens`; os outros
+  pacotes sempre estimam localmente.
+- **Formato de erro**: sempre `{"type":"error","error":{"type":...,"message":...}}`
+  com tipos de erro Anthropic (`not_found_error`, `authentication_error`,
+  `invalid_request_error`, `api_error`).
+- **Refresh do catálogo** roda em background após o bind; `/health` fica
+  `starting` até o primeiro sucesso, `degraded` após falha, `ok` caso contrário.
+  Os testes constroem um `AppState` semeado e nunca chamam o binário real.
+
+## Daemon e ciclo de vida
+
+- `frank-opencode --enable` escreve pidfile/porta/sessão em
+  `~/.local/share/frank-opencode/` (arquivos `0600` via `daemon::write_private`)
+  e spawna o filho com `--daemon-child`.
+- `--disable` envia SIGTERM (drena os streams SSE em andamento) e limpa o estado.
+- `--status` reporta se o daemon está rodando, em qual porta e o session id.
+
+## Documentação relacionada
+
+- [Desenvolvimento](dev.md) — building, testes, comandos.
+- [Setup no Claude Code](../README.md) — config e uso no dia a dia.
