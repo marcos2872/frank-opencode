@@ -130,15 +130,19 @@ pub fn anthropic_to_openai(body: &Value, upstream_model: &str) -> Value {
                     }
                     if !tool_results.is_empty() {
                         // Each tool_result becomes its own `tool` message.
-                        // Any accompanying text goes first as a user message.
-                        let t = texts.join("\n");
-                        if !t.trim().is_empty() {
-                            messages.push(serde_json::json!({"role": "user", "content": t}));
-                        }
+                        // They must immediately follow the assistant
+                        // `tool_calls` message: strict OpenAI-compatible
+                        // upstreams 400 otherwise ("must be followed by tool
+                        // messages"). Any accompanying text goes AFTER as its
+                        // own user message.
                         for (id, txt) in tool_results {
                             messages.push(serde_json::json!({
                                 "role": "tool", "tool_call_id": id, "content": txt
                             }));
+                        }
+                        let t = texts.join("\n");
+                        if !t.trim().is_empty() {
+                            messages.push(serde_json::json!({"role": "user", "content": t}));
                         }
                     } else if !tool_calls.is_empty() {
                         let mut msg = serde_json::json!({
@@ -1137,6 +1141,8 @@ mod tests {
             settings: CatalogSettings::default(),
             limit: None,
             enabled: true,
+            headers: None,
+            body: None,
             variants: variants
                 .into_iter()
                 .map(|(id, effort)| crate::domain::ModelVariant {
@@ -1224,6 +1230,34 @@ mod tests {
         // tool result becomes tool role
         assert!(msgs.iter().any(|m| m["role"] == "tool"));
         assert_eq!(oai["tools"][0]["function"]["name"], "Read");
+    }
+
+    #[test]
+    fn mixed_tool_result_and_text_keeps_tool_adjacency() {
+        // Strict OpenAI-compatible upstreams 400 when a `user` message sits
+        // between assistant `tool_calls` and their `tool` responses, so the
+        // `tool` messages must come first and the text after.
+        let body = serde_json::json!({
+            "model": "x",
+            "messages": [
+                {"role": "user", "content": "read it"},
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "looking"},
+                    {"type": "tool_use", "id": "t1", "name": "Read", "input": {"path": "a"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": "file contents"},
+                    {"type": "text", "text": "now summarize"}
+                ]}
+            ],
+            "max_tokens": 10
+        });
+        let oai = anthropic_to_openai(&body, "upstream");
+        let msgs = oai["messages"].as_array().unwrap();
+        let roles: Vec<&str> = msgs.iter().map(|m| m["role"].as_str().unwrap()).collect();
+        assert_eq!(roles, vec!["user", "assistant", "tool", "user"]);
+        assert_eq!(msgs[2]["tool_call_id"], "t1");
+        assert_eq!(msgs[3]["content"], "now summarize");
     }
 
     #[test]

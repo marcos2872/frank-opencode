@@ -143,7 +143,11 @@ Você escolhe modelos dentro do Claude Code via `/model`, alimentado por `GET /v
 
 - **Automático:** cada modelo habilitado do OpenCode ganha um alias `claude-<provider>-<model>`
   (o prefixo `claude-` é obrigatório — a descoberta do Claude Code só mantém ids contendo
-  `claude`/`anthropic`). O catálogo é lido no boot com retry (veja "Solução de problemas"
+  `claude`/`anthropic`). Modelos >= 1M são anunciados como `claude-...[1m]` (único sufixo que
+  o Claude lê); use essa forma com sufixo no `settings.json: model` para não aparecer como
+  `Custom model` (sem sufixo funciona na API, o gateway remove ao resolver). Linhas com mesmo
+  `provider/model` mas `id` distinto (ex. `opus-4.8` vs `opus-4.8-fast`) ganham aliases distintos.
+  O catálogo é lido no boot com retry (veja "Solução de problemas"
   para o caso `models:0`): para refletir modelos novos/removidos depois disso, reinicie o
   gateway (`--refresh` só pré-visualiza o que o boot carregaria).
 - **Manual:** `[aliases."<gateway-id>"]` no `config.toml` tem precedência sobre os automáticos;
@@ -210,6 +214,10 @@ checagem de janela para ids desconhecidos, perdendo a conta real de tokens).
 | `400` citando `context_management`/`output_config` | O upstream rejeita um campo pré-release; tente com `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1`. |
 | `"X" isn't described by this version's model catalog` | Esperado: ids do gateway são sintéticos e o Claude Code assume janela de 200k. O gateway anuncia a janela real do catálogo do OpenCode (`limit.context`) em `/v1/models` — como campo `context_window` e, para janelas >= 1M, como sufixo `[1m]` no próprio id (o único sufixo que a mainline do Claude Code lê; o gateway remove o sufixo ao resolver). Valide com `curl -s http://127.0.0.1:3737/v1/models | jq '.data[] | {id, context_window}'`. Janelas < 1M continuam com valor padrão no cliente: persista com `behavesAs`/`modelOverrides` para o modelo Claude mais próximo, ou em último caso `CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT=1`. |
 | `Waiting for API response · will retry` (travamentos) | Pausas longas de reasoning sem bytes no stream. O gateway injeta frames `ping` durante o silêncio do upstream; se persistir, cheque `frank.log` por erros do upstream e considere aumentar `API_TIMEOUT_MS`. |
+| Modelo aparece como `Custom model` no `/model` | O picker do Claude Code faz match exato do `id`. Para janelas >= 1M o gateway anuncia `claude-...[1m]`; se seu `settings.json: model` tem a forma sem sufixo (ou vice-versa), funciona na API (o gateway remove o sufixo ao resolver) mas aparece como custom. Reseleciona a forma com `[1m]` no `/model`. |
+| `400 {"model":"X"}` intermitente | Passthrough do upstream Go (ex. indisponibilidade pontual, limite, modelo em rolagem). O gateway agora loga em `frank.log` com `gateway_model/opencode_ref/base_url/status/body` para diagnóstico. Trocar de modelo e voltar costuma resolver; se persistir, reinicie o gateway. |
+| Modelo removido/renomeado no `opencode-go` continua listado | Catálogo é lido só no boot: após `opencode auth` novo ou rolagem de modelos (`opus-4.7` → `opus-4.8`), rode `frank-opencode --disable && frank-opencode --enable`. |
+| `Claude Opus 4.8` vs `Claude Opus 4.8 Fast` | Mesmo `modelID`, `id`/`headers` diferentes (`fast-mode-2026-02-01` + `{"speed":"fast"}`). O gateway agora gera 2 aliases distintos (`...-opus-4-8` e `...-opus-4-8-fast`) e repassa `anthropic-beta`/`speed` do catálogo. |
 
 > **Contexto:** o Claude Code pode mostrar *"There's an issue with the selected model
 > (claude-…)"* de forma intermitente mesmo com o gateway saudável. Essa mensagem é genérica —

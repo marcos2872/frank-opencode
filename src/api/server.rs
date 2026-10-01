@@ -2,7 +2,7 @@
 
 use crate::config::AppConfig;
 use crate::domain::{
-    auto_alias, is_known_package, protocol_for_entry, strip_window_suffix, window_suffix,
+    auto_aliases_for, is_known_package, protocol_for_entry, strip_window_suffix, window_suffix,
     AliasEntry, CatalogEntry, ModelRef, Protocol,
 };
 use crate::infra::opencode::{fetch_catalog, upstream_bearer, CredentialStore};
@@ -148,19 +148,36 @@ impl AppState {
             aliases.push(a);
         }
         // 2. Auto aliases for the rest (free-tier excluded unless opted in).
-        let mut auto: Vec<AliasEntry> = usable
+        // A manual alias may point at either `provider/model` or
+        // `provider/id` (fast flavors), so exclude a catalog row when any of
+        // its refs is taken.
+        let remaining: Vec<CatalogEntry> = usable
             .iter()
-            .filter(|e| !used_refs.contains(&e.qualified()))
-            .map(|e| auto_alias(e))
+            .filter(|e| {
+                !used_refs.contains(&e.qualified())
+                    && !used_refs.contains(&e.id_ref())
+                    && !used_refs.contains(&e.preferred_ref())
+            })
+            .map(|e| (*e).clone())
+            .collect();
+        let mut auto: Vec<AliasEntry> = auto_aliases_for(&remaining)
+            .into_iter()
             .filter(|a| !self.config.is_disabled(&a.opencode_ref, &a.gateway_id))
             .collect();
         auto.sort_by(|a, b| a.gateway_id.cmp(&b.gateway_id));
-        // Avoid gateway_id collisions with manual entries.
-        let taken: std::collections::HashSet<String> =
+        // Avoid gateway_id collisions with manual entries (and among autos:
+        // `auto_aliases_for` already dedups, but manual ids win).
+        let mut taken: std::collections::HashSet<String> =
             aliases.iter().map(|a| a.gateway_id.clone()).collect();
         for a in auto {
-            if !taken.contains(&a.gateway_id) {
+            if taken.insert(a.gateway_id.clone()) {
                 aliases.push(a);
+            } else {
+                tracing::warn!(
+                    gateway_id = %a.gateway_id,
+                    opencode_ref = %a.opencode_ref,
+                    "duplicate gateway_id, skipping auto alias"
+                );
             }
         }
         aliases.sort_by(|a, b| a.gateway_id.cmp(&b.gateway_id));
@@ -258,20 +275,37 @@ impl AppState {
     async fn lookup_entry(&self, base: &str) -> Option<CatalogEntry> {
         let catalog = self.catalog.read().await;
         let aliases = self.aliases.read().await;
-        // Alias hit?
+        // Alias hit? Prefer the `id` match so disambiguated rows
+        // (`provider/id`, e.g. `.../claude-opus-4.8-fast`) resolve to their
+        // own headers/body instead of collapsing to the first row with the
+        // same `modelID`.
         if let Some(a) = aliases.iter().find(|a| a.gateway_id == base) {
             if let Some(r) = ModelRef::parse(&a.opencode_ref) {
-                let hit = catalog
+                if let Some(hit) = catalog
+                    .iter()
+                    .find(|e| e.provider_id == r.provider_id && e.id == r.model_id)
+                    .cloned()
+                {
+                    return Some(hit);
+                }
+                if let Some(hit) = catalog
                     .iter()
                     .find(|e| e.provider_id == r.provider_id && e.model_id == r.model_id)
-                    .cloned();
-                if hit.is_some() {
-                    return hit;
+                    .cloned()
+                {
+                    return Some(hit);
                 }
             }
         }
-        // Direct provider/model?
+        // Direct provider/model (or provider/id for fast flavors)?
         if let Some(r) = ModelRef::parse(base) {
+            if let Some(hit) = catalog
+                .iter()
+                .find(|e| e.provider_id == r.provider_id && e.id == r.model_id)
+                .cloned()
+            {
+                return Some(hit);
+            }
             if let Some(hit) = catalog
                 .iter()
                 .find(|e| e.provider_id == r.provider_id && e.model_id == r.model_id)
@@ -280,11 +314,12 @@ impl AppState {
                 return Some(hit);
             }
         }
-        // Plain model id (first enabled match)? Sort for determinism
-        // (ambiguity is order-dependent across providers) and warn.
+        // Plain model id (first enabled match)? Match `modelID` or `id`
+        // (`claude-opus-4.8-fast` is an `id`, not a `modelID`). Sort for
+        // determinism (ambiguity is order-dependent across providers) and warn.
         let mut hits: Vec<CatalogEntry> = catalog
             .iter()
-            .filter(|e| e.model_id == base)
+            .filter(|e| e.model_id == base || e.id == base)
             .cloned()
             .collect();
         hits.sort_by_key(|e| e.qualified());
@@ -664,6 +699,142 @@ async fn messages(
     }
 }
 
+/// Truncate an upstream error body for logs (never log credentials here;
+///
+/// callers only pass status + body, never the bearer).
+fn body_preview(s: &str) -> String {
+    const MAX: usize = 500;
+    let t = s.trim();
+    if t.len() <= MAX {
+        return t.to_string();
+    }
+    let mut out = t[..MAX].to_string();
+    out.push('…');
+    out
+}
+
+fn log_upstream_error(
+    entry: &CatalogEntry,
+    gateway_model: &str,
+    base: &str,
+    status: StatusCode,
+    text: &str,
+    req_summary: &serde_json::Value,
+) {
+    tracing::warn!(
+        gateway_model = %gateway_model,
+        opencode_ref = %entry.qualified(),
+        entry_id = %entry.id,
+        provider = %entry.provider_id,
+        base_url = %base,
+        status = status.as_u16(),
+        body = %body_preview(text),
+        req = %req_summary,
+        "upstream rejected request"
+    );
+}
+
+/// Privacy-safe shape of the Anthropic request that failed: counts, block
+/// kinds and sizes only, never prompt/tool content. Lets us tell "poisoned
+/// history in this session" (e.g. a tool_result shape the translator or the
+/// upstream rejects) apart from "model down" without logging user data.
+fn request_summary(body: &Value) -> Value {
+    let mut msgs = vec![];
+    if let Some(arr) = body.get("messages").and_then(|m| m.as_array()) {
+        for m in arr.iter().take(50) {
+            let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("?");
+            match m.get("content") {
+                Some(Value::String(s)) => msgs.push(serde_json::json!({
+                    "role": role, "kind": "text", "chars": s.chars().count()
+                })),
+                Some(Value::Array(blocks)) => {
+                    let kinds: Vec<String> = blocks
+                        .iter()
+                        .map(|b| {
+                            let t = b.get("type").and_then(|t| t.as_str()).unwrap_or("?");
+                            // Text length without content: tool I/O still needs a size hint.
+                            let chars = b
+                                .get("text")
+                                .and_then(|t| t.as_str())
+                                .map(|s| s.chars().count())
+                                .unwrap_or(0);
+                            if chars > 0 {
+                                format!("{t}:{chars}ch")
+                            } else {
+                                t.to_string()
+                            }
+                        })
+                        .collect();
+                    msgs.push(serde_json::json!({"role": role, "kind": kinds}));
+                }
+                _ => msgs.push(serde_json::json!({"role": role, "kind": "other"})),
+            }
+        }
+    }
+    let tools: Vec<String> = body
+        .get("tools")
+        .and_then(|t| t.as_array())
+        .map(|arr| {
+            arr.iter()
+                .take(30)
+                .map(|t| {
+                    t.get("name")
+                        .and_then(|n| n.as_str())
+                        .unwrap_or("?")
+                        .to_string()
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    serde_json::json!({
+        "messages": msgs.len(),
+        "detail": msgs,
+        "tools": tools,
+        "tool_choice": body.get("tool_choice").and_then(|t| t.get("type").and_then(|x| x.as_str())),
+        "max_tokens": body.get("max_tokens"),
+        "stream": body.get("stream"),
+        "system": body.get("system").map(|s| if s.is_string() { "text" } else { "blocks" }),
+    })
+}
+
+/// Catalog default headers for an entry, excluding auth (bearer is set from
+/// the credential store). Keys are matched case-insensitively by callers.
+fn entry_headers(entry: &CatalogEntry) -> Vec<(String, String)> {
+    let Some(h) = entry.headers.as_ref() else {
+        return vec![];
+    };
+    h.iter()
+        .filter(|(k, _)| {
+            let l = k.to_ascii_lowercase();
+            l != "authorization" && l != "x-api-key"
+        })
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
+}
+
+fn entry_beta_header(entry: &CatalogEntry) -> Option<String> {
+    entry.headers.as_ref().and_then(|h| {
+        h.iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("anthropic-beta"))
+            .map(|(_, v)| v.clone())
+    })
+}
+
+/// Merge catalog `body` defaults (e.g. `{"speed":"fast"}`) into the upstream
+/// JSON. Catalog wins on key conflicts: these are model defaults the Go
+/// backend would have applied.
+fn apply_entry_body(target: &mut Value, entry: &CatalogEntry) {
+    let (Some(t), Some(e)) = (
+        target.as_object_mut(),
+        entry.body.as_ref().and_then(|v| v.as_object()),
+    ) else {
+        return;
+    };
+    for (k, v) in e {
+        t.insert(k.clone(), v.clone());
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn forward_anthropic(
     s: &AppState,
@@ -677,6 +848,7 @@ async fn forward_anthropic(
     _variant: Option<&str>,
 ) -> Response {
     body["model"] = Value::String(entry.model_id.clone());
+    apply_entry_body(body, entry);
     // `stream` passthrough stays as the client sent it.
     let url = join_url(base, "messages");
     let mut req = s
@@ -696,7 +868,23 @@ async fn forward_anthropic(
                 .unwrap_or("2023-06-01"),
         );
     if let Some(beta) = headers.get("anthropic-beta").and_then(|v| v.to_str().ok()) {
-        req = req.header("anthropic-beta", beta);
+        // Merge client betas with catalog defaults (fast-mode): both are
+        // comma-separated lists.
+        let merged = match entry_beta_header(entry) {
+            Some(catalog) if !catalog.is_empty() && !beta.contains(&catalog) => {
+                format!("{beta}, {catalog}")
+            }
+            _ => beta.to_string(),
+        };
+        req = req.header("anthropic-beta", merged);
+    } else if let Some(catalog) = entry_beta_header(entry) {
+        req = req.header("anthropic-beta", catalog);
+    }
+    for (k, v) in entry_headers(entry) {
+        if k.eq_ignore_ascii_case("anthropic-beta") {
+            continue; // handled above (merged).
+        }
+        req = req.header(k, v);
     }
     for (k, v) in session_headers(headers) {
         req = req.header(k, v);
@@ -714,6 +902,8 @@ async fn forward_anthropic(
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     if !status.is_success() {
         let text = resp.text().await.unwrap_or_default();
+        let summary = request_summary(body);
+        log_upstream_error(entry, gateway_model, base, status, &text, &summary);
         return (status, [("content-type", "application/json")], text).into_response();
     }
     if stream {
@@ -766,11 +956,12 @@ async fn forward_responses(
 ) -> Response {
     // Apply the selected variant to the translated body, not the raw
     // client body: the translators drop unknown fields.
-    let resp_body = if let Some(v) = variant {
+    let mut resp_body = if let Some(v) = variant {
         apply_variant(anthropic_to_responses(body, &entry.model_id), entry, v)
     } else {
         anthropic_to_responses(body, &entry.model_id)
     };
+    apply_entry_body(&mut resp_body, entry);
     let url = join_url(base, "responses");
     let mut req = s
         .http
@@ -781,6 +972,9 @@ async fn forward_responses(
             format!("Bearer {}", bearer.expose_secret()),
         )
         .header("x-api-key", bearer.expose_secret().to_string());
+    for (k, v) in entry_headers(entry) {
+        req = req.header(k, v);
+    }
     for (k, v) in session_headers(headers) {
         req = req.header(k, v);
     }
@@ -797,6 +991,8 @@ async fn forward_responses(
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     if !status.is_success() {
         let text = resp.text().await.unwrap_or_default();
+        let summary = request_summary(body);
+        log_upstream_error(entry, gateway_model, base, status, &text, &summary);
         return (status, [("content-type", "application/json")], text).into_response();
     }
     if !stream {
@@ -887,11 +1083,12 @@ async fn forward_openai(
 ) -> Response {
     // Apply the selected variant to the translated body, not the raw
     // client body: the translators drop unknown fields.
-    let oai_body = if let Some(v) = variant {
+    let mut oai_body = if let Some(v) = variant {
         apply_variant(anthropic_to_openai(body, &entry.model_id), entry, v)
     } else {
         anthropic_to_openai(body, &entry.model_id)
     };
+    apply_entry_body(&mut oai_body, entry);
     let url = join_url(base, "chat/completions");
     let mut req = s
         .http
@@ -903,6 +1100,9 @@ async fn forward_openai(
         );
     // Some OpenAI-compatible gateways also accept api-key header; harmless to send.
     req = req.header("x-api-key", bearer.expose_secret().to_string());
+    for (k, v) in entry_headers(entry) {
+        req = req.header(k, v);
+    }
     for (k, v) in session_headers(headers) {
         req = req.header(k, v);
     }
@@ -919,6 +1119,8 @@ async fn forward_openai(
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     if !status.is_success() {
         let text = resp.text().await.unwrap_or_default();
+        let summary = request_summary(body);
+        log_upstream_error(entry, gateway_model, base, status, &text, &summary);
         return (status, [("content-type", "application/json")], text).into_response();
     }
     if !stream {
@@ -1001,4 +1203,57 @@ async fn forward_openai(
         .header("cache-control", "no-cache")
         .body(Body::from_stream(with_heartbeat(out, HEARTBEAT_IDLE)))
         .unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+    use serde_json::json;
+
+    #[test]
+    fn request_summary_counts_without_content() {
+        let body = json!({
+            "model": "claude-x",
+            "max_tokens": 128,
+            "stream": true,
+            "system": "secret-system",
+            "messages": [
+                {"role": "user", "content": "secret-prompt"},
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "secret-reply"},
+                    {"type": "tool_use", "id": "t1", "name": "Read", "input": {"path": "secret-path"}},
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": "secret-file-contents"},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAA"}},
+                ]},
+            ],
+            "tools": [{"name": "Read", "description": "d", "input_schema": {"type": "object"}}],
+            "tool_choice": {"type": "auto"},
+        });
+        let s = request_summary(&body);
+        let rendered = s.to_string();
+        for secret in [
+            "secret-prompt",
+            "secret-reply",
+            "secret-path",
+            "secret-file-contents",
+            "secret-system",
+            "AAA",
+        ] {
+            assert!(!rendered.contains(secret), "{rendered}");
+        }
+        assert_eq!(s["messages"], 3);
+        assert_eq!(s["tools"], json!(["Read"]));
+        assert_eq!(s["max_tokens"], 128);
+    }
+
+    #[test]
+    fn body_preview_truncates() {
+        assert_eq!(body_preview("  ok  "), "ok");
+        let long = "x".repeat(600);
+        let p = body_preview(&long);
+        assert!(p.len() < 600 && p.ends_with('…'), "{p}");
+    }
 }

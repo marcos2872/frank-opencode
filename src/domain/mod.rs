@@ -73,6 +73,15 @@ pub struct CatalogEntry {
     pub enabled: bool,
     #[serde(default)]
     pub variants: Vec<ModelVariant>,
+    /// Per-model default headers from the catalog (e.g. `anthropic-beta:
+    /// fast-mode-2026-02-01` for `*-fast` rows, `x-opencode-org-id` for Go
+    /// inference rows). Forwarded on every upstream request.
+    #[serde(default)]
+    pub headers: Option<std::collections::HashMap<String, String>>,
+    /// Per-model default body fields from the catalog (e.g.
+    /// `{"speed":"fast"}`). Merged into the upstream JSON body.
+    #[serde(default)]
+    pub body: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -153,6 +162,25 @@ pub struct ModelVariantSettings {
 impl CatalogEntry {
     pub fn qualified(&self) -> String {
         format!("{}/{}", self.provider_id, self.model_id)
+    }
+
+    /// Stable identity for this catalog row: `provider/id`.
+    /// For most rows `id == modelID` so this equals `qualified()`; for rows
+    /// like `claude-opus-4.8-fast` (same `modelID`, different `id`/`headers`)
+    /// it is distinct and lets the gateway keep both flavors.
+    pub fn id_ref(&self) -> String {
+        format!("{}/{}", self.provider_id, self.id)
+    }
+
+    /// Reference to advertise for this row: `qualified()` normally,
+    /// `id_ref()` when the row carries a distinct `id` (fast flavors etc.)
+    /// so `lookup_entry` can resolve it via the `id` match.
+    pub fn preferred_ref(&self) -> String {
+        if !self.id.is_empty() && self.id != self.model_id {
+            self.id_ref()
+        } else {
+            self.qualified()
+        }
     }
 
     pub fn is_anthropic_package(&self) -> bool {
@@ -313,13 +341,80 @@ pub fn slugify(s: &str) -> String {
 pub fn auto_alias(entry: &CatalogEntry) -> AliasEntry {
     let slug = slugify(&format!("{}-{}", entry.provider_id, entry.model_id));
     let gateway_id = format!("claude-{slug}");
+    let opencode_ref = entry.preferred_ref();
     AliasEntry {
         gateway_id,
-        opencode_ref: entry.qualified(),
+        opencode_ref: opencode_ref.clone(),
         display_name: format!("{} ({})", entry.name, entry.provider_id),
-        description: format!("via frank-opencode · {}", entry.qualified()),
+        description: format!("via frank-opencode · {opencode_ref}"),
         context_window: entry.context_window(),
     }
+}
+
+/// Build automatic aliases for a batch, guaranteeing unique `gateway_id`s.
+///
+/// Two rows can slug to the same id: same `provider/modelID` with different
+/// `id` (e.g. `claude-opus-4.8` vs `claude-opus-4.8-fast`), or different
+/// model ids that differ only by punctuation (`v4.1` vs `v4-1`). The first
+/// row (sorted by `qualified`, then `id`) keeps the base alias; the rest
+/// fall back to `provider-id` and then numeric suffixes. Callers must still
+/// dedup against manual aliases (see `AppState::refresh`).
+pub fn auto_aliases_for(entries: &[CatalogEntry]) -> Vec<AliasEntry> {
+    use std::collections::HashSet;
+    let mut sorted: Vec<&CatalogEntry> = entries.iter().collect();
+    sorted.sort_by(|a, b| {
+        a.qualified()
+            .cmp(&b.qualified())
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    let mut taken: HashSet<String> = HashSet::new();
+    let mut out = Vec::with_capacity(sorted.len());
+    for e in sorted {
+        let base_slug = slugify(&format!("{}-{}", e.provider_id, e.model_id));
+        let base_id = format!("claude-{base_slug}");
+        // Distinct-id rows advertise `provider/id` so `lookup_entry` can
+        // resolve them via the `id` match instead of collapsing to the first
+        // row with the same `modelID`.
+        let opencode_ref = e.preferred_ref();
+        let id_slug = if !e.id.is_empty() {
+            slugify(&format!("{}-{}", e.provider_id, e.id))
+        } else {
+            base_slug.clone()
+        };
+        let id_based = format!("claude-{id_slug}");
+        // Candidate order: base, id-based, base-2, base-3, ...
+        let mut candidate = base_id.clone();
+        if taken.contains(&candidate) {
+            candidate = id_based.clone();
+        }
+        let mut n = 2;
+        while taken.contains(&candidate) {
+            // If even the id-based form collides (identical rows or
+            // punctuation-only differences), append a numeric suffix.
+            if candidate == id_based {
+                candidate = format!("{base_id}-{n}");
+            } else {
+                candidate = format!("{id_based}-{n}");
+                if taken.contains(&candidate) {
+                    candidate = format!("{base_id}-{n}");
+                }
+            }
+            n += 1;
+            if n > 100 {
+                break;
+            }
+        }
+        taken.insert(candidate.clone());
+        out.push(AliasEntry {
+            gateway_id: candidate,
+            opencode_ref: opencode_ref.clone(),
+            display_name: format!("{} ({})", e.name, e.provider_id),
+            description: format!("via frank-opencode · {opencode_ref}"),
+            context_window: e.context_window(),
+        });
+    }
+    out.sort_by(|a, b| a.gateway_id.cmp(&b.gateway_id));
+    out
 }
 
 #[cfg(test)]
@@ -376,6 +471,8 @@ mod tests {
             limit: None,
             enabled: true,
             variants: vec![],
+            headers: None,
+            body: None,
         };
         let a = auto_alias(&e);
         assert!(a.gateway_id.contains("claude"));
@@ -476,6 +573,8 @@ mod tests {
             limit: None,
             enabled: true,
             variants: vec![],
+            headers: None,
+            body: None,
         }
     }
 
@@ -518,6 +617,8 @@ mod tests {
             limit: None,
             enabled: true,
             variants: vec![],
+            headers: None,
+            body: None,
         };
         // Anthropic package wins regardless of a stray endpoint label.
         assert_eq!(protocol_for_entry(&e), Anthropic);
@@ -558,5 +659,117 @@ mod tests {
         assert_eq!(window_suffix(0), None);
         // Round trip: what we announce is what the gateway strips again.
         assert_eq!(strip_window_suffix("claude-x[1m]"), "claude-x");
+    }
+
+    fn test_entry(provider: &str, id: &str, model: &str, name: &str) -> CatalogEntry {
+        CatalogEntry {
+            id: id.into(),
+            model_id: model.into(),
+            provider_id: provider.into(),
+            name: name.into(),
+            package: "@opencode/ai/providers/anthropic".into(),
+            settings: CatalogSettings::default(),
+            limit: None,
+            enabled: true,
+            variants: vec![],
+            headers: None,
+            body: None,
+        }
+    }
+
+    #[test]
+    fn preferred_ref_uses_id_when_distinct() {
+        let normal = test_entry("github-copilot", "claude-opus-4.8", "claude-opus-4.8", "N");
+        assert_eq!(normal.preferred_ref(), "github-copilot/claude-opus-4.8");
+        assert_eq!(normal.id_ref(), "github-copilot/claude-opus-4.8");
+        let fast = test_entry(
+            "github-copilot",
+            "claude-opus-4.8-fast",
+            "claude-opus-4.8",
+            "N Fast",
+        );
+        assert_eq!(fast.preferred_ref(), "github-copilot/claude-opus-4.8-fast");
+    }
+
+    #[test]
+    fn auto_aliases_disambiguate_same_model_id() {
+        let normal = test_entry(
+            "github-copilot",
+            "claude-opus-4.8",
+            "claude-opus-4.8",
+            "Claude Opus 4.8",
+        );
+        let mut fast = test_entry(
+            "github-copilot",
+            "claude-opus-4.8-fast",
+            "claude-opus-4.8",
+            "Claude Opus 4.8 Fast",
+        );
+        fast.headers = Some(
+            [(
+                "anthropic-beta".to_string(),
+                "fast-mode-2026-02-01".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        fast.body = Some(serde_json::json!({"speed": "fast"}));
+        let aliases = auto_aliases_for(&[normal, fast]);
+        assert_eq!(aliases.len(), 2);
+        let ids: Vec<&str> = aliases.iter().map(|a| a.gateway_id.as_str()).collect();
+        // No duplicates.
+        let mut uniq = ids.clone();
+        uniq.sort_unstable();
+        uniq.dedup();
+        assert_eq!(uniq.len(), 2, "{ids:?}");
+        // Base alias kept for the normal row, fast gets an id-based alias.
+        assert!(ids.contains(&"claude-github-copilot-claude-opus-4-8"));
+        assert!(ids.contains(&"claude-github-copilot-claude-opus-4-8-fast"));
+        let refs: Vec<&str> = aliases.iter().map(|a| a.opencode_ref.as_str()).collect();
+        assert!(refs.contains(&"github-copilot/claude-opus-4.8"));
+        assert!(refs.contains(&"github-copilot/claude-opus-4.8-fast"));
+    }
+
+    #[test]
+    fn auto_aliases_dedup_slug_collision() {
+        // `v4.1` vs `v4-1` slug to the same id; both must survive with
+        // distinct gateway ids.
+        let a = test_entry(
+            "opencode-go",
+            "deepseek-v4.1-flash",
+            "deepseek-v4.1-flash",
+            "A",
+        );
+        let b = test_entry(
+            "opencode-go",
+            "deepseek-v4-1-flash",
+            "deepseek-v4-1-flash",
+            "B",
+        );
+        let aliases = auto_aliases_for(&[a, b]);
+        assert_eq!(aliases.len(), 2);
+        assert_ne!(aliases[0].gateway_id, aliases[1].gateway_id);
+    }
+
+    #[test]
+    fn catalog_headers_body_deserialize() {
+        use serde_json::json;
+        let e: CatalogEntry = serde_json::from_value(json!({
+            "id": "claude-opus-4.8-fast",
+            "modelID": "claude-opus-4.8",
+            "providerID": "github-copilot",
+            "name": "Claude Opus 4.8 Fast",
+            "package": "@opencode/ai/providers/anthropic",
+            "enabled": true,
+            "headers": {"anthropic-beta": "fast-mode-2026-02-01"},
+            "body": {"speed": "fast"}
+        }))
+        .unwrap();
+        assert_eq!(
+            e.headers.as_ref().unwrap()["anthropic-beta"],
+            "fast-mode-2026-02-01"
+        );
+        assert_eq!(e.body.as_ref().unwrap()["speed"], "fast");
+        assert_eq!(e.preferred_ref(), "github-copilot/claude-opus-4.8-fast");
     }
 }

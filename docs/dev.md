@@ -27,6 +27,35 @@ curl -s http://127.0.0.1:3737/health
 curl -s "http://127.0.0.1:3737/v1/models?limit=1000" | head -c 500
 ```
 
+## Resetando o cache do Claude Code (dev)
+
+O discovery (`CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1`) busca
+`GET /v1/models` a cada startup do Claude e grava em
+`~/.claude/cache/gateway-models.json`. O catálogo do gateway é lido só no
+boot, então após mudar aliases/código:
+
+```bash
+# 1. Gateway com catálogo fresco (mata o --serve antigo e sobe de novo)
+curl -s http://127.0.0.1:3737/health  # confira "models" != 0
+# daemon: frank-opencode --disable && frank-opencode --enable
+# foreground: cargo run -- --serve --port 3737
+
+# 2. Confere o novo mapeamento (zero dup, fast com alias próprio)
+curl -s http://127.0.0.1:3737/v1/models \
+  | jq -r '.data[].id' | sort | uniq -d  # vazio = ok
+
+# 3. Força o Claude a reler (saia do claude antes)
+rm ~/.claude/cache/gateway-models.json
+claude
+# /model -> reselecione o id COM [1m], ex. claude-opencode-go-deepseek-v4-1-flash[1m]
+```
+
+Não apague `~/.claude/cache/model-catalog/` (catálogo publicado da
+Anthropic, não do gateway). Se o picker mostra `Custom model`, o
+`settings.json: model` tem a forma sem `[1m]` — funciona na API (o gateway
+remove o sufixo ao resolver) mas o picker compara string exata; reselecionar
+no `/model` reescreve o campo.
+
 ## Instalando o binário local
 
 ```bash

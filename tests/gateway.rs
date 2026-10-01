@@ -38,6 +38,8 @@ fn entry(provider: &str, model: &str) -> CatalogEntry {
         limit: None,
         enabled: true,
         variants: vec![],
+        headers: None,
+        body: None,
     }
 }
 
@@ -266,6 +268,8 @@ async fn ambiguous_model_id_resolves_deterministically() {
 struct MockUpstream {
     calls: Arc<Mutex<Vec<(String, Value)>>>,
     sessions: Arc<Mutex<Vec<String>>>,
+    betas: Arc<Mutex<Vec<Option<String>>>>,
+    org_ids: Arc<Mutex<Vec<Option<String>>>>,
     chat_streaming: bool,
 }
 
@@ -277,6 +281,18 @@ async fn note(st: &MockUpstream, headers: &axum::http::HeaderMap, path: &str, bo
     {
         st.sessions.lock().await.push(s.to_string());
     }
+    st.betas.lock().await.push(
+        headers
+            .get("anthropic-beta")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string()),
+    );
+    st.org_ids.lock().await.push(
+        headers
+            .get("x-opencode-org-id")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string()),
+    );
 }
 
 async fn mock_chat(
@@ -372,6 +388,8 @@ fn mock_entry(base_url: &str, package: &str, model: &str) -> CatalogEntry {
         limit: None,
         enabled: true,
         variants: vec![],
+        headers: None,
+        body: None,
     }
 }
 
@@ -485,6 +503,8 @@ async fn e2e_copilot_responses_endpoint_routes_to_responses() {
         limit: None,
         enabled: true,
         variants: vec![],
+        headers: None,
+        body: None,
     };
     let state = seeded_state(
         test_config(),
@@ -527,6 +547,8 @@ async fn e2e_copilot_chat_endpoint_stays_on_chat_completions() {
         limit: None,
         enabled: true,
         variants: vec![],
+        headers: None,
+        body: None,
     };
     let state = seeded_state(
         test_config(),
@@ -576,6 +598,111 @@ async fn e2e_anthropic_passthrough() {
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0]["model"], "mock-anth");
     assert_eq!(calls[0]["max_tokens"], 8);
+}
+
+#[tokio::test]
+async fn e2e_fast_flavor_keeps_distinct_alias_and_headers() {
+    use std::collections::HashMap;
+    let mock = MockUpstream::default();
+    let base = spawn_mock(mock.clone()).await;
+    // Provider `opencode` with inline api_key needs no credential DB (same
+    // trick as `mock_entry`); the disambiguation logic is provider-agnostic.
+    let mut normal = mock_entry(&base, ANTHROPIC_PKG, "claude-opus-4.8");
+    normal.id = "claude-opus-4.8".to_string();
+    normal.name = "Claude Opus 4.8".to_string();
+    let mut fast = mock_entry(&base, ANTHROPIC_PKG, "claude-opus-4.8");
+    fast.id = "claude-opus-4.8-fast".to_string();
+    fast.name = "Claude Opus 4.8 Fast".to_string();
+    fast.headers = Some(HashMap::from([(
+        "anthropic-beta".to_string(),
+        "fast-mode-2026-02-01".to_string(),
+    )]));
+    fast.body = Some(json!({"speed": "fast"}));
+    // Aliases built the same way `refresh()` does: no duplicate ids.
+    let aliases = frank_opencode::domain::auto_aliases_for(&[normal.clone(), fast.clone()]);
+    assert_eq!(aliases.len(), 2);
+    assert_ne!(aliases[0].gateway_id, aliases[1].gateway_id);
+    let state = seeded_state(test_config(), vec![normal, fast], aliases.clone()).await;
+    let server = axum_test::TestServer::new(router(state)).unwrap();
+    for a in &aliases {
+        let resp = server
+            .post("/v1/messages")
+            .add_header("x-api-key", "test-secret")
+            .json(&msg_body(&a.gateway_id))
+            .await;
+        assert_eq!(resp.status_code(), 200, "alias {}", a.gateway_id);
+    }
+    let calls = calls_to(&mock, "messages").await;
+    assert_eq!(calls.len(), 2);
+    // Both hit the same upstream model id, but the fast row carries speed.
+    assert!(calls.iter().all(|c| c["model"] == "claude-opus-4.8"));
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|c| c.get("speed") == Some(&json!("fast")))
+            .count(),
+        1
+    );
+    // Fast beta header reached the upstream exactly once.
+    let betas = mock.betas.lock().await;
+    assert_eq!(
+        betas
+            .iter()
+            .filter(|b| b.as_deref() == Some("fast-mode-2026-02-01"))
+            .count(),
+        1,
+        "{betas:?}"
+    );
+}
+
+#[tokio::test]
+async fn e2e_provider_id_ref_resolves_fast_row() {
+    let mock = MockUpstream::default();
+    let base = spawn_mock(mock.clone()).await;
+    let mut e = mock_entry(&base, ANTHROPIC_PKG, "claude-opus-4.8");
+    e.id = "claude-opus-4.8-fast".to_string();
+    e.body = Some(json!({"speed": "fast"}));
+    let state = seeded_state(
+        test_config(),
+        vec![e],
+        vec![alias("claude-fast", "opencode/claude-opus-4.8-fast")],
+    )
+    .await;
+    let server = axum_test::TestServer::new(router(state)).unwrap();
+    // Direct provider/id and plain id both resolve via the `id` match.
+    for model in ["opencode/claude-opus-4.8-fast", "claude-opus-4.8-fast"] {
+        let resp = server
+            .post("/v1/messages")
+            .add_header("x-api-key", "test-secret")
+            .json(&msg_body(model))
+            .await;
+        assert_eq!(resp.status_code(), 200, "model {model}");
+    }
+    let calls = calls_to(&mock, "messages").await;
+    assert_eq!(calls.len(), 2);
+}
+
+#[tokio::test]
+async fn e2e_catalog_body_merged_into_upstream() {
+    let mock = MockUpstream::default();
+    let base = spawn_mock(mock.clone()).await;
+    let mut e = mock_entry(&base, ANTHROPIC_PKG, "mock-anth");
+    e.body = Some(json!({"speed": "fast"}));
+    let state = seeded_state(
+        test_config(),
+        vec![e],
+        vec![alias("claude-mock-anth", "opencode/mock-anth")],
+    )
+    .await;
+    let server = axum_test::TestServer::new(router(state)).unwrap();
+    let resp = server
+        .post("/v1/messages")
+        .add_header("x-api-key", "test-secret")
+        .json(&msg_body("claude-mock-anth"))
+        .await;
+    assert_eq!(resp.status_code(), 200);
+    let calls = calls_to(&mock, "messages").await;
+    assert_eq!(calls[0]["speed"], "fast");
 }
 
 #[tokio::test]
@@ -827,7 +954,7 @@ fn catalog_body(model: &str) -> Value {
 /// Write a self-contained `opencode` shim: it reads its phase from the state
 /// file and prints a preset catalog (or exits 1 for `fail`). The `model`
 /// phase prints the catalog for `model`.
-fn write_shim(dir: &PathBuf, state_file: &PathBuf, model: &str) -> String {
+fn write_shim(dir: &std::path::Path, state_file: &std::path::Path, model: &str) -> String {
     let body = catalog_body(model).to_string();
     std::fs::create_dir_all(dir).expect("create shim dir");
     let path = dir.join("opencode");
