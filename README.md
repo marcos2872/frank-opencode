@@ -199,6 +199,7 @@ checagem de janela para ids desconhecidos, perdendo a conta real de tokens).
 |---|---|
 | `401` "no stored credential for 'X'" | Rode `opencode auth login` para aquele provider. |
 | `400` "IDE authentication failed ... invalid token: unknown format" | Provider `github-copilot`: a credencial é envelope OAuth (`access`), não API-key (`key`). O gateway agora extrai `access`; se o erro persistir, re-autentique: `opencode auth login` e `opencode auth switch` (ajuste o `switch` para o provider copilot). |
+| `400` "`X` is not accessible via the /chat/completions endpoint" | Provider `github-copilot`: GPT-6/5.6, grok, mai-code e codex são servidos pela Responses API, não Chat Completions. O gateway roteia pelo `settings.endpoint` que o catálogo declara por modelo (`"responses"`/`"chat"`/`"messages"`); reinicie o gateway para pegar o binário novo. |
 | `401` "invalid gateway credential" | `auth_token` está setado no config: `ANTHROPIC_AUTH_TOKEN` precisa ser igual. |
 | `MissingSessionID` do Go | frank-opencode < 0.1.1; atualize (headers de sessão agora são automáticos). |
 | `FreeTierError` em modelos `opencode/*` | Free tier do Console só funciona dentro do OpenCode; esses modelos ficam ocultos de `/v1/models` por padrão (`include_free_tier = true` para exibir). Use um modelo `opencode-go/*`. |

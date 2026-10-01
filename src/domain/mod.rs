@@ -83,6 +83,11 @@ pub struct CatalogSettings {
     pub api_key: Option<String>,
     #[serde(default)]
     pub provider: Option<String>,
+    /// Wire API for the model, per the catalog (`settings.endpoint`).
+    /// `github-copilot` (aisdk package) mixes APIs: `"responses"` (GPT-6/5.6,
+    /// grok, mai-code, codex), `"chat"` (Gemini), `"messages"` (Claude).
+    #[serde(default)]
+    pub endpoint: Option<String>,
 }
 
 /// Token limits as reported by `opencode api get /api/model` (`limit` field).
@@ -212,6 +217,28 @@ pub fn protocol_for(package: &str) -> Protocol {
     } else {
         Protocol::ChatCompletions
     }
+}
+
+/// Wire protocol for a catalog entry, honoring the per-model
+/// `settings.endpoint` the catalog declares.
+///
+/// `github-copilot` (aisdk package) mixes APIs on one baseURL: GPT-6/5.6,
+/// grok, mai-code and codex run on the Responses API (`endpoint: "responses"`),
+/// Gemini on Chat Completions (`"chat"`) and Claude on Messages (`"messages"`).
+/// Routing by package alone sends the Responses models to `/chat/completions`,
+/// which Copilot rejects with `400 ... not accessible via the /chat/completions
+/// endpoint`. For aisdk entries the declared endpoint decides; all other
+/// packages keep the `protocol_for(package)` table.
+pub fn protocol_for_entry(entry: &CatalogEntry) -> Protocol {
+    if entry.package.contains("aisdk") {
+        return match entry.settings.endpoint.as_deref() {
+            Some("responses") => Protocol::Responses,
+            Some("messages") => Protocol::Anthropic,
+            // Includes `"chat"` and any unknown/absent endpoint label.
+            _ => Protocol::ChatCompletions,
+        };
+    }
+    protocol_for(&entry.package)
 }
 
 /// Returns true when the package is not one of the known shapes, so the
@@ -431,6 +458,73 @@ mod tests {
         assert!(is_known_package("@opencode/ai/providers/openrouter"));
         assert!(!is_known_package("@acme/custom-thing"));
         assert_eq!(protocol_for("@acme/custom-thing"), ChatCompletions);
+    }
+
+    /// The github-copilot aisdk package mixes APIs under one baseURL; the
+    /// catalog's per-model `settings.endpoint` decides the wire protocol.
+    fn copilot_entry(endpoint: Option<&str>) -> CatalogEntry {
+        CatalogEntry {
+            id: "m".into(),
+            model_id: "m".into(),
+            provider_id: "github-copilot".into(),
+            name: "M".into(),
+            package: "aisdk:@ai-sdk/github-copilot".into(),
+            settings: CatalogSettings {
+                endpoint: endpoint.map(|s| s.to_string()),
+                ..CatalogSettings::default()
+            },
+            limit: None,
+            enabled: true,
+            variants: vec![],
+        }
+    }
+
+    #[test]
+    fn protocol_for_entry_honors_copilot_endpoint() {
+        use Protocol::*;
+        assert_eq!(
+            protocol_for_entry(&copilot_entry(Some("responses"))),
+            Responses
+        );
+        assert_eq!(
+            protocol_for_entry(&copilot_entry(Some("chat"))),
+            ChatCompletions
+        );
+        assert_eq!(
+            protocol_for_entry(&copilot_entry(Some("messages"))),
+            Anthropic
+        );
+        // Unknown/absent endpoint on aisdk: ChatCompletions fallback.
+        assert_eq!(
+            protocol_for_entry(&copilot_entry(Some("weird"))),
+            ChatCompletions
+        );
+        assert_eq!(protocol_for_entry(&copilot_entry(None)), ChatCompletions);
+    }
+
+    #[test]
+    fn protocol_for_entry_ignores_endpoint_outside_aisdk() {
+        use Protocol::*;
+        let mut e = CatalogEntry {
+            id: "c".into(),
+            model_id: "claude-sonnet-5.5".into(),
+            provider_id: "github-copilot".into(),
+            name: "Claude".into(),
+            package: "@opencode/ai/providers/anthropic".into(),
+            settings: CatalogSettings {
+                endpoint: Some("chat".into()),
+                ..CatalogSettings::default()
+            },
+            limit: None,
+            enabled: true,
+            variants: vec![],
+        };
+        // Anthropic package wins regardless of a stray endpoint label.
+        assert_eq!(protocol_for_entry(&e), Anthropic);
+        // OpenAI responses-package stays Responses with no endpoint declared.
+        e.package = "@opencode/ai/providers/openai".into();
+        e.settings.endpoint = None;
+        assert_eq!(protocol_for_entry(&e), Responses);
     }
 
     #[test]

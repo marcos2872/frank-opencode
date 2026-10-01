@@ -32,6 +32,7 @@ fn entry(provider: &str, model: &str) -> CatalogEntry {
             base_url: Some("http://127.0.0.1:9".to_string()),
             api_key: None,
             provider: None,
+            endpoint: None,
         },
         limit: None,
         enabled: true,
@@ -365,6 +366,7 @@ fn mock_entry(base_url: &str, package: &str, model: &str) -> CatalogEntry {
             base_url: Some(base_url.to_string()),
             api_key: Some("test-upstream-key".to_string()),
             provider: None,
+            endpoint: None,
         },
         limit: None,
         enabled: true,
@@ -457,6 +459,94 @@ async fn e2e_responses_round_trip() {
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0]["model"], "mock-resp");
     assert!(calls[0]["input"].is_array());
+}
+
+#[tokio::test]
+async fn e2e_copilot_responses_endpoint_routes_to_responses() {
+    // github-copilot aisdk models declare `settings.endpoint: "responses"`
+    // (GPT-6/5.6, grok, mai-code, codex). Without the endpoint-aware routing
+    // they were sent to /chat/completions -> 400 "not accessible via the
+    // /chat/completions endpoint".
+    let mock = MockUpstream::default();
+    let base = spawn_mock(mock.clone()).await;
+    let e = CatalogEntry {
+        id: "grok-4.7".to_string(),
+        model_id: "grok-4.7".to_string(),
+        provider_id: "opencode".to_string(),
+        name: "Grok 4.7".to_string(),
+        package: "aisdk:@ai-sdk/github-copilot".to_string(),
+        settings: CatalogSettings {
+            base_url: Some(base.clone()),
+            api_key: Some("test-upstream-key".to_string()),
+            provider: None,
+            endpoint: Some("responses".to_string()),
+        },
+        limit: None,
+        enabled: true,
+        variants: vec![],
+    };
+    let state = seeded_state(
+        test_config(),
+        vec![e],
+        vec![alias("claude-github-copilot-grok-4-7", "opencode/grok-4.7")],
+    )
+    .await;
+    let server = axum_test::TestServer::new(router(state)).unwrap();
+    let resp = server
+        .post("/v1/messages")
+        .add_header("x-api-key", "test-secret")
+        .json(&msg_body("claude-github-copilot-grok-4-7"))
+        .await;
+    assert_eq!(resp.status_code(), 200);
+    // The upstream must have seen a Responses-API call, not chat/completions.
+    let calls = calls_to(&mock, "responses").await;
+    assert_eq!(calls.len(), 1, "expected the request on /responses");
+    assert_eq!(calls[0]["model"], "grok-4.7");
+    assert!(calls_to(&mock, "chat/completions").await.is_empty());
+}
+
+#[tokio::test]
+async fn e2e_copilot_chat_endpoint_stays_on_chat_completions() {
+    // Gemini copilot models declare `settings.endpoint: "chat"` and must
+    // keep routing to /chat/completions (regression guard).
+    let mock = MockUpstream::default();
+    let base = spawn_mock(mock.clone()).await;
+    let e = CatalogEntry {
+        id: "gemini-3.6-flash".to_string(),
+        model_id: "gemini-3.6-flash".to_string(),
+        provider_id: "opencode".to_string(),
+        name: "Gemini 3.6 Flash".to_string(),
+        package: "aisdk:@ai-sdk/github-copilot".to_string(),
+        settings: CatalogSettings {
+            base_url: Some(base.clone()),
+            api_key: Some("test-upstream-key".to_string()),
+            provider: None,
+            endpoint: Some("chat".to_string()),
+        },
+        limit: None,
+        enabled: true,
+        variants: vec![],
+    };
+    let state = seeded_state(
+        test_config(),
+        vec![e],
+        vec![alias(
+            "claude-github-copilot-gemini-3-6-flash",
+            "opencode/gemini-3.6-flash",
+        )],
+    )
+    .await;
+    let server = axum_test::TestServer::new(router(state)).unwrap();
+    let resp = server
+        .post("/v1/messages")
+        .add_header("x-api-key", "test-secret")
+        .json(&msg_body("claude-github-copilot-gemini-3-6-flash"))
+        .await;
+    assert_eq!(resp.status_code(), 200);
+    let calls = calls_to(&mock, "chat/completions").await;
+    assert_eq!(calls.len(), 1, "expected the request on /chat/completions");
+    assert_eq!(calls[0]["model"], "gemini-3.6-flash");
+    assert!(calls_to(&mock, "responses").await.is_empty());
 }
 
 #[tokio::test]

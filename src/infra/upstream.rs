@@ -4,7 +4,7 @@
 //!   (forward `anthropic-version` / `anthropic-beta` / body unchanged).
 //! - `openai*` packages: translate Anthropic <-> OpenAI Chat Completions.
 
-use crate::domain::{protocol_for, CatalogEntry, Protocol};
+use crate::domain::{protocol_for_entry, CatalogEntry, Protocol};
 use serde_json::Value;
 
 // ---------------------------------------------------------------------------
@@ -252,7 +252,7 @@ pub fn normalize_reasoning(label: &str) -> &str {
 
 /// Apply a selected variant to a translated request body.
 /// The field that carries the variant's parameters depends on the wire
-/// protocol (same table as `protocol_for`):
+/// protocol (same table as `protocol_for_entry`):
 ///
 /// - `Anthropic`: `reasoning_effort` is not a Messages param; a variant that
 ///   declares `reasoningEffort` is a no-op (we cannot guess a thinking
@@ -268,7 +268,7 @@ pub fn apply_variant(mut body: Value, entry: &CatalogEntry, variant: &str) -> Va
     let Some(effort) = v.settings.reasoning_effort.as_deref() else {
         return body;
     };
-    let key = match protocol_for(&entry.package) {
+    let key = match protocol_for_entry(entry) {
         Protocol::Anthropic => return body,
         Protocol::Responses => "reasoning",
         Protocol::ChatCompletions => "reasoning_effort",

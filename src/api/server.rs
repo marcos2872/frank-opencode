@@ -2,8 +2,8 @@
 
 use crate::config::AppConfig;
 use crate::domain::{
-    auto_alias, is_known_package, protocol_for, strip_window_suffix, window_suffix, AliasEntry,
-    CatalogEntry, ModelRef, Protocol,
+    auto_alias, is_known_package, protocol_for_entry, strip_window_suffix, window_suffix,
+    AliasEntry, CatalogEntry, ModelRef, Protocol,
 };
 use crate::infra::opencode::{fetch_catalog, upstream_bearer, CredentialStore};
 use crate::infra::upstream::{
@@ -453,7 +453,7 @@ async fn count_tokens(State(s): State<AppState>, Json(body): Json<Value>) -> Res
     }
 
     if let Some(base) = entry.base_url() {
-        if protocol_for(&entry.package) == Protocol::Anthropic {
+        if protocol_for_entry(&entry) == Protocol::Anthropic {
             if let Some(n) = proxy_count_tokens(&s, base, &entry, &body).await {
                 return Json(serde_json::json!({"input_tokens": n})).into_response();
             }
@@ -552,7 +552,7 @@ async fn messages(
         );
     };
 
-    match protocol_for(&entry.package) {
+    match protocol_for_entry(&entry) {
         Protocol::Anthropic => {
             forward_anthropic(
                 &s,
