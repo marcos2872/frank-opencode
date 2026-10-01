@@ -1,0 +1,831 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>frank-opencode — seus modelos do opencode no Claude Code e no Claude Desktop</title>
+<meta name="description" content="Gateway local compatível com Anthropic que expõe os modelos do OpenCode v2 ao Claude Code. Escuta em 127.0.0.1:3737 e nunca fala com a Anthropic.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Arimo:wght@400;600;700&family=DM+Mono:ital,wght@0,400;0,500;1,400&display=swap" rel="stylesheet">
+<style>
+/* ————————————————————————————————————————————————
+   frank-opencode — tokens
+   ———————————————————————————————————————————————— */
+:root{
+  color-scheme:dark;
+  --paper:#131210;
+  --paper-lift:#1D1C17;
+  --ink:#EDE8D9;
+  --body:#B3AD9B;
+  --rule:#EDE8D91F;
+  --rule-strong:#EDE8D945;
+
+  --wire-a:#E0682E;      /* dialect A — Messages API */
+  --wire-b:#3AA695;      /* frank — the interpreter */
+  --wire-c:#8B8FF0;      /* dialect B — opencode providers */
+
+  --f-display:"Arimo",-apple-system,"Segoe UI",Roboto,sans-serif;
+  --f-mono:"DM Mono",ui-monospace,"SFMono-Regular",Menlo,Consolas,monospace;
+
+  --gut:clamp(1.25rem,4.5vw,4.5rem);
+  --max:78rem;
+  --hair:1px;
+  --r:2px;
+}
+
+*,*::before,*::after{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{
+  margin:0;
+  background:var(--paper);
+  color:var(--ink);
+  font-family:var(--f-display);
+  font-size:clamp(1rem,0.55vw + 0.88rem,1.0625rem);
+  line-height:1.62;
+  font-synthesis-weight:none;
+  text-rendering:optimizeLegibility;
+}
+img,svg{display:block;max-width:100%}
+a{color:inherit}
+
+.wrap{max-width:var(--max);margin:0 auto;padding:0 var(--gut)}
+.hair{border:0;border-top:var(--hair) solid var(--rule);margin:0}
+
+/* focus: visible, never removed */
+:focus-visible{outline:2px solid var(--wire-b);outline-offset:3px;border-radius:var(--r)}
+
+/* type roles */
+.d-xl{
+  font-size:clamp(2.1rem,6.6vw,4.2rem);
+  line-height:1.03;
+  letter-spacing:-.035em;
+  font-weight:700;
+  margin:0;
+}
+.d-l{font-size:clamp(1.5rem,3.1vw,2.4rem);line-height:1.1;letter-spacing:-.028em;font-weight:700;margin:0}
+.d-m{font-size:clamp(1.15rem,1.7vw,1.48rem);line-height:1.25;letter-spacing:-.018em;font-weight:600;margin:0}
+.lede{font-size:clamp(1.02rem,1.15vw,1.22rem);line-height:1.55;color:var(--body);max-width:58ch;margin:0}
+
+.mono{font-family:var(--f-mono);font-variant-ligatures:none}
+p code,li code,td code,dd code,.lede code{
+  font-family:var(--f-mono);font-size:.87em;
+  background:var(--rule);padding:.08em .34em;border-radius:var(--r);
+  overflow-wrap:break-word;
+}
+.tag{
+  font-family:var(--f-mono);font-size:.74rem;letter-spacing:.06em;
+  color:var(--body);display:flex;gap:.5rem;align-items:baseline;flex-wrap:wrap;
+}
+.tag i{font-style:normal;color:var(--ink);font-weight:500}
+
+/* ——— top bar ——— */
+.bar{
+  position:sticky;top:0;z-index:40;
+  background:var(--paper);
+  background:color-mix(in srgb,var(--paper) 88%,transparent);
+  backdrop-filter:blur(10px) saturate(1.1);
+  border-bottom:var(--hair) solid var(--rule-strong);
+}
+.bar .wrap{display:flex;align-items:center;gap:1.25rem;height:3.5rem}
+.mark{
+  font-family:var(--f-mono);font-weight:500;font-size:.85rem;
+  letter-spacing:-.02em;text-decoration:none;white-space:nowrap;
+  display:flex;align-items:center;gap:.45rem;
+}
+.mark::before{
+  content:"";width:9px;height:9px;background:var(--wire-b);flex:none;
+  clip-path:polygon(0 0,100% 50%,0 100%);
+}
+.bar nav{margin-left:auto;display:flex;gap:1.35rem;align-items:center}
+.bar nav a{
+  font-family:var(--f-mono);font-size:.76rem;letter-spacing:.04em;
+  text-decoration:none;color:var(--body);padding:.25rem 0;
+}
+.bar nav a:hover{color:var(--ink);text-decoration:underline;text-underline-offset:4px;text-decoration-thickness:1px}
+@media (max-width:44rem){.bar nav a.opt{display:none}}
+
+/* ——— buttons ——— */
+.btn{
+  display:inline-flex;align-items:center;gap:.6rem;
+  font-family:var(--f-mono);font-size:.8rem;letter-spacing:.03em;
+  padding:.72rem 1.05rem;border-radius:var(--r);
+  border:var(--hair) solid var(--ink);background:var(--ink);color:var(--paper);
+  text-decoration:none;cursor:pointer;transition:background .16s,border-color .16s;
+}
+.btn:hover{background:var(--wire-b);border-color:var(--wire-b)}
+.btn.ghost{background:transparent;color:var(--ink)}
+.btn.ghost:hover{background:var(--ink);color:var(--paper);border-color:var(--ink)}
+
+/* ——— hero ——— */
+.hero{padding:clamp(3rem,8vw,6.5rem) 0 0}
+.hero h1{margin-bottom:1.5rem;max-width:22ch}
+.hero .lede{margin-bottom:2rem}
+.cta{display:flex;gap:.8rem;flex-wrap:wrap;align-items:center}
+
+.stage{
+  margin:clamp(2.5rem,6vw,4rem) 0 0;
+  border-top:var(--hair) solid var(--rule-strong);
+  border-bottom:var(--hair) solid var(--rule-strong);
+}
+.stage svg{width:100%;height:auto;display:block}
+/* on narrow screens the 1120×300 diagram would shrink into an illegible strip;
+   keep it tall enough to read and let the figure pan horizontally instead */
+@media (max-width:56rem){
+  .stage{overflow-x:auto;overflow-y:hidden}
+  .stage svg{width:44rem;min-height:11.8rem;max-width:none}
+}
+.stage.in .sig{opacity:1;transform:none;transition:opacity .55s ease,transform .55s ease;transition-delay:var(--d,0ms)}
+.stage .sig{opacity:0;transform:translateY(10px)}
+.stage-cap{
+  font-family:var(--f-mono);font-size:.74rem;color:var(--body);
+  padding:.7rem 0 1rem;display:flex;gap:.7rem;flex-wrap:wrap;align-items:baseline;
+}
+.stage-cap b{font-weight:500;color:var(--ink)}
+@media (prefers-reduced-motion:reduce){
+  .stage .sig{opacity:1;transform:none}
+  .stage.in .sig{transition:none}
+  *{animation-duration:.001ms !important;transition-duration:.001ms !important}
+}
+
+/* ——— bands ——— */
+.band{border-top:var(--hair) solid var(--rule-strong);padding:clamp(3rem,7vw,5.5rem) 0}
+.band h2{margin-bottom:1.1rem;max-width:26ch}
+.band .lede{max-width:62ch}
+
+.flow{display:grid;gap:0;margin-top:2.75rem;border-top:var(--hair) solid var(--rule)}
+.flow>div{
+  display:grid;grid-template-columns:minmax(0,7rem) minmax(0,1fr);
+  gap:1.5rem;padding:1.4rem 0;border-bottom:var(--hair) solid var(--rule);
+}
+.flow .k{font-family:var(--f-mono);font-size:.75rem;color:var(--body);padding-top:.35rem}
+.flow .v{max-width:62ch}
+.flow .v p{margin:.4rem 0 0;color:var(--body)}
+.flow .v p + p{margin-top:.7rem}
+@media (max-width:40rem){
+  .flow>div{grid-template-columns:1fr;gap:.5rem}
+  .flow .k{padding-top:0}
+}
+
+/* ——— translation panel ——— */
+.translate{margin-top:2.75rem;border:var(--hair) solid var(--rule-strong);border-radius:var(--r);background:var(--paper-lift)}
+.translate-h{
+  display:flex;gap:.75rem 1rem;flex-wrap:wrap;align-items:center;
+  padding:1rem 1.25rem;border-bottom:var(--hair) solid var(--rule);
+}
+.translate-h .tag{margin-right:auto}
+.probe{
+  display:flex;gap:.4rem;border:0;margin:0;padding:0;min-width:0;
+  max-width:100%;overflow-x:auto;scrollbar-width:none;
+}
+.probe::-webkit-scrollbar{display:none}
+.probe button{
+  font-family:var(--f-mono);font-size:.74rem;letter-spacing:.03em;
+  padding:.4rem .7rem;border:var(--hair) solid var(--rule-strong);
+  background:transparent;color:var(--body);cursor:pointer;border-radius:var(--r);
+  white-space:nowrap;transition:background .14s,color .14s,border-color .14s;
+}
+.probe button:hover{background:var(--paper);color:var(--ink);border-color:var(--ink)}
+.probe button[aria-pressed="true"]{background:var(--ink);color:var(--paper);border-color:var(--ink)}
+.translate table{width:100%;border-collapse:collapse;margin:0}
+.translate th,.translate td{
+  text-align:left;vertical-align:top;padding:.85rem 1.25rem;
+  border-top:var(--hair) solid var(--rule);
+}
+.translate thead th{
+  border-top:0;padding-top:1rem;padding-bottom:.55rem;
+  font-family:var(--f-mono);font-size:.72rem;letter-spacing:.04em;color:var(--body);font-weight:400;
+}
+.translate tbody tr:first-child td{border-top:0}
+.translate td:first-child{width:30%;font-family:var(--f-mono);font-size:.78rem;color:var(--body)}
+.translate td:last-child{font-weight:600;letter-spacing:-.01em}
+.translate th.a{color:var(--wire-a)}
+.translate th.b{color:var(--wire-c)}
+.translate code{
+  font-family:var(--f-mono);font-size:.86em;background:var(--rule);
+  padding:.1em .35em;border-radius:var(--r);
+}
+@media (max-width:44rem){
+  .translate td:first-child,.translate td:last-child{width:auto}
+  .translate th:first-child,.translate td:first-child{display:none}
+  .translate th,.translate td{padding:.8rem 1.25rem}
+  .translate thead th{padding-top:.85rem}
+}
+
+/* ——— config spec tables (reuse .translate frame) ——— */
+.spec{margin-top:2rem}
+.spec td:first-child{width:26%;font-size:.78rem}
+.spec td:nth-child(2){font-weight:400;color:var(--body);font-size:.9rem}
+.spec td:last-child{font-weight:400;font-size:.9rem;letter-spacing:0;color:var(--ink)}
+
+/* ——— install ——— */
+.cols{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:clamp(1.5rem,4vw,3rem);margin-top:2.75rem}
+@media (max-width:52rem){.cols{grid-template-columns:1fr}}
+.field h3{margin:0 0 .75rem;font-size:1.02rem;font-weight:600}
+.field p{margin:.6rem 0 0;color:var(--body);font-size:.94rem}
+.field .tag{margin-bottom:.65rem}
+.field ol.steps{margin:.6rem 0 0;padding-left:1.2rem;color:var(--body);font-size:.94rem}
+.field ol.steps li{margin-bottom:.3rem}
+.field ol.steps li::marker{font-family:var(--f-mono);color:var(--wire-b)}
+
+.term{
+  border:var(--hair) solid var(--ink);border-radius:var(--r);background:var(--paper-lift);
+  font-family:var(--f-mono);font-size:.8rem;line-height:1.75;overflow:hidden;
+}
+.term + .term{margin-top:1rem}
+.term-h{
+  display:flex;align-items:center;gap:.6rem;
+  padding:.55rem .8rem;border-bottom:var(--hair) solid var(--rule-strong);
+  font-size:.72rem;letter-spacing:.03em;color:var(--body);
+}
+.term-h .copy{
+  margin-left:auto;font-family:var(--f-mono);font-size:.72rem;
+  background:transparent;border:var(--hair) solid var(--rule-strong);color:var(--body);
+  padding:.28rem .55rem;border-radius:var(--r);cursor:pointer;transition:background .14s,color .14s;
+}
+.term-h .copy:hover{background:var(--ink);color:var(--paper);border-color:var(--ink)}
+.term pre{margin:0;padding:.95rem 1rem;overflow-x:auto;white-space:pre}
+.term .c{color:var(--body)}
+.term .k{color:var(--wire-b);font-weight:500}
+.term .s{color:var(--wire-c)}
+.note{
+  margin-top:1rem;padding:.85rem 1rem;border:var(--hair) solid var(--rule-strong);
+  border-radius:var(--r);background:var(--paper-lift);color:var(--body);font-size:.9rem;max-width:70ch;
+}
+.note b{color:var(--ink);font-weight:600}
+
+.tabs{margin-top:2.75rem}
+.tabs [role="tablist"]{display:flex;gap:0;border-bottom:var(--hair) solid var(--rule-strong);flex-wrap:wrap}
+.tabs [role="tab"]{
+  font-family:var(--f-mono);font-size:.78rem;letter-spacing:.03em;
+  background:transparent;border:0;border-bottom:2px solid transparent;
+  padding:.7rem 1rem;margin-bottom:-1px;color:var(--body);cursor:pointer;
+}
+.tabs [role="tab"]:hover{color:var(--ink)}
+.tabs [role="tab"][aria-selected="true"]{color:var(--ink);border-bottom-color:var(--ink)}
+.tabs [role="tabpanel"]{padding-top:1.25rem}
+.tabs [role="tabpanel"] p{margin:.7rem 0 0;color:var(--body);font-size:.94rem;max-width:64ch}
+.tabs [role="tabpanel"] p:first-child{margin-top:0}
+.stack{display:grid;gap:0}
+.stack > * + *{margin-top:1rem}
+
+/* ——— limits ——— */
+.limits{margin-top:2rem;border-top:var(--hair) solid var(--rule)}
+.limits details{border-bottom:var(--hair) solid var(--rule)}
+.limits summary{
+  cursor:pointer;padding:1.05rem 0;font-weight:600;font-size:1.02rem;
+  display:flex;align-items:baseline;gap:.8rem;list-style:none;
+}
+.limits summary::-webkit-details-marker{display:none}
+.limits summary::before{
+  content:"+";font-family:var(--f-mono);font-weight:400;color:var(--wire-b);width:.9rem;flex:none;
+}
+.limits details[open] summary::before{content:"–"}
+.limits summary:hover{color:var(--wire-b)}
+.limits .body{padding:0 0 1.35rem 1.7rem;color:var(--body);max-width:68ch}
+.limits .body p{margin:0 0 .8rem}
+.limits .body p:last-child{margin-bottom:0}
+
+/* ——— foot ——— */
+.foot{border-top:var(--hair) solid var(--rule-strong);padding:clamp(2.5rem,6vw,4rem) 0 3rem}
+.foot .row{display:flex;gap:1.5rem;flex-wrap:wrap;align-items:baseline}
+.foot .row .tag{margin-right:auto}
+.foot a{text-underline-offset:4px}
+.foot .fine{margin:1.6rem 0 0;font-size:.84rem;color:var(--body);max-width:70ch}
+
+.skip{position:absolute;left:-9999px}
+.skip:focus{left:var(--gut);top:.6rem;z-index:60;background:var(--ink);color:var(--paper);padding:.5rem .8rem;border-radius:var(--r);font-family:var(--f-mono);font-size:.78rem;text-decoration:none}
+</style>
+</head>
+<body>
+<a class="skip" href="#main">Pular para o conteúdo</a>
+
+<header class="bar">
+  <div class="wrap">
+    <a class="mark" href="#">frank-opencode</a>
+    <nav aria-label="Seções">
+      <a href="#como">Como funciona</a>
+      <a href="#instalar">Instalar</a>
+      <a href="#configurar">Configurar</a>
+      <a class="opt" href="#limites">Limites</a>
+      <a class="opt" href="https://github.com/marcos2872/frank-opencode">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+
+  <!-- ————————————————— hero ————————————————— -->
+  <section class="hero">
+    <div class="wrap">
+      <h1 class="d-xl">Seus modelos do opencode respondem como a API da Anthropic.</h1>
+      <p class="lede">O frank-opencode é um gateway local. Ele recebe a Messages API que o Claude Code e o Claude Desktop falam, resolve o modelo no catálogo do OpenCode v2, traduz cada requisição para o protocolo do provedor — passthrough Anthropic, OpenAI Chat Completions ou Responses API — e traduz a resposta de volta, streaming incluído. Escuta só em <code class="mono">127.0.0.1</code> e nunca fala com a Anthropic: o upstream é o backend Go/Console do OpenCode, autenticado com o login que você já tem.</p>
+      <div class="cta">
+        <a class="btn" href="#instalar">Instalar em três comandos</a>
+        <a class="btn ghost" href="#como">Ver a tradução</a>
+      </div>
+
+      <figure class="stage" id="stage">
+        <svg viewBox="0 0 1120 300" role="img" aria-label="Diagrama: o Claude Code envia uma requisição da Messages API para o frank-opencode, que a traduz para um provedor do opencode e devolve a resposta traduzida de volta.">
+          <defs>
+            <marker id="ah-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <path d="M0,0 L10,5 L0,10 z" fill="#E0682E"/>
+            </marker>
+            <marker id="ah-c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <path d="M0,0 L10,5 L0,10 z" fill="#8B8FF0"/>
+            </marker>
+          </defs>
+
+          <!-- client -->
+          <g class="sig" style="--d:60ms">
+            <rect x="30" y="112" width="228" height="76" rx="2" fill="none" stroke="#EDE8D9" stroke-width="1.25"/>
+            <text x="52" y="143" font-family="DM Mono, monospace" font-size="17" fill="#EDE8D9">Claude Code</text>
+            <text x="52" y="167" font-family="DM Mono, monospace" font-size="13" fill="#B3AD9B">Claude Desktop</text>
+          </g>
+
+          <!-- wire A -->
+          <g class="sig" style="--d:260ms">
+            <path d="M258,150 C400,150 400,64 560,64" fill="none" stroke="#E0682E" stroke-width="1.4" marker-end="url(#ah-a)"/>
+            <path d="M560,236 C400,236 400,150 258,150" fill="none" stroke="#E0682E" stroke-width="1.4" marker-end="url(#ah-a)"/>
+            <text x="409" y="86" text-anchor="middle" font-family="DM Mono, monospace" font-size="13" fill="#E0682E">/v1/messages · /v1/models</text>
+            <text x="409" y="272" text-anchor="middle" font-family="DM Mono, monospace" font-size="13" fill="#E0682E">SSE · content_block_delta</text>
+          </g>
+
+          <!-- translator -->
+          <g class="sig" style="--d:460ms">
+            <rect x="560" y="20" width="162" height="260" rx="2" fill="#EDE8D9"/>
+            <text x="641" y="140" text-anchor="middle" font-family="DM Mono, monospace" font-size="15" font-weight="500" fill="#131210">frank</text>
+            <text x="641" y="164" text-anchor="middle" font-family="DM Mono, monospace" font-size="12" fill="#5A5546">127.0.0.1:3737</text>
+          </g>
+
+          <!-- wire B -->
+          <g class="sig" style="--d:680ms">
+            <path d="M722,64 C840,64 840,150 950,150" fill="none" stroke="#8B8FF0" stroke-width="1.4" marker-end="url(#ah-c)"/>
+            <path d="M950,150 C840,150 840,236 722,236" fill="none" stroke="#8B8FF0" stroke-width="1.4" marker-end="url(#ah-c)"/>
+            <text x="819" y="86" text-anchor="middle" font-family="DM Mono, monospace" font-size="13" fill="#8B8FF0">messages · chat · responses</text>
+            <text x="819" y="272" text-anchor="middle" font-family="DM Mono, monospace" font-size="13" fill="#8B8FF0">SQLite credential · providers</text>
+          </g>
+
+          <!-- provider -->
+          <g class="sig" style="--d:880ms">
+            <rect x="950" y="112" width="142" height="76" rx="2" fill="none" stroke="#EDE8D9" stroke-width="1.25"/>
+            <text x="1021" y="145" text-anchor="middle" font-family="DM Mono, monospace" font-size="14" fill="#EDE8D9">opencode</text>
+            <text x="1021" y="167" text-anchor="middle" font-family="DM Mono, monospace" font-size="12" fill="#B3AD9B">Go backend</text>
+          </g>
+        </svg>
+        <figcaption class="stage-cap">
+          <b>Uma requisição, três dialetos de saída.</b>
+          <span>O cliente nunca sabe que não está falando com a Anthropic. O protocolo é escolhido por modelo, pelo catálogo.</span>
+        </figcaption>
+      </figure>
+    </div>
+  </section>
+
+  <!-- ————————————————— como funciona ————————————————— -->
+  <section class="band" id="como">
+    <div class="wrap">
+      <h2 class="d-l">A tradução, campo a campo</h2>
+      <p class="lede">Traduzir API não é só renomear chaves. As duas famílias discordam sobre onde mora o papel da mensagem, como o streaming é fatiado e o que significa uma chamada de ferramenta. O frank resolve as três — e escolhe o protocolo certo por modelo: pacotes Anthropic fazem passthrough de bytes para <code class="mono">{baseURL}/messages</code>, pacotes OpenAI vão para <code class="mono">/chat/completions</code>, linhas Go GPT/Grok/Muse vão para <code class="mono">/responses</code>.</p>
+
+      <div class="translate">
+        <div class="translate-h">
+          <span class="tag"><i>tradução</i> <span>· o que entra e o que sai (Chat Completions)</span></span>
+          <div class="probe" role="group" aria-label="Escolher exemplo de requisição">
+            <button type="button" data-probe="text" aria-pressed="true">texto</button>
+            <button type="button" data-probe="tool" aria-pressed="false">tool use</button>
+            <button type="button" data-probe="stream" aria-pressed="false">streaming</button>
+          </div>
+        </div>
+        <table>
+          <caption class="skip">Conversão de campos entre a Messages API e o formato do provedor</caption>
+          <thead>
+            <tr>
+              <th scope="col">entra</th>
+              <th scope="col" class="a">Messages API</th>
+              <th scope="col" class="b">provedor do opencode</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td>mensagens</td><td data-a>turnos <code>user</code> / <code>assistant</code> separados</td><td data-b>lista <code>messages[]</code> com <code>role</code> por item</td></tr>
+            <tr><td>system</td><td data-a>parâmetro <code>system</code> de nível superior</td><td data-b>primeira entrada com <code>role: "system"</code></td></tr>
+            <tr><td>imagens</td><td data-a>bloco <code>{"type":"image"}</code> com base64</td><td data-b>parte <code>image_url</code> na mensagem</td></tr>
+            <tr><td>saída máxima</td><td data-a><code>max_tokens</code>, obrigatório</td><td data-b><code>max_tokens</code>, opcional</td></tr>
+            <tr><td>temperatura</td><td data-a><code>temperature</code> 0–1</td><td data-b>repassado conforme o provedor aceita</td></tr>
+            <tr><td>parada</td><td data-a><code>stop_sequences[]</code></td><td data-b><code>stop[]</code></td></tr>
+            <tr><td>ferramentas</td><td data-a><code>tools[]</code> com <code>input_schema</code></td><td data-b><code>tools[]</code> com <code>function.parameters</code></td></tr>
+            <tr><td>chamada de ferramenta</td><td data-a>bloco <code>tool_use</code> com <code>id</code></td><td data-b><code>tool_calls[]</code> com <code>id</code> em JSON</td></tr>
+            <tr><td>resultado da ferramenta</td><td data-a>bloco <code>tool_result</code> do usuário</td><td data-b>mensagem <code>role: "tool"</code></td></tr>
+            <tr><td>uso de tokens</td><td data-a><code>input_tokens</code> / <code>output_tokens</code></td><td data-b><code>prompt_tokens</code> / <code>completion_tokens</code></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="flow">
+        <div>
+          <span class="k">01 · entra</span>
+          <div class="v">
+            <h3 class="d-m">O cliente aponta para o gateway local</h3>
+            <p>Claude Code via <code class="mono">ANTHROPIC_BASE_URL=http://127.0.0.1:3737</code>; Claude Desktop via gateway inference apontando para a mesma base. Nenhum patch, nenhum binário trocado.</p>
+          </div>
+        </div>
+        <div>
+          <span class="k">02 · resolve</span>
+          <div class="v">
+            <h3 class="d-m">O frank resolve o modelo no catálogo</h3>
+            <p>Alias do gateway → <code class="mono">provider/model</code> → id simples. A ordem é essa; ids ambíguos ordenam por nome qualificado, com aviso. Sufixo de janela <code class="mono">[1m]</code> é removido ao resolver. Variantes <code class="mono">#variant</code> são validadas contra o catálogo — label desconhecido devolve 404 listando as disponíveis.</p>
+          </div>
+        </div>
+        <div>
+          <span class="k">03 · traduz</span>
+          <div class="v">
+            <h3 class="d-m">Traduz para o protocolo do modelo e encaminha</h3>
+            <p>Blocos de conteúdo, ferramentas e histórico são reconstruídos no formato do upstream. O <code class="mono">Bearer</code> vem do SQLite do OpenCode (tabela <code class="mono">credential</code>, lida em modo read-only — nunca <code class="mono">auth.json</code> como fonte) e o forward sempre envia <code class="mono">x-opencode-session</code>. Modelos free-tier <code class="mono">opencode/*</code> usam a chave pública de <code class="mono">settings.apiKey</code> e dão 403 fora do OpenCode — por isso ficam ocultos por padrão.</p>
+          </div>
+        </div>
+        <div>
+          <span class="k">04 · volta</span>
+          <div class="v">
+            <h3 class="d-m">A resposta é remontada no dialeto da Anthropic</h3>
+            <p>Inclusive o streaming: os deltas do provedor são reemitidos como <code class="mono">content_block_delta</code>, na ordem e no formato que o cliente espera — com <code class="mono">ping</code> injetado durante o silêncio do upstream para o watchdog não travar. Erros do upstream viram o formato de erro Anthropic.</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ————————————————— instalar ————————————————— -->
+  <section class="band" id="instalar">
+    <div class="wrap">
+      <h2 class="d-l">Instalar</h2>
+      <p class="lede">O frank não pede suas credenciais de novo. Ele herda o login que o opencode já tem — lido do banco SQLite, em memória, nunca logado.</p>
+
+      <div class="cols">
+        <div class="field">
+          <div class="tag"><i>passo 1</i> <span>· pré-requisito, uma vez só</span></div>
+          <h3>Tenha o OpenCode v2 autenticado</h3>
+          <p>Se <code class="mono">opencode auth login</code> já mostra seus provedores, pule para o passo 2. O frank lê essa mesma credencial no SQLite (caminho via <code class="mono">opencode debug paths db</code>).</p>
+          <div class="term" style="margin-top:1rem">
+            <div class="term-h"><span>shell</span><button class="copy" type="button" data-copy="opencode auth login">copiar</button></div>
+            <pre><span class="c">$</span> <span class="k">opencode</span> auth login</pre>
+          </div>
+        </div>
+        <div class="field">
+          <div class="tag"><i>passo 2</i> <span>· instale o binário</span></div>
+          <h3>Baixe da última release</h3>
+          <p>Ou compile localmente com <code class="mono">cargo install --path .</code>.</p>
+          <div class="term" style="margin-top:1rem">
+            <div class="term-h"><span>shell</span><button class="copy" type="button" data-copy="frank-opencode --enable">copiar</button></div>
+            <pre><span class="c">$</span> URL=$(gh release view --repo marcos2872/frank-opencode --json assets --jq <span class="s">'.assets[] | select(.name=="frank-opencode-linux-x86_64") | .url'</span>)
+<span class="c">$</span> curl -L <span class="s">"$URL"</span> -o /tmp/frank-opencode
+<span class="c">$</span> install -m 0755 /tmp/frank-opencode ~/.local/bin/frank-opencode
+<span class="c">$</span> <span class="k">frank-opencode</span> --version</pre>
+          </div>
+        </div>
+      </div>
+
+      <div class="cols">
+        <div class="field">
+          <div class="tag"><i>passo 3</i> <span>· suba o gateway</span></div>
+          <h3>Rode como daemon em background</h3>
+          <p>O catálogo é lido no boot em background (com retry); <code class="mono">/health</code> fica <code class="mono">starting</code> até o primeiro load.</p>
+          <div class="term" style="margin-top:1rem">
+            <div class="term-h"><span>shell</span><button class="copy" type="button" data-copy="frank-opencode --enable">copiar</button></div>
+            <pre><span class="c">$</span> <span class="k">frank-opencode</span> --enable
+<span class="c">$</span> <span class="k">frank-opencode</span> --status
+<span class="c">$</span> curl -s http://127.0.0.1:3737/health</pre>
+          </div>
+          <p>Porta custom: <code class="mono">frank-opencode --enable --port 3740</code>. Com ele rodando, trocar de porta exige <code class="mono">--disable</code> antes. Logs em <code class="mono">~/.local/share/frank-opencode/frank.log</code>. Prévia do catálogo sem subir: <code class="mono">frank-opencode --refresh</code>.</p>
+        </div>
+        <div class="field">
+          <div class="tag"><i>passo 4</i> <span>· escolha o modelo no cliente</span></div>
+          <h3>Não há comando <code class="mono">use</code> — selecione no picker</h3>
+          <p>Os modelos aparecem em <code class="mono">GET /v1/models</code> como aliases <code class="mono">claude-&lt;provider&gt;-&lt;model&gt;</code>. No Claude Code, escolha com <code class="mono">/model</code> (exige <code class="mono">CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1</code>). Aliases manuais e <code class="mono">[disabled]</code> vão no <code class="mono">config.toml</code> — ver <a href="#configurar">Configurar</a>.</p>
+          <div class="term" style="margin-top:1rem">
+            <div class="term-h"><span>shell</span><button class="copy" type="button" data-copy="curl -s http://127.0.0.1:3737/v1/models | jq -r '.data[].id' | sort">copiar</button></div>
+            <pre><span class="c">$</span> curl -s http://127.0.0.1:3737/v1/models | jq -r <span class="s">'.data[].id'</span> | sort</pre>
+          </div>
+        </div>
+      </div>
+
+      <div class="tabs">
+        <div role="tablist" aria-label="Cliente a configurar">
+          <button role="tab" id="t-code" aria-controls="p-code" aria-selected="true">Claude Code</button>
+          <button role="tab" id="t-desktop" aria-controls="p-desktop" aria-selected="false">Claude Desktop</button>
+        </div>
+
+        <div role="tabpanel" id="p-code" aria-labelledby="t-code" tabindex="0">
+          <div class="stack">
+            <div class="term">
+              <div class="term-h">
+                <span>shell — sessão atual</span>
+                <button class="copy" type="button" data-copy="export ANTHROPIC_BASE_URL=http://127.0.0.1:3737">copiar</button>
+              </div>
+              <pre><span class="k">export</span> ANTHROPIC_BASE_URL=<span class="s">http://127.0.0.1:3737</span>
+<span class="k">export</span> ANTHROPIC_AUTH_TOKEN=<span class="s">dummy</span>
+<span class="k">export</span> CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=<span class="s">1</span>
+claude</pre>
+            </div>
+            <div class="term">
+              <div class="term-h">
+                <span>~/.claude/settings.json — persistente (escopo do usuário)</span>
+                <button class="copy" type="button" data-copy='{"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:3737", "ANTHROPIC_AUTH_TOKEN": "dummy", "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1"}}'>copiar</button>
+              </div>
+              <pre>{
+  <span class="s">"env"</span>: {
+    <span class="s">"ANTHROPIC_BASE_URL"</span>: <span class="c">"http://127.0.0.1:3737"</span>,
+    <span class="s">"ANTHROPIC_AUTH_TOKEN"</span>: <span class="c">"dummy"</span>,
+    <span class="s">"CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"</span>: <span class="c">"1"</span>
+  }
+}</pre>
+            </div>
+          </div>
+          <p><code class="mono">ANTHROPIC_AUTH_TOKEN</code> aqui é a <b>credencial do gateway</b> (<code class="mono">auth_token</code> do <code class="mono">config.toml</code>), não uma chave da Anthropic — por padrão o gateway aceita qualquer valor em loopback, então <code class="mono">dummy</code> basta. Quando <code class="mono">auth_token</code> está setado, o valor precisa ser igual. A credencial do provedor vem do SQLite do OpenCode; o gateway nunca fala com a API da Anthropic.</p>
+          <p>Subagentes (<code class="mono">Explore</code>, <code class="mono">general-purpose</code>) podem escolher um id de snapshot da Anthropic que o OpenCode não oferece. Fixe com um id exato de <code class="mono">/v1/models</code>: <code class="mono">CLAUDE_CODE_SUBAGENT_MODEL="SEU_ID_EXATO"</code> + <code class="mono">CLAUDE_CODE_SUBAGENT_MODEL_FORCE=1</code>, incluindo o sufixo <code class="mono">[1m]</code> quando ele aparecer.</p>
+        </div>
+
+        <div role="tabpanel" id="p-desktop" aria-labelledby="t-desktop" tabindex="0" hidden>
+          <div class="stack">
+            <div class="term">
+              <div class="term-h">
+                <span>/etc/claude-desktop/managed-settings.json — Linux (porte comunitário)</span>
+                <button class="copy" type="button" data-copy='{"inferenceProvider": "gateway", "inferenceGatewayBaseUrl": "http://127.0.0.1:3737", "inferenceCredentialKind": "static", "inferenceGatewayApiKey": "dummy", "inferenceGatewayAuthScheme": "bearer", "modelDiscoveryEnabled": true}'>copiar</button>
+              </div>
+              <pre>{
+  <span class="s">"inferenceProvider"</span>: <span class="c">"gateway"</span>,
+  <span class="s">"inferenceGatewayBaseUrl"</span>: <span class="c">"http://127.0.0.1:3737"</span>,
+  <span class="s">"inferenceCredentialKind"</span>: <span class="c">"static"</span>,
+  <span class="s">"inferenceGatewayApiKey"</span>: <span class="c">"dummy"</span>,
+  <span class="s">"inferenceGatewayAuthScheme"</span>: <span class="c">"bearer"</span>,
+  <span class="s">"modelDiscoveryEnabled"</span>: true
+}</pre>
+            </div>
+            <div class="term">
+              <div class="term-h">
+                <span>shell — permissões exigidas + reinício</span>
+                <button class="copy" type="button" data-copy="frank-opencode --enable">copiar</button>
+              </div>
+              <pre><span class="c">$</span> <span class="k">frank-opencode</span> --enable <span class="c"># ex.: http://127.0.0.1:3737</span>
+<span class="c">$</span> sudo chown root:root /etc/claude-desktop/managed-settings.json
+<span class="c">$</span> sudo chmod 0644 /etc/claude-desktop/managed-settings.json <span class="c"># 0600 dá EACCES; o app lê como seu usuário</span>
+<span class="c">$</span> sudo chmod 0755 /etc/claude-desktop</pre>
+            </div>
+          </div>
+          <p>Base URL <b>sem</b> sufixo <code class="mono">/v1</code> (o app anexa <code class="mono">/v1/messages</code> sozinho) e com <code class="mono">127.0.0.1</code>, não <code class="mono">localhost</code>. <code class="mono">inferenceGatewayApiKey</code> = valor do <code class="mono">auth_token</code> do gateway (ou qualquer placeholder se vazio). Feche o Desktop por completo e reabra — a config só é lida no boot; na tela de login aparece <code class="mono">Continue with Gateway</code> (saia da conta Anthropic se já logado).</p>
+          <p>Builds oficiais Mac/Windows: <code class="mono">Help → Troubleshooting → Enable Developer Mode</code>, depois <code class="mono">Developer → Configure Third-Party Inference</code> com os mesmos valores (provider <code class="mono">Gateway</code>, <code class="mono">Static API key</code>, scheme <code class="mono">Bearer</code>). Para listar todos os modelos no picker, ative <code class="mono">desktop_aliases = true</code> (ver <a href="#configurar">Configurar</a>) e reinicie gateway + Desktop.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ————————————————— configurar ————————————————— -->
+  <section class="band" id="configurar">
+    <div class="wrap">
+      <h2 class="d-l">Configurar</h2>
+      <p class="lede">Arquivo em <code class="mono">~/.config/frank-opencode/config.toml</code> (exemplo completo em <code class="mono">config.example.toml</code>). Overrides: <code class="mono">--port</code> / <code class="mono">FRANK_PORT</code>, <code class="mono">--config</code> / <code class="mono">FRANK_CONFIG</code>, <code class="mono">FRANK_AUTH_TOKEN</code> (não-vazio sobrescreve o arquivo). O config é lido no boot — trocar exige reiniciar (<code class="mono">--disable</code> + <code class="mono">--enable</code>). Arquivo inválido é erro fatal, não default silencioso.</p>
+
+      <div class="translate spec">
+        <div class="translate-h">
+          <span class="tag"><i>config.toml</i> <span>· todas as chaves</span></span>
+        </div>
+        <table>
+          <caption class="skip">Chaves do config.toml e seus padrões</caption>
+          <thead>
+            <tr>
+              <th scope="col">chave</th>
+              <th scope="col">padrão</th>
+              <th scope="col">o que faz</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td>port</td><td><code>3737</code></td><td>Porta do gateway (sempre em <code>127.0.0.1</code>).</td></tr>
+            <tr><td>auth_token</td><td><code>""</code> (aceita qualquer)</td><td>Quando setado, todo endpoint exceto <code>GET /health</code> exige o token via <code>x-api-key</code> ou <code>Authorization: Bearer</code>. Token errado/ausente → 401.</td></tr>
+            <tr><td>default_model</td><td><code>""</code> (primeiro alias)</td><td>Modelo usado quando o cliente omite <code>model</code>.</td></tr>
+            <tr><td>opencode_bin</td><td><code>"opencode"</code></td><td>Binário usado para catálogo (<code>api get /api/model</code>) e descoberta do DB (<code>debug paths db</code>).</td></tr>
+            <tr><td>[aliases."&lt;gateway-id&gt;"]</td><td>—</td><td>Alias manual (<code>opencode</code> + <code>display_name</code> / <code>description</code> opcionais). Tem precedência sobre os automáticos; o id precisa conter <code>claude</code>/<code>anthropic</code> para o discovery listar.</td></tr>
+            <tr><td>[disabled] models</td><td><code>[]</code></td><td>Refs (gateway id ou ref <code>provider/model</code>) escondidas de <code>/v1/models</code>.</td></tr>
+            <tr><td>include_free_tier</td><td><code>false</code></td><td>Mostra modelos <code>opencode/*</code> no picker. Eles dão 403 fora do OpenCode — só ative sabendo.</td></tr>
+            <tr><td>desktop_aliases</td><td><code>false</code></td><td>Reescreve o id anunciado para furar a denylist do picker do Desktop (<code>deepseek</code> → <code>d-eepseek</code>, etc.). Só o id muda; refs, display names e resolução intactos.</td></tr>
+            <tr><td>connect_timeout_secs</td><td><code>30</code></td><td>Timeout de conexão TCP/TLS com o upstream — provedor inalcançável falha rápido.</td></tr>
+            <tr><td>request_timeout_secs</td><td><code>3600</code></td><td>Timeout total, <b>incluindo streaming</b>. Generoso de propósito: turno longo com reasoning fica aberto minutos.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="translate spec">
+        <div class="translate-h">
+          <span class="tag"><i>cli</i> <span>· ciclo de vida do daemon</span></span>
+        </div>
+        <table>
+          <caption class="skip">Flags do CLI</caption>
+          <thead>
+            <tr>
+              <th scope="col">comando</th>
+              <th scope="col">—</th>
+              <th scope="col">o que faz</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td>--enable [--port N]</td><td>daemon</td><td>Sobe o filho destacado com <code>--serve</code>, espera <code>/health</code> e imprime os <code>export</code> do Claude Code. Estado em <code>~/.local/share/frank-opencode/</code> (<code>frank.pid</code>, <code>frank.port</code>, <code>frank.session</code>, <code>frank.log</code>, todos 0600).</td></tr>
+            <tr><td>--disable</td><td>daemon</td><td>Envia SIGTERM (drena streams SSE) e limpa o estado.</td></tr>
+            <tr><td>--status</td><td>daemon</td><td>Diz se está rodando, em qual porta e se responde.</td></tr>
+            <tr><td>--serve</td><td>foreground</td><td>Servidor em primeiro plano (dev + filho do daemon).</td></tr>
+            <tr><td>--refresh</td><td>prévia</td><td>Imprime o catálogo que o boot carregaria (N modelos + aliases) e sai.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="translate spec">
+        <div class="translate-h">
+          <span class="tag"><i>http</i> <span>· endpoints servidos</span></span>
+        </div>
+        <table>
+          <caption class="skip">Endpoints do gateway</caption>
+          <thead>
+            <tr>
+              <th scope="col">endpoint</th>
+              <th scope="col">auth</th>
+              <th scope="col">o que faz</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td>GET /health</td><td>aberto</td><td><code>ok</code> / <code>degraded</code> / <code>starting</code>, contagem de modelos, modelo padrão efetivo e <code>last_error</code> do load no boot.</td></tr>
+            <tr><td>GET /v1/models</td><td>token*</td><td>Aliases <code>claude-&lt;provider&gt;-&lt;model&gt;</code> (+ <code>[1m]</code> quando a janela real ≥ 1M; único sufixo que o Claude Code lê). Alimenta <code>/model</code>.</td></tr>
+            <tr><td>POST /v1/messages</td><td>token*</td><td>Aceita alias, ref direta (<code>provider/model</code>) e id simples; sufixo <code>#variant</code> quando o catálogo declara variantes.</td></tr>
+            <tr><td>POST /v1/messages/count_tokens</td><td>token*</td><td>Pacotes Anthropic: proxy para <code>{baseURL}/messages/count_tokens</code> (com fallback local); demais pacotes: estimativa local por partes.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="flow">
+        <div>
+          <span class="k">modelos</span>
+          <div class="v">
+            <h3 class="d-m">Automático, manual e janela</h3>
+            <p>Cada modelo habilitado do OpenCode ganha um alias <code class="mono">claude-&lt;provider&gt;-&lt;model&gt;</code> (o prefixo <code class="mono">claude-</code> é obrigatório para o discovery). Linhas com mesmo <code class="mono">provider/model</code> mas <code class="mono">id</code> distinto (ex. <code class="mono">opus-4.8</code> vs <code class="mono">opus-4.8-fast</code>) ganham aliases distintos, com <code class="mono">anthropic-beta</code>/<code class="mono">speed</code> do catálogo repassados.</p>
+            <p>Janelas &lt; 1M e o aviso <code class="mono">"X" isn't described by this version's model catalog</code> não se resolvem no gateway: fixe no Claude Code com <code class="mono">modelOverrides</code> (<code class="mono">behavesAs</code> / <code class="mono">inputWindowHint</code>) ou, em último caso, <code class="mono">CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT=1</code>.</p>
+          </div>
+        </div>
+        <div>
+          <span class="k">variantes</span>
+          <div class="v">
+            <h3 class="d-m">Sufixo <code class="mono">#variant</code>, traduzido por protocolo</h3>
+            <p>Chat Completions: <code class="mono">reasoning_effort</code> (labels fora do enum, como <code class="mono">xhigh</code>/<code class="mono">max</code>, saturam para <code class="mono">high</code>; <code class="mono">none</code> remove o parâmetro). Responses API: objeto <code class="mono">reasoning</code> + <code class="mono">include</code> declarados. Passthrough Anthropic: <code class="mono">thinking</code> (<code class="mono">adaptive</code> com <code class="mono">display: summarized</code>, ou <code class="mono">disabled</code> para <code class="mono">none</code>). Variante sem representação segura no Messages API retorna <b>400</b>, nunca silêncio.</p>
+          </div>
+        </div>
+      </div>
+
+      <div class="note"><b>Regra de ouro:</b> catálogo é lido <b>uma vez no boot</b> (com até 6 tentativas e backoff 2s → 16s enquanto vier vazio). Sem refresh automático — modelo novo/removido ou <code class="mono">opencode auth</code> novo pede <code class="mono">frank-opencode --disable && frank-opencode --enable</code>. <code class="mono">--refresh</code> só pré-visualiza.</div>
+    </div>
+  </section>
+
+  <!-- ————————————————— limites ————————————————— -->
+  <section class="band" id="limites">
+    <div class="wrap">
+      <h2 class="d-l">O que o proxy não faz</h2>
+      <p class="lede">Um tradutor honesto diz onde não alcança. Se algo aqui for um problema para você, é melhor saber antes de instalar.</p>
+
+      <div class="limits">
+        <details open>
+          <summary>Nem todo recurso da Messages API tem equivalente</summary>
+          <div class="body">
+            <p>Ferramentas que o provedor não implementa não são inventadas. Recursos exclusivos da Anthropic — como trechos com cache de prompt e busca na web hospedada — só funcionam quando o provedor de destino oferece algo equivalente.</p>
+            <p>Na dúvida, o proxy prefere falhar com um erro claro (sempre no formato <code class="mono">{"type":"error","error":{...}}</code>) a devolver uma resposta silenciosamente diferente do que foi pedido.</p>
+          </div>
+        </details>
+        <details>
+          <summary>É um proxy local, não um serviço hospedado</summary>
+          <div class="body">
+            <p>O frank escuta só em <code class="mono">127.0.0.1</code>, abre o DB em read-only e mantém segredos só em memória (nunca logados). Arquivos de estado (<code class="mono">frank.pid</code>, <code class="mono">frank.port</code>, <code class="mono">frank.session</code>, <code class="mono">frank.log</code>) são criados <code class="mono">0600</code>. Suas chaves e conversas passam por ele, mas ficam entre você e o provedor — nada é enviado para terceiros.</p>
+          </div>
+        </details>
+        <details>
+          <summary>O catálogo congela no boot</summary>
+          <div class="body">
+            <p>Sem refresh periódico: <code class="mono">/health</code> fica <code class="mono">starting</code> até o primeiro load e <code class="mono">degraded</code> se as tentativas esgotarem com 0 modelos. <code class="mono">models: 0</code> logo após o boot costuma ser o serviço do OpenCode ainda aquecendo (<code class="mono">opencode service status</code> + reinicie o gateway). <code class="mono">frank.log</code> é só-append — trunque de vez em quando.</p>
+          </div>
+        </details>
+        <details>
+          <summary>A qualidade da resposta é do modelo, não da tradução</summary>
+          <div class="body">
+            <p>O proxy garante que a requisição chegue bem formada e que a resposta volte no formato esperado. Ele não equaliza capacidades: um modelo mais fraco em uso de ferramentas continuará mais fraco, mesmo falando fluentemente o dialeto da Anthropic.</p>
+          </div>
+        </details>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer class="foot">
+  <div class="wrap">
+    <div class="row">
+      <span class="tag"><i>frank-opencode</i> <span>· gateway local · 127.0.0.1:3737</span></span>
+      <span class="tag"><a href="https://github.com/marcos2872/frank-opencode">código</a> · <a href="#instalar">instalação</a> · <a href="#configurar">configuração</a> · <a href="#limites">limites</a></span>
+    </div>
+    <p class="fine">Projeto independente. Não é afiliado à Anthropic nem ao opencode. Claude e Claude Code são marcas da Anthropic; o opencode é um projeto separado com sua própria licença.</p>
+  </div>
+</footer>
+
+<script>
+(function(){
+  "use strict";
+
+  /* hero reveal — one orchestrated moment, on load */
+  var stage = document.getElementById('stage');
+  if (stage) {
+    if (matchMedia('(prefers-reduced-motion: reduce)').matches) {
+      stage.classList.add('in');
+    } else {
+      requestAnimationFrame(function(){
+        requestAnimationFrame(function(){ stage.classList.add('in'); });
+      });
+    }
+  }
+
+  /* tabs */
+  var tabs = Array.prototype.slice.call(document.querySelectorAll('[role="tab"]'));
+  function selectTab(tab){
+    tabs.forEach(function(t){
+      var sel = t === tab;
+      t.setAttribute('aria-selected', sel ? 'true' : 'false');
+      t.tabIndex = sel ? 0 : -1;
+      var panel = document.getElementById(t.getAttribute('aria-controls'));
+      if (panel) panel.hidden = !sel;
+    });
+  }
+  tabs.forEach(function(t, i){
+    t.tabIndex = t.getAttribute('aria-selected') === 'true' ? 0 : -1;
+    t.addEventListener('click', function(){ selectTab(t); });
+    t.addEventListener('keydown', function(e){
+      var d = e.key === 'ArrowRight' ? 1 : e.key === 'ArrowLeft' ? -1 : 0;
+      if (!d) return;
+      e.preventDefault();
+      var n = tabs[(i + d + tabs.length) % tabs.length];
+      selectTab(n); n.focus();
+    });
+  });
+
+  /* copy buttons */
+  document.querySelectorAll('.copy').forEach(function(btn){
+    btn.addEventListener('click', function(){
+      var text = btn.getAttribute('data-copy');
+      var done = function(){
+        var old = btn.textContent;
+        btn.textContent = 'copiado';
+        setTimeout(function(){ btn.textContent = old; }, 1400);
+      };
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(done, function(){});
+      } else {
+        var ta = document.createElement('textarea');
+        ta.value = text; document.body.appendChild(ta); ta.select();
+        try { document.execCommand('copy'); done(); } catch(e){}
+        document.body.removeChild(ta);
+      }
+    });
+  });
+
+  /* translation probe — switches the pair of examples shown */
+  var PROBES = {
+    text: {
+      messages: ['turnos <code>user</code> / <code>assistant</code> separados', 'lista <code>messages[]</code> com <code>role</code> por item'],
+      system:   ['parâmetro <code>system</code> de nível superior', 'primeira entrada com <code>role: "system"</code>'],
+      images:   ['bloco <code>{"type":"image"}</code> com base64', 'parte <code>image_url</code> na mensagem'],
+      max:      ['<code>max_tokens</code>, obrigatório', '<code>max_tokens</code>, opcional'],
+      stop:     ['<code>stop_sequences[]</code>', '<code>stop[]</code>'],
+      ret:      ['<code>"type": "message"</code>', 'escolha com <code>finish_reason: "stop"</code>']
+    },
+    tool: {
+      messages: ['histórico misto de texto e blocos', 'mensagens com <code>role</code> por item'],
+      system:   ['parâmetro <code>system</code> de nível superior', 'primeira entrada com <code>role: "system"</code>'],
+      tools:    ['<code>tools[]</code> com <code>input_schema</code>', '<code>tools[]</code> com <code>function.parameters</code>'],
+      call:     ['bloco <code>tool_use</code> com <code>id</code>', '<code>tool_calls[]</code> com <code>id</code> em JSON'],
+      result:   ['bloco <code>tool_result</code> do usuário', 'mensagem <code>role: "tool"</code>'],
+      ret:      ['<code>stop_reason: "tool_use"</code>', '<code>finish_reason: "tool_calls"</code>']
+    },
+    stream: {
+      messages: ['turnos <code>user</code> / <code>assistant</code> separados', 'lista <code>messages[]</code> com <code>role</code> por item'],
+      events:   ['<code>message_start</code> / <code>content_block_delta</code>', 'deltas do provedor, quando existirem'],
+      partial:  ['blocos parciais com <code>index</code>', 'pedaços de <code>choices[0].delta</code>'],
+      end:      ['<code>message_delta</code> com <code>stop_reason</code>', '<code>[DONE]</code> ou fim do stream'],
+      usage:    ['<code>input_tokens</code> / <code>output_tokens</code>', '<code>prompt_tokens</code> / <code>completion_tokens</code>'],
+      ret:      ['eventos SSE no dialeto da Anthropic', 'formato nativo do provedor']
+    }
+  };
+
+  var tbody = document.querySelector('.translate tbody');
+  var probes = document.querySelectorAll('[data-probe]');
+  function renderProbe(name){
+    var spec = PROBES[name];
+    if (!spec || !tbody) return;
+    tbody.innerHTML = Object.keys(spec).map(function(k){
+      return '<tr><td>' + k + '</td><td data-a>' + spec[k][0] + '</td><td data-b>' + spec[k][1] + '</td></tr>';
+    }).join('');
+    probes.forEach(function(p){ p.setAttribute('aria-pressed', String(p.getAttribute('data-probe') === name)); });
+  }
+  probes.forEach(function(p){
+    p.addEventListener('click', function(){ renderProbe(p.getAttribute('data-probe')); });
+  });
+})();
+</script>
+</body>
+</html>
