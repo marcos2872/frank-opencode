@@ -95,13 +95,19 @@ impl CredentialStore {
     }
 }
 
-/// Unwrap the v2 JSON envelope `{"type":..,"key":".."}`.
-/// Falls back to the raw string when it is not JSON (forward compatible).
+/// Unwrap the v2 credential envelope.
+///
+/// OAuth envelopes (github-copilot, opencode console) carry the token in
+/// `access`, API-key envelopes carry it in `key`. Prefer `access` (OAuth),
+/// then `key`; fall back to the raw string when it is not JSON (forward
+/// compatible).
 pub fn unwrap_envelope(raw: &str) -> String {
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) {
-        if let Some(k) = v.get("key").and_then(|k| k.as_str()) {
-            if !k.is_empty() {
-                return k.to_string();
+        for field in ["access", "key"] {
+            if let Some(k) = v.get(field).and_then(|k| k.as_str()) {
+                if !k.is_empty() {
+                    return k.to_string();
+                }
             }
         }
     }
@@ -156,4 +162,47 @@ pub fn upstream_bearer(entry: &CatalogEntry, store: &CredentialStore) -> Option<
 #[allow(dead_code)]
 pub fn debug_bearer_len(b: Option<&SecretString>) -> usize {
     b.map(|s| s.expose_secret().len()).unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn oauth_envelope_uses_access_token() {
+        // github-copilot OAuth envelope: no `key`, only access/refresh.
+        let raw = r#"{"type":"oauth","methodID":"device","access":"gho_abc123","refresh":"gho_refresh","expires":0}"#;
+        assert_eq!(unwrap_envelope(raw), "gho_abc123");
+    }
+
+    #[test]
+    fn key_envelope_uses_key() {
+        let raw = r#"{"type":"key","key":"sk-ant-xyz"}"#;
+        assert_eq!(unwrap_envelope(raw), "sk-ant-xyz");
+    }
+
+    #[test]
+    fn access_precedes_key_when_both_present() {
+        let raw = r#"{"type":"oauth","access":"gho_access","key":"sk-fallback"}"#;
+        assert_eq!(unwrap_envelope(raw), "gho_access");
+    }
+
+    #[test]
+    fn empty_key_falls_back_to_access_then_raw() {
+        assert_eq!(
+            unwrap_envelope(r#"{"type":"oauth","key":"","access":"gho_tok"}"#),
+            "gho_tok"
+        );
+        // Neither field: raw string is returned (forward compatible).
+        assert_eq!(
+            unwrap_envelope(r#"{"type":"oauth","refresh":"gho_r"}"#),
+            r#"{"type":"oauth","refresh":"gho_r"}"#
+        );
+    }
+
+    #[test]
+    fn non_json_falls_back_to_raw() {
+        assert_eq!(unwrap_envelope("sk-plain-token"), "sk-plain-token");
+        assert_eq!(unwrap_envelope(""), "");
+    }
 }
