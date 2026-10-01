@@ -24,12 +24,15 @@ jobs:
       - name: Build release binary
         env:
           CARGO_INCREMENTAL: "0"
-        run: cargo build --release --locked
+        run: |
+          cargo build --release --locked
+          # Keep the platform suffix in the asset name (docs/README install section).
+          cp target/release/frank-opencode frank-opencode-linux-x86_64
 
       - name: Create release and upload asset
         uses: softprops/action-gh-release@v2
         with:
           name: ${{ github.ref_name }}
           generate_release_notes: true
-          files: target/release/frank-opencode
+          files: frank-opencode-linux-x86_64
           fail_on_unmatched_files: true
