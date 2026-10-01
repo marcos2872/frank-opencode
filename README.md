@@ -328,6 +328,14 @@ Não há refresh automático depois do boot — para atualizar o catálogo, rein
 - `frank.log` é só-append: trunque de vez em quando (`: > frank.log`).
 - `--enable` recusa uma `--port` diferente com ele rodando; dê `--disable` antes.
 
+## Desenvolvimento
+
+CI (GitHub Actions) roda formatação, lint e a suíte completa em todo push e PR.
+A branch `main` está protegida: o status **test** é obrigatório e a branch precisa
+estar atualizada — uma PR só mergeia com os testes verdes. Há também um hook de
+pre-commit opcional; ative com `git config core.hooksPath .githooks`. Detalhes em
+[docs/dev.md](docs/dev.md).
+
 ## Documentação
 
 - [Desenvolvimento](docs/dev.md) — como rodar em dev, testes, lint.

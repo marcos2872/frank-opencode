@@ -14,6 +14,13 @@ cargo run -- --refresh        # print catalog + gateway aliases, exit
 cargo run -- --serve          # foreground server on 127.0.0.1:3737
 ```
 
+CI: `.github/workflows/ci.yml` runs `cargo fmt --all --check`, `cargo clippy
+--all-targets -- -D warnings` and `cargo test --all-targets` on every push and
+PR. `main` is protected — the `test` check is required and the branch must be up
+to date, so a PR cannot merge with failing tests (admins may still push
+directly). An opt-in pre-commit hook (`.githooks/pre-commit`, same three
+commands) is enabled per clone with `git config core.hooksPath .githooks`.
+
 Daemon lifecycle: `frank-opencode --enable [--port PORT] | --disable | --status`. Configuration is loaded from `~/.config/frank-opencode/config.toml` (or `--config`/`FRANK_CONFIG`), with `FRANK_PORT` and `FRANK_AUTH_TOKEN` overrides. State files
 (pid, port, session id, log) live in `~/.local/share/frank-opencode/` and are
 created 0600 via `daemon::write_private`.

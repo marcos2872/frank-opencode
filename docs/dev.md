@@ -12,6 +12,26 @@ cargo clippy -- -D warnings   # lint (precisa estar limpo)
 cargo fmt --check             # formatação (precisa estar limpa)
 ```
 
+## CI e hooks
+
+O workflow [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) roda em todo
+push e em toda PR: `cargo fmt --all --check`, `cargo clippy --all-targets --
+-D warnings` e `cargo test --all-targets`. A branch `main` está protegida: o
+status **test** é obrigatório e a branch precisa estar atualizada — **uma PR não
+mergeia enquanto os testes não passarem** (o admin ainda pode dar push direto).
+
+Para reproduzir o CI localmente, os mesmos comandos acima com `--all-targets`.
+
+Há um hook de pre-commit em [`.githooks/pre-commit`](../.githooks/pre-commit) que
+roda `fmt --check`, `clippy` e `test` antes de cada commit. Ele **não** é ativado
+automaticamente (o Git não versiona `.git/hooks`); habilite uma vez por clone:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+Para pular um commit específico: `git commit --no-verify`.
+
 ## Rodando
 
 ```bash
