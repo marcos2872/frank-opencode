@@ -15,6 +15,13 @@ opencode_bin = "opencode"
 # They 403 outside OpenCode, so they are hidden by default.
 include_free_tier = false
 
+# Dodge the Claude Desktop picker's bundled third-party-model denylist
+# (deepseek, kimi, gpt, ...): deepseek-v4.1-flash is advertised as
+# claude-opencode-go-d-eepseek-v4-1-flash so Desktop lists it.
+# Only the advertised id changes; refs and resolution are untouched.
+# Leave false for Claude Code (it lists every claude-* id already).
+desktop_aliases = false
+
 # Manual aliases win over auto-generated ones.
 # Key = gateway id seen by Claude Code (keep "claude"/"anthropic" in it
 # so /v1/models discovery lists it in /model).

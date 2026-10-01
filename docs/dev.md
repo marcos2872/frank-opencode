@@ -16,7 +16,7 @@ cargo fmt --check             # formatação (precisa estar limpa)
 
 ```bash
 cargo run -- --refresh        # imprime catálogo: N modelos habilitados + aliases do gateway
-cargo run -- --serve          # servidor em foreground na :3737 (RUST_LOG=debug p/ logs)
+RUST_LOG=warn cargo run -- --serve          # servidor em foreground na :3737 (RUST_LOG=debug p/ logs)
 cargo run -- --serve --port 3739
 ```
 

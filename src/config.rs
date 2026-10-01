@@ -40,6 +40,14 @@ pub struct AppConfig {
     /// They 403 outside OpenCode, so they are hidden by default.
     #[serde(default)]
     pub include_free_tier: bool,
+    /// Rewrite auto-generated gateway ids to dodge the Claude Desktop
+    /// picker's bundled third-party-model denylist (`deepseek`, `kimi`,
+    /// `gpt`, ...): `deepseek-v4.1-flash` is advertised as
+    /// `claude-opencode-go-d-eepseek-v4-1-flash`. Only the advertised id
+    /// changes; refs, display names and resolution are untouched.
+    /// Off by default (Claude Code lists every `claude-*` id already).
+    #[serde(default)]
+    pub desktop_aliases: bool,
 }
 
 fn default_port() -> u16 {
@@ -56,6 +64,7 @@ impl Default for AppConfig {
             aliases: HashMap::new(),
             disabled: DisabledConfig::default(),
             include_free_tier: false,
+            desktop_aliases: false,
         }
     }
 }

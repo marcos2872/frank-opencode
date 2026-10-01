@@ -149,7 +149,10 @@ Você escolhe modelos dentro do Claude Code via `/model`, alimentado por `GET /v
   `provider/model` mas `id` distinto (ex. `opus-4.8` vs `opus-4.8-fast`) ganham aliases distintos.
   O catálogo é lido no boot com retry (veja "Solução de problemas"
   para o caso `models:0`): para refletir modelos novos/removidos depois disso, reinicie o
-  gateway (`--refresh` só pré-visualiza o que o boot carregaria).
+  gateway (`--refresh` só pré-visualiza o que o boot carregaria). Para o picker do
+  Claude Desktop (que descarta ids com nomes de modelos third-party), sete
+  `desktop_aliases = true` — só o id anunciado muda
+  (`...-deepseek-...` vira `...-d-eepseek-...`), refs e resolução intactos.
 - **Manual:** `[aliases."<gateway-id>"]` no `config.toml` tem precedência sobre os automáticos;
   `[disabled]` esconde refs do picker.
 - `POST /v1/messages` também aceita refs diretas (`opencode-go/kimi-k2.7-code`) e

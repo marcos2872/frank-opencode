@@ -160,7 +160,7 @@ impl AppState {
             })
             .map(|e| (*e).clone())
             .collect();
-        let mut auto: Vec<AliasEntry> = auto_aliases_for(&remaining)
+        let mut auto: Vec<AliasEntry> = auto_aliases_for(&remaining, self.config.desktop_aliases)
             .into_iter()
             .filter(|a| !self.config.is_disabled(&a.opencode_ref, &a.gateway_id))
             .collect();

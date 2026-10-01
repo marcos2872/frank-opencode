@@ -318,6 +318,87 @@ pub fn strip_window_suffix(s: &str) -> &str {
 pub fn window_suffix(tokens: u64) -> Option<String> {
     (tokens >= 1_000_000).then(|| "[1m]".to_string())
 }
+/// Substrings the Claude Desktop app refuses anywhere in a gateway model
+/// id: any discovered id containing one is dropped from the picker, even
+/// with `claude` in it. Extracted from the denylist baked into the Desktop
+/// bundle (`XSe`): only plain slug-compatible tokens are listed here
+/// (dotted/bounded fragments like `k2\.` or `\bling\b` can never occur in
+/// our slugs, which use `-` separators and no dots).
+const DESKTOP_BLOCKED_TOKENS: &[&str] = &[
+    "ark-code",
+    "astron",
+    "command-r",
+    "deepseek",
+    "doubao",
+    "gemini",
+    "gemma",
+    "glm",
+    "gpt",
+    "grok",
+    "hermes",
+    "hy3",
+    "kimi",
+    "lfm",
+    "llama",
+    "longcat",
+    "mimo",
+    "minimax",
+    "mistral",
+    "mixtral",
+    "moonshot",
+    "nemotron",
+    "openai",
+    "qianfan",
+    "qwen",
+    "trinity",
+    "abab",
+    "jamba",
+    "arctic",
+    "solar",
+    "mercury",
+    "zamba",
+    "ernie",
+    "arcee",
+    "nova-",
+    "phi-",
+    "tc-code",
+    "kat-coder",
+    "yi-",
+    "devstral",
+    "ministral",
+    "stepfun",
+    "bytedance",
+    "hunyuan",
+    "granite",
+    "codex",
+    "step-3",
+    "seed-",
+];
+
+/// Rewrite a model/id fragment so no `DESKTOP_BLOCKED_TOKENS` entry survives
+/// as a substring: a `-` is inserted after the first character of each
+/// (case-insensitive) occurrence (`deepseek` → `d-eepseek`). The Desktop
+/// filter only inspects the alias `id`, so display names and `opencode_ref`
+/// resolution are untouched. Deterministic and slug-safe.
+pub fn evade_desktop_blocklist(s: &str) -> String {
+    let mut out = s.to_string();
+    let mut tokens: Vec<&str> = DESKTOP_BLOCKED_TOKENS.to_vec();
+    tokens.sort_by_key(|t| std::cmp::Reverse(t.len()));
+    for token in tokens {
+        let mut search_from = 0;
+        loop {
+            let lower = out.to_lowercase();
+            let Some(rel) = lower[search_from..].find(token) else {
+                break;
+            };
+            let at = search_from + rel;
+            // Split "deepseek" into "d-eepseek". Byte-safe: tokens are ASCII.
+            out.insert(at + 1, '-');
+            search_from = at + token.len() + 1;
+        }
+    }
+    out
+}
 /// Sanitize a model id into a URL/claude-safe slug.
 pub fn slugify(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -359,7 +440,13 @@ pub fn auto_alias(entry: &CatalogEntry) -> AliasEntry {
 /// row (sorted by `qualified`, then `id`) keeps the base alias; the rest
 /// fall back to `provider-id` and then numeric suffixes. Callers must still
 /// dedup against manual aliases (see `AppState::refresh`).
-pub fn auto_aliases_for(entries: &[CatalogEntry]) -> Vec<AliasEntry> {
+///
+/// When `evade` is set (opt-in `desktop_aliases` config for Claude Desktop,
+/// whose bundled denylist drops discovered ids containing third-party model
+/// tokens), the model/id fragments are rewritten via
+/// `evade_desktop_blocklist` before slugging. `opencode_ref`, display names
+/// and resolution are unaffected: only the advertised `gateway_id` changes.
+pub fn auto_aliases_for(entries: &[CatalogEntry], evade: bool) -> Vec<AliasEntry> {
     use std::collections::HashSet;
     let mut sorted: Vec<&CatalogEntry> = entries.iter().collect();
     sorted.sort_by(|a, b| {
@@ -370,16 +457,30 @@ pub fn auto_aliases_for(entries: &[CatalogEntry]) -> Vec<AliasEntry> {
     let mut taken: HashSet<String> = HashSet::new();
     let mut out = Vec::with_capacity(sorted.len());
     for e in sorted {
-        let base_slug = slugify(&format!("{}-{}", e.provider_id, e.model_id));
+        let model_part = if evade {
+            evade_desktop_blocklist(&e.model_id)
+        } else {
+            e.model_id.clone()
+        };
+        let id_part = if !e.id.is_empty() {
+            if evade {
+                evade_desktop_blocklist(&e.id)
+            } else {
+                e.id.clone()
+            }
+        } else {
+            model_part.clone()
+        };
+        let base_slug = slugify(&format!("{}-{}", e.provider_id, model_part));
         let base_id = format!("claude-{base_slug}");
         // Distinct-id rows advertise `provider/id` so `lookup_entry` can
         // resolve them via the `id` match instead of collapsing to the first
         // row with the same `modelID`.
         let opencode_ref = e.preferred_ref();
-        let id_slug = if !e.id.is_empty() {
-            slugify(&format!("{}-{}", e.provider_id, e.id))
-        } else {
+        let id_slug = if id_part == model_part && e.id.is_empty() {
             base_slug.clone()
+        } else {
+            slugify(&format!("{}-{}", e.provider_id, id_part))
         };
         let id_based = format!("claude-{id_slug}");
         // Candidate order: base, id-based, base-2, base-3, ...
@@ -714,7 +815,7 @@ mod tests {
             .collect(),
         );
         fast.body = Some(serde_json::json!({"speed": "fast"}));
-        let aliases = auto_aliases_for(&[normal, fast]);
+        let aliases = auto_aliases_for(&[normal, fast], false);
         assert_eq!(aliases.len(), 2);
         let ids: Vec<&str> = aliases.iter().map(|a| a.gateway_id.as_str()).collect();
         // No duplicates.
@@ -746,9 +847,89 @@ mod tests {
             "deepseek-v4-1-flash",
             "B",
         );
-        let aliases = auto_aliases_for(&[a, b]);
+        let aliases = auto_aliases_for(&[a, b], false);
         assert_eq!(aliases.len(), 2);
         assert_ne!(aliases[0].gateway_id, aliases[1].gateway_id);
+    }
+
+    #[test]
+    fn evade_breaks_blocked_substrings() {
+        assert_eq!(
+            evade_desktop_blocklist("deepseek-v4.1-flash"),
+            "d-eepseek-v4.1-flash"
+        );
+        assert_eq!(evade_desktop_blocklist("kimi-k2.7-code"), "k-imi-k2.7-code");
+        assert_eq!(evade_desktop_blocklist("qwen3.8-max"), "q-wen3.8-max");
+        assert_eq!(evade_desktop_blocklist("hy3"), "h-y3");
+        // Unblocked names pass through untouched.
+        assert_eq!(
+            evade_desktop_blocklist("muse-spark-1.3-contributor"),
+            "muse-spark-1.3-contributor"
+        );
+        assert_eq!(
+            evade_desktop_blocklist("space-bunny-free"),
+            "space-bunny-free"
+        );
+    }
+
+    /// Mirror of the Desktop picker's gateway-id rule (bundled `Lo`: id must
+    /// contain `claude` and none of the `XSe` denylist tokens) over the token
+    /// subset that can occur in our slugs.
+    fn desktop_would_list(id: &str) -> bool {
+        let lower = id.to_lowercase();
+        let has_claude = lower.contains("claude");
+        let blocked = [
+            "deepseek", "gemini", "glm", "gpt", "grok", "hy3", "kimi", "qwen", "minimax",
+            "longcat", "mimo",
+        ];
+        has_claude && !blocked.iter().any(|t| lower.contains(t))
+    }
+
+    #[test]
+    fn evaded_aliases_pass_desktop_filter() {
+        let models = [
+            ("deepseek-v4.1-flash", "DeepSeek V4.1 Flash"),
+            ("deepseek-v4-flash", "DeepSeek V4 Flash"),
+            ("kimi-k2.7-code", "Kimi K2.7 Code"),
+            ("glm-5.3", "GLM 5.3"),
+            ("gpt-6-luna", "GPT-6 Luna"),
+            ("grok-4.7", "Grok 4.7"),
+            ("qwen3.8-max", "Qwen3.8 Max"),
+            ("minimax-m3", "MiniMax M3"),
+            ("longcat-2.0", "LongCat 2.0"),
+            ("mimo-v2.5-pro", "MiMo-V2.5-Pro"),
+            ("hy3", "HY3"),
+            ("muse-spark-1.3-contributor", "Muse Spark 1.3"),
+        ];
+        let entries: Vec<CatalogEntry> = models
+            .iter()
+            .map(|(m, n)| test_entry("opencode-go", m, m, n))
+            .collect();
+        // Without evasion the Desktop drops all but the last one.
+        let plain = auto_aliases_for(&entries, false);
+        assert_eq!(
+            plain
+                .iter()
+                .filter(|a| desktop_would_list(&a.gateway_id))
+                .count(),
+            1
+        );
+        // With evasion every alias passes, stays unique and keeps the
+        // original ref for resolution.
+        let evaded = auto_aliases_for(&entries, true);
+        assert_eq!(evaded.len(), models.len());
+        for a in &evaded {
+            assert!(desktop_would_list(&a.gateway_id), "{}", a.gateway_id);
+        }
+        let mut ids: Vec<&str> = evaded.iter().map(|a| a.gateway_id.as_str()).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), models.len());
+        let deepseek = evaded
+            .iter()
+            .find(|a| a.opencode_ref == "opencode-go/deepseek-v4.1-flash")
+            .unwrap();
+        assert!(deepseek.display_name.contains("DeepSeek"));
     }
 
     #[test]
