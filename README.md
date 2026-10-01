@@ -97,6 +97,16 @@ Regras:
 - Trocar o token exige reiniciar (`--disable` + `--enable`); só editar o
   arquivo não afeta o daemon já rodando.
 
+### Timeouts do upstream
+
+O cliente HTTP do gateway separa dois orçamentos (segundos):
+
+- `connect_timeout_secs` (padrão `30`) — conexão TCP/TLS; faz um provider
+  inalcançável falhar rápido.
+- `request_timeout_secs` (padrão `3600`) — tempo total da requisição, **incluindo
+  streaming**. É generoso de propósito: um turno longo com reasoning pode ficar
+  aberto vários minutos. Reduza só se quiser cortar sessões presas.
+
 ## Rodando o Claude Code
 
 ```bash
@@ -117,6 +127,50 @@ Persistindo em `~/.claude/settings.json` (escopo do usuário, nunca no arquivo c
   }
 }
 ```
+
+### Fixando o modelo dos subagentes
+
+O Claude Code pode escolher automaticamente um modelo para subagentes como
+`Explore` e `general-purpose`. Quando a sessão usa o frank-opencode, fixe esse
+modelo em um id que exista no catálogo do gateway para evitar erros como
+`model_not_found` com um id de snapshot da Anthropic que o OpenCode não oferece.
+
+Liste os ids disponíveis e copie um deles exatamente:
+
+```bash
+curl -s http://127.0.0.1:3737/v1/models \
+  | jq -r '.data[].id' \
+  | sort
+```
+
+Defina o modelo antes de iniciar o Claude Code:
+
+```bash
+export CLAUDE_CODE_SUBAGENT_MODEL="SEU_ID_EXATO_DO_V1_MODELS"
+export CLAUDE_CODE_SUBAGENT_MODEL_FORCE=1
+claude
+```
+
+`CLAUDE_CODE_SUBAGENT_MODEL_FORCE=1` é recomendado: ele força o mesmo modelo
+para todos os subagentes, ignorando escolhas automáticas ou configurações
+individuais de agentes. O valor de `CLAUDE_CODE_SUBAGENT_MODEL` deve ser um id
+retornado por `/v1/models`, incluindo o sufixo `[1m]` quando ele aparecer.
+
+Para persistir a configuração em `~/.claude/settings.json`, adicione ao bloco
+`env`:
+
+```json
+{
+  "env": {
+    "CLAUDE_CODE_SUBAGENT_MODEL": "SEU_ID_EXATO_DO_V1_MODELS",
+    "CLAUDE_CODE_SUBAGENT_MODEL_FORCE": "1"
+  }
+}
+```
+
+Feche e reabra o Claude Code depois de alterar essas variáveis. Sem
+`CLAUDE_CODE_SUBAGENT_MODEL_FORCE`, uma definição de agente ou uma escolha por
+invocação pode substituir o modelo padrão.
 
 Verifique antes de abrir o Claude Code:
 
@@ -167,10 +221,15 @@ aceitam o sufixo `#<variant>` no id — em aliases, refs diretas e ids simples
 parâmetro do wire protocol do upstream:
 
 - **OpenAI-compatible** (`/chat/completions`): `reasoning_effort` (labels fora do
-  enum da OpenAI, como `xhigh`/`max`, são saturados para `high`).
-- **Responses API**: `reasoning`.
-- **Passthrough Anthropic**: sem equivalente (`reasoning_effort` não existe no
-  Messages API) — a variante é aceita e ignorada, e o modelo usa seu default.
+  enum da OpenAI, como `xhigh`/`max`, são saturados para `high`; `none` remove o
+  parâmetro).
+- **Responses API**: `reasoning` (objeto `{"effort": ...}`) mais os
+  `include` declarados pela variante.
+- **Passthrough Anthropic**: `thinking` derivado do que o catálogo declara para
+  a variante — `{"type": "adaptive", "display": "summarized"}` para variantes
+  com `thinking`, `{"type": "disabled"}` para `none`. Uma variante sem
+  representação segura no Messages API (apenas `reasoningEffort`) retorna **400**
+  em vez de ser silenciosamente ignorada.
 
 #### Janela de contexto manual (quando o auto-sufixo não basta)
 

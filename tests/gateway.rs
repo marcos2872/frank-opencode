@@ -271,6 +271,9 @@ struct MockUpstream {
     betas: Arc<Mutex<Vec<Option<String>>>>,
     org_ids: Arc<Mutex<Vec<Option<String>>>>,
     chat_streaming: bool,
+    /// Emit a streaming Chat response that ends after a partial frame,
+    /// mid-SSE. Exercises the stream-failure path.
+    chat_stream_truncated: bool,
 }
 
 async fn note(st: &MockUpstream, headers: &axum::http::HeaderMap, path: &str, body: Value) {
@@ -301,6 +304,22 @@ async fn mock_chat(
     Json(body): Json<Value>,
 ) -> Response {
     note(&st, &headers, "chat/completions", body).await;
+    if st.chat_stream_truncated {
+        // A partial SSE frame, a pause so the response headers flush, then a
+        // body error: the gateway must surface an error event instead of
+        // ending 200 with no explanation.
+        let s = async_stream::stream! {
+            yield Ok::<_, std::io::Error>(axum::body::Bytes::from(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+            ));
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            yield Err(std::io::Error::other("upstream dropped"));
+        };
+        return Response::builder()
+            .header("content-type", "text/event-stream")
+            .body(axum::body::Body::from_stream(s))
+            .unwrap();
+    }
     if st.chat_streaming {
         let sse = concat!(
             "data: {\"choices\":[{\"delta\":{\"content\":\"hel\"}}]}\n\n",
@@ -356,10 +375,20 @@ async fn mock_messages(
     .into_response()
 }
 
+async fn mock_count_tokens(
+    State(st): State<MockUpstream>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    note(&st, &headers, "messages/count_tokens", body).await;
+    Json(json!({"input_tokens": 7})).into_response()
+}
+
 async fn spawn_mock(mock: MockUpstream) -> String {
     let app = Router::new()
         .route("/chat/completions", post(mock_chat))
         .route("/responses", post(mock_responses))
+        .route("/messages/count_tokens", post(mock_count_tokens))
         .route("/messages", post(mock_messages))
         .with_state(mock);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -777,9 +806,7 @@ async fn e2e_variant_adds_reasoning_effort() {
         id: "high".to_string(),
         settings: frank_opencode::domain::ModelVariantSettings {
             reasoning_effort: Some("high".to_string()),
-            thinking: None,
-            budget_tokens: None,
-            include: None,
+            ..Default::default()
         },
     });
     let state = seeded_state(
@@ -810,9 +837,7 @@ async fn unknown_variant_is_404_with_available_list() {
         id: "high".to_string(),
         settings: frank_opencode::domain::ModelVariantSettings {
             reasoning_effort: Some("high".to_string()),
-            thinking: None,
-            budget_tokens: None,
-            include: None,
+            ..Default::default()
         },
     });
     let state = seeded_state(
@@ -886,6 +911,141 @@ async fn count_tokens_missing_messages_is_400() {
     assert_eq!(resp.status_code(), 400);
     let body: Value = resp.json();
     assert_eq!(body["error"]["type"], "invalid_request_error");
+}
+
+#[tokio::test]
+async fn e2e_anthropic_variant_sets_thinking() {
+    let mock = MockUpstream::default();
+    let base = spawn_mock(mock.clone()).await;
+    let mut e = mock_entry(&base, ANTHROPIC_PKG, "mock-anth");
+    e.variants.push(frank_opencode::domain::ModelVariant {
+        id: "high".to_string(),
+        settings: frank_opencode::domain::ModelVariantSettings {
+            thinking: Some(frank_opencode::domain::ThinkingConfig::Typed {
+                kind: "adaptive".to_string(),
+                display: Some("summarized".to_string()),
+            }),
+            ..Default::default()
+        },
+    });
+    let state = seeded_state(
+        test_config(),
+        vec![e],
+        vec![alias("claude-mock-anth", "opencode/mock-anth")],
+    )
+    .await;
+    let server = axum_test::TestServer::new(router(state)).unwrap();
+    let resp = server
+        .post("/v1/messages")
+        .add_header("x-api-key", "test-secret")
+        .json(&msg_body("claude-mock-anth#high"))
+        .await;
+    assert_eq!(resp.status_code(), 200);
+    let calls = calls_to(&mock, "messages").await;
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["thinking"]["type"], "adaptive");
+    assert_eq!(calls[0]["thinking"]["display"], "summarized");
+}
+
+#[tokio::test]
+async fn e2e_unrepresentable_anthropic_variant_is_400() {
+    let mock = MockUpstream::default();
+    let base = spawn_mock(mock.clone()).await;
+    let mut e = mock_entry(&base, ANTHROPIC_PKG, "mock-anth");
+    // `reasoningEffort` has no Messages API parameter: must fail loudly.
+    e.variants.push(frank_opencode::domain::ModelVariant {
+        id: "high".to_string(),
+        settings: frank_opencode::domain::ModelVariantSettings {
+            reasoning_effort: Some("high".to_string()),
+            ..Default::default()
+        },
+    });
+    let state = seeded_state(
+        test_config(),
+        vec![e],
+        vec![alias("claude-mock-anth", "opencode/mock-anth")],
+    )
+    .await;
+    let server = axum_test::TestServer::new(router(state)).unwrap();
+    let resp = server
+        .post("/v1/messages")
+        .add_header("x-api-key", "test-secret")
+        .json(&msg_body("claude-mock-anth#high"))
+        .await;
+    assert_eq!(resp.status_code(), 400);
+    let body: Value = resp.json();
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    // The request never reached the upstream.
+    assert!(calls_to(&mock, "messages").await.is_empty());
+}
+
+#[tokio::test]
+async fn e2e_count_tokens_applies_variant_and_catalog_body() {
+    let mock = MockUpstream::default();
+    let base = spawn_mock(mock.clone()).await;
+    let mut e = mock_entry(&base, ANTHROPIC_PKG, "mock-anth");
+    e.body = Some(json!({"speed": "fast"}));
+    e.variants.push(frank_opencode::domain::ModelVariant {
+        id: "high".to_string(),
+        settings: frank_opencode::domain::ModelVariantSettings {
+            thinking: Some(frank_opencode::domain::ThinkingConfig::Typed {
+                kind: "adaptive".to_string(),
+                display: None,
+            }),
+            ..Default::default()
+        },
+    });
+    let state = seeded_state(
+        test_config(),
+        vec![e],
+        vec![alias("claude-mock-anth", "opencode/mock-anth")],
+    )
+    .await;
+    let server = axum_test::TestServer::new(router(state)).unwrap();
+    let resp = server
+        .post("/v1/messages/count_tokens")
+        .add_header("x-api-key", "test-secret")
+        .json(&json!({
+            "model": "claude-mock-anth#high",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .await;
+    assert_eq!(resp.status_code(), 200);
+    let calls = calls_to(&mock, "messages/count_tokens").await;
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["thinking"]["type"], "adaptive");
+    assert_eq!(calls[0]["speed"], "fast");
+    // Streaming is a request-only concern: never forwarded to count_tokens.
+    assert!(calls[0].get("stream").is_none());
+}
+
+#[tokio::test]
+async fn e2e_chat_stream_failure_surfaces_error_event() {
+    let mock = MockUpstream {
+        chat_stream_truncated: true,
+        ..MockUpstream::default()
+    };
+    let base = spawn_mock(mock.clone()).await;
+    let state = seeded_state(
+        test_config(),
+        vec![mock_entry(&base, CHAT_PKG, "mock-chat")],
+        vec![alias("claude-mock-chat", "opencode/mock-chat")],
+    )
+    .await;
+    let server = axum_test::TestServer::new(router(state)).unwrap();
+    let mut body = msg_body("claude-mock-chat");
+    body["stream"] = Value::Bool(true);
+    let resp = server
+        .post("/v1/messages")
+        .add_header("x-api-key", "test-secret")
+        .json(&body)
+        .await;
+    assert_eq!(resp.status_code(), 200);
+    let text = resp.text();
+    // Partial content still delivered, then an explicit error frame.
+    assert!(text.contains("partial"), "{text}");
+    assert!(text.contains("message_stop"), "{text}");
+    assert!(text.contains("event: error"), "{text}");
 }
 
 // ---------------------------------------------------------------------------

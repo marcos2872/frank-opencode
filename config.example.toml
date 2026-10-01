@@ -22,6 +22,13 @@ include_free_tier = false
 # Leave false for Claude Code (it lists every claude-* id already).
 desktop_aliases = false
 
+# Upstream transport timeouts, in seconds.
+# connect_timeout_secs fails fast when a provider is unreachable.
+# request_timeout_secs bounds the whole request, streaming included, so it is
+# generous: a long reasoning turn can legitimately stay open for many minutes.
+connect_timeout_secs = 30
+request_timeout_secs = 3600
+
 # Manual aliases win over auto-generated ones.
 # Key = gateway id seen by Claude Code (keep "claude"/"anthropic" in it
 # so /v1/models discovery lists it in /model).

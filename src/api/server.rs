@@ -7,12 +7,13 @@ use crate::domain::{
 };
 use crate::infra::opencode::{fetch_catalog, upstream_bearer, CredentialStore};
 use crate::infra::upstream::{
-    anthropic_to_openai, anthropic_to_responses, apply_variant, estimate_tokens, join_url,
-    openai_to_anthropic, responses_to_anthropic, sse, with_heartbeat, ResponsesTranslator,
-    StreamTranslator,
+    anthropic_to_openai, anthropic_to_responses, apply_variant, apply_variant_checked,
+    estimate_tokens, join_url, openai_to_anthropic, responses_to_anthropic, sse, sse_error,
+    with_heartbeat, ResponsesTranslator, StreamTranslator,
 };
 use axum::{
     body::Body,
+    extract::DefaultBodyLimit,
     extract::State,
     http::{HeaderMap, StatusCode},
     middleware,
@@ -23,7 +24,7 @@ use axum::{
 use futures::StreamExt;
 use secrecy::ExposeSecret;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime};
 use tokio::sync::RwLock;
 
@@ -55,17 +56,23 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(config: AppConfig, db_path: PathBuf) -> Self {
+        let http = reqwest::Client::builder()
+            // Connect/headers budget is short (fail fast on an unreachable
+            // provider); the total timeout is generous because it also bounds
+            // streaming responses, and a long reasoning turn can legitimately
+            // stay open for many minutes.
+            .connect_timeout(std::time::Duration::from_secs(config.connect_timeout_secs))
+            .timeout(std::time::Duration::from_secs(config.request_timeout_secs))
+            .user_agent(format!("frank-opencode/{}", env!("CARGO_PKG_VERSION")))
+            .build()
+            .expect("http client");
         Self {
             config,
             catalog: Arc::new(RwLock::new(vec![])),
             aliases: Arc::new(RwLock::new(vec![])),
             last_refresh: Arc::new(RwLock::new(None)),
             last_error: Arc::new(RwLock::new(None)),
-            http: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(600))
-                .user_agent(format!("frank-opencode/{}", env!("CARGO_PKG_VERSION")))
-                .build()
-                .expect("http client"),
+            http,
             db_path,
         }
     }
@@ -368,9 +375,33 @@ impl AppState {
     }
 }
 
+const MAX_REQUEST_BODY: usize = 64 * 1024 * 1024;
+
 fn anthropic_error(status: StatusCode, err_type: &str, msg: &str) -> Response {
     let body = serde_json::json!({"type": "error", "error": {"type": err_type, "message": msg}});
     (status, Json(body)).into_response()
+}
+
+fn upstream_error_response(status: StatusCode, text: &str) -> Response {
+    let value = serde_json::from_str::<Value>(text).ok();
+    let message = value
+        .as_ref()
+        .and_then(|v| {
+            v.get("error")
+                .and_then(|e| e.get("message"))
+                .or_else(|| v.get("message"))
+        })
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .unwrap_or_else(|| body_preview(text));
+    let error_type = match status {
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => "authentication_error",
+        StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY => "invalid_request_error",
+        StatusCode::NOT_FOUND => "not_found_error",
+        StatusCode::TOO_MANY_REQUESTS => "rate_limit_error",
+        _ => "api_error",
+    };
+    anthropic_error(status, error_type, &message)
 }
 
 pub fn router(state: AppState) -> Router {
@@ -380,6 +411,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/messages/count_tokens", post(count_tokens))
         .route("/v1/messages", post(messages))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_token))
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY))
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -472,20 +504,26 @@ use serde_json::Value;
 
 /// Stable fallback session id (persisted) for clients that send no session
 /// header (e.g. curl smoke tests). Go uses it for routing/prompt caching.
+static FALLBACK_SESSION: OnceLock<String> = OnceLock::new();
+
 fn fallback_session_id() -> String {
-    let path = AppConfig::data_dir().join("frank.session");
-    if let Ok(s) = std::fs::read_to_string(&path) {
-        let s = s.trim().to_string();
-        if !s.is_empty() {
-            return s;
-        }
-    }
-    let id = format!("frank-{}", uuid::Uuid::new_v4());
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let _ = crate::daemon::write_private(path, &id);
-    id
+    FALLBACK_SESSION
+        .get_or_init(|| {
+            let path = AppConfig::data_dir().join("frank.session");
+            if let Ok(s) = std::fs::read_to_string(&path) {
+                let s = s.trim().to_string();
+                if !s.is_empty() {
+                    return s;
+                }
+            }
+            let id = format!("frank-{}", uuid::Uuid::new_v4());
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = crate::daemon::write_private(path, &id);
+            id
+        })
+        .clone()
 }
 
 /// Outgoing Go session headers derived from the incoming client headers.
@@ -521,7 +559,11 @@ fn session_headers(incoming: &HeaderMap) -> Vec<(String, String)> {
 /// then return the Anthropic count when the upstream package is Anthropic
 /// (proxy), else the local per-part estimate. The upstream count_tokens
 /// endpoint exists only in the Anthropic wire protocol.
-async fn count_tokens(State(s): State<AppState>, Json(body): Json<Value>) -> Response {
+async fn count_tokens(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
     // Model resolution first: same 404/400 semantics as /v1/messages.
     let raw = body
         .get("model")
@@ -540,7 +582,7 @@ async fn count_tokens(State(s): State<AppState>, Json(body): Json<Value>) -> Res
             "missing model (and no default_model configured)",
         );
     }
-    let (entry, _variant) = match s.resolve(&requested).await {
+    let (entry, variant) = match s.resolve(&requested).await {
         Ok(ok) => ok,
         Err(msg) => return anthropic_error(StatusCode::NOT_FOUND, "not_found_error", &msg),
     };
@@ -555,7 +597,9 @@ async fn count_tokens(State(s): State<AppState>, Json(body): Json<Value>) -> Res
 
     if let Some(base) = entry.base_url() {
         if protocol_for_entry(&entry) == Protocol::Anthropic {
-            if let Some(n) = proxy_count_tokens(&s, base, &entry, &body).await {
+            if let Some(n) =
+                proxy_count_tokens(&s, &headers, base, &entry, &body, variant.as_deref()).await
+            {
                 return Json(serde_json::json!({"input_tokens": n})).into_response();
             }
             // Proxy failed: fall through to the estimate.
@@ -570,9 +614,11 @@ async fn count_tokens(State(s): State<AppState>, Json(body): Json<Value>) -> Res
 /// local estimate (the endpoint is optional in this gateway's contract).
 async fn proxy_count_tokens(
     s: &AppState,
+    headers: &HeaderMap,
     base: &str,
     entry: &CatalogEntry,
     body: &Value,
+    variant: Option<&str>,
 ) -> Option<u64> {
     let store = CredentialStore::new(s.db_path.clone());
     let bearer = upstream_bearer(entry, &store)?;
@@ -580,7 +626,7 @@ async fn proxy_count_tokens(
     // The upstream counts under its own model id, not the gateway alias.
     req_body["model"] = Value::String(entry.model_id.clone());
     let url = join_url(base, "messages/count_tokens");
-    let resp = s
+    let mut req = s
         .http
         .post(&url)
         .header("content-type", "application/json")
@@ -588,10 +634,37 @@ async fn proxy_count_tokens(
             "authorization",
             format!("Bearer {}", bearer.expose_secret()),
         )
-        .json(&req_body)
-        .send()
-        .await
-        .ok()?;
+        .header("x-api-key", bearer.expose_secret().to_string())
+        .header(
+            "anthropic-version",
+            headers
+                .get("anthropic-version")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("2023-06-01"),
+        );
+    if let Some(beta) = headers.get("anthropic-beta").and_then(|v| v.to_str().ok()) {
+        req = req.header("anthropic-beta", beta);
+    }
+    for (k, v) in entry_headers(entry) {
+        if !k.eq_ignore_ascii_case("anthropic-beta") {
+            req = req.header(k, v);
+        }
+    }
+    for (k, v) in session_headers(headers) {
+        req = req.header(k, v);
+    }
+    req_body.as_object_mut().map(|o| o.remove("stream"));
+    // Apply the selected variant and the catalog body defaults, so the count
+    // matches what the real forward would send (thinking changes the input
+    // token count on the Messages API).
+    if let Some(v) = variant {
+        match apply_variant_checked(std::mem::take(&mut req_body), entry, v) {
+            Ok(applied) => req_body = applied,
+            Err(_) => return None,
+        }
+    }
+    apply_entry_body(&mut req_body, entry);
+    let resp = req.json(&req_body).send().await.ok()?;
     if !resp.status().is_success() {
         return None;
     }
@@ -702,13 +775,41 @@ async fn messages(
 /// Truncate an upstream error body for logs (never log credentials here;
 ///
 /// callers only pass status + body, never the bearer).
+/// Message from a Responses `response.failed` event: the upstream reports the
+/// failure under `response.error` (falling back to a few legacy shapes).
+fn response_failure_message(v: &Value) -> String {
+    let r = v.get("response").unwrap_or(v);
+    let picked = r
+        .get("error")
+        .and_then(|e| e.get("message"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| r.get("error").and_then(Value::as_str).map(str::to_owned))
+        .or_else(|| {
+            r.get("incomplete_details")
+                .and_then(|d| d.get("reason"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        });
+    match picked {
+        Some(s) if !s.is_empty() => format!("upstream response failed: {s}"),
+        _ => "upstream response failed".to_string(),
+    }
+}
+
 fn body_preview(s: &str) -> String {
     const MAX: usize = 500;
     let t = s.trim();
     if t.len() <= MAX {
         return t.to_string();
     }
-    let mut out = t[..MAX].to_string();
+    let end = t
+        .char_indices()
+        .take_while(|(index, _)| *index < MAX)
+        .map(|(index, _)| index)
+        .last()
+        .unwrap_or(0);
+    let mut out = t[..end].to_string();
     out.push('…');
     out
 }
@@ -845,9 +946,24 @@ async fn forward_anthropic(
     bearer: &secrecy::SecretString,
     gateway_model: &str,
     stream: bool,
-    _variant: Option<&str>,
+    variant: Option<&str>,
 ) -> Response {
     body["model"] = Value::String(entry.model_id.clone());
+    // Apply the selected variant to the raw body: the Messages API forwards
+    // client fields verbatim, so `thinking`/`include` land unchanged. A
+    // variant the Messages API cannot represent is a 400, not a silent no-op.
+    if let Some(v) = variant {
+        match apply_variant_checked(std::mem::take(body), entry, v) {
+            Ok(applied) => *body = applied,
+            Err(e) => {
+                return anthropic_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    &e.to_string(),
+                )
+            }
+        }
+    }
     apply_entry_body(body, entry);
     // `stream` passthrough stays as the client sent it.
     let url = join_url(base, "messages");
@@ -904,7 +1020,7 @@ async fn forward_anthropic(
         let text = resp.text().await.unwrap_or_default();
         let summary = request_summary(body);
         log_upstream_error(entry, gateway_model, base, status, &text, &summary);
-        return (status, [("content-type", "application/json")], text).into_response();
+        return upstream_error_response(status, &text);
     }
     if stream {
         // Byte passthrough, but inject `ping` during upstream silence so the
@@ -993,7 +1109,7 @@ async fn forward_responses(
         let text = resp.text().await.unwrap_or_default();
         let summary = request_summary(body);
         log_upstream_error(entry, gateway_model, base, status, &text, &summary);
-        return (status, [("content-type", "application/json")], text).into_response();
+        return upstream_error_response(status, &text);
     }
     if !stream {
         let v: Value = match resp.json().await {
@@ -1020,9 +1136,17 @@ async fn forward_responses(
         let mut buf: Vec<u8> = vec![];
         let mut pinned = Box::pin(byte_stream);
         let mut output_tokens: u64 = 0;
+        let mut input_tokens: u64 = 0;
         let mut incomplete = false;
+        let mut upstream_error: Option<String> = None;
         while let Some(chunk) = pinned.next().await {
-            let bytes = match chunk { Ok(b) => b, Err(_) => break };
+            let bytes = match chunk {
+                Ok(b) => b,
+                Err(e) => {
+                    upstream_error = Some(format!("upstream stream read failed: {e}"));
+                    break;
+                }
+            };
             buf.extend_from_slice(&bytes);
             while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
                 let line: Vec<u8> = buf.drain(..=pos).collect();
@@ -1033,12 +1157,24 @@ async fn forward_responses(
                 let Ok(v) = serde_json::from_str::<Value>(payload) else { continue; };
                 // Usage + status arrive on response.completed.
                 if let Some(r) = v.get("response") {
-                    if let Some(u) = r.get("usage").and_then(|u| u.get("output_tokens")).and_then(|x| x.as_u64()) {
-                        output_tokens = u;
+                    if let Some(u) = r.get("usage") {
+                        if let Some(n) = u.get("input_tokens").and_then(Value::as_u64) {
+                            input_tokens = n;
+                            tr.input_tokens = n;
+                        }
+                        if let Some(n) = u.get("output_tokens").and_then(Value::as_u64) {
+                            output_tokens = n;
+                        }
                     }
                 }
-                if v.get("type").and_then(|t| t.as_str()) == Some("response.incomplete") {
-                    incomplete = true;
+                match v.get("type").and_then(|t| t.as_str()) {
+                    Some("response.incomplete") => incomplete = true,
+                    // The upstream failed after the stream opened: surface it
+                    // rather than ending 200 with no explanation.
+                    Some("response.failed") => {
+                        upstream_error = Some(response_failure_message(&v));
+                    }
+                    _ => {}
                 }
                 for ev in tr.feed(&v) {
                     yield Ok(ev.into_bytes());
@@ -1057,8 +1193,12 @@ async fn forward_responses(
         } else {
             "end_turn"
         };
-        for line in tr.finish(reason, output_tokens) {
+        for line in tr.finish(reason, input_tokens, output_tokens) {
             yield Ok::<_, std::io::Error>(line.into_bytes());
+        }
+        if let Some(msg) = upstream_error {
+            let err = sse_error("api_error", &msg);
+            yield Ok::<_, std::io::Error>(err.into_bytes());
         }
     };
     Response::builder()
@@ -1121,7 +1261,7 @@ async fn forward_openai(
         let text = resp.text().await.unwrap_or_default();
         let summary = request_summary(body);
         log_upstream_error(entry, gateway_model, base, status, &text, &summary);
-        return (status, [("content-type", "application/json")], text).into_response();
+        return upstream_error_response(status, &text);
     }
     if !stream {
         let v: Value = match resp.json().await {
@@ -1156,9 +1296,17 @@ async fn forward_openai(
         use futures::StreamExt;
         let mut pinned = Box::pin(byte_stream);
         let mut output_tokens: u64 = 0;
+        let mut input_tokens: u64 = 0;
         let mut stop_reason = "end_turn".to_string();
+        let mut upstream_error: Option<String> = None;
         while let Some(chunk) = pinned.next().await {
-            let bytes = match chunk { Ok(b) => b, Err(_) => break };
+            let bytes = match chunk {
+                Ok(b) => b,
+                Err(e) => {
+                    upstream_error = Some(format!("upstream stream read failed: {e}"));
+                    break;
+                }
+            };
             buf.extend_from_slice(&bytes);
             // Process complete lines.
             while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
@@ -1169,8 +1317,14 @@ async fn forward_openai(
                 if payload.is_empty() { continue; }
                 if payload == "[DONE]" { continue; }
                 let Ok(v) = serde_json::from_str::<Value>(payload) else { continue; };
-                if let Some(u) = v.get("usage").and_then(|u| u.get("completion_tokens")).and_then(|x| x.as_u64()) {
-                    output_tokens = u;
+                if let Some(u) = v.get("usage") {
+                    if let Some(n) = u.get("prompt_tokens").and_then(Value::as_u64) {
+                        input_tokens = n;
+                        tr.input_tokens = n;
+                    }
+                    if let Some(n) = u.get("completion_tokens").and_then(Value::as_u64) {
+                        output_tokens = n;
+                    }
                 }
                 if let Some(fr) = v.get("choices").and_then(|c| c.as_array()).and_then(|a| a.first()).and_then(|c| c.get("finish_reason")).and_then(|f| f.as_str()) {
                     stop_reason = match fr {
@@ -1193,8 +1347,15 @@ async fn forward_openai(
             yield Ok(start.into_bytes());
             tr.text_open = true;
         }
-        for line in tr.finish(&stop_reason, output_tokens) {
+        if tr.tool_blocks.iter().any(|b| b.started) {
+            stop_reason = "tool_use".to_string();
+        }
+        for line in tr.finish(&stop_reason, input_tokens, output_tokens) {
             yield Ok::<_, std::io::Error>(line.into_bytes());
+        }
+        if let Some(msg) = upstream_error {
+            let err = sse_error("api_error", &msg);
+            yield Ok::<_, std::io::Error>(err.into_bytes());
         }
     };
     Response::builder()
@@ -1249,6 +1410,13 @@ mod tests {
         assert_eq!(s["max_tokens"], 128);
     }
 
+    #[test]
+    fn body_preview_truncates_at_utf8_boundary() {
+        let long = format!("{}x", "é".repeat(300));
+        let preview = body_preview(&long);
+        assert!(preview.ends_with('…'));
+        assert!(std::str::from_utf8(preview.as_bytes()).is_ok());
+    }
     #[test]
     fn body_preview_truncates() {
         assert_eq!(body_preview("  ok  "), "ok");

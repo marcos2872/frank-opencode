@@ -48,6 +48,23 @@ pub struct AppConfig {
     /// Off by default (Claude Code lists every `claude-*` id already).
     #[serde(default)]
     pub desktop_aliases: bool,
+    /// TCP/TLS connect timeout for the upstream request, in seconds.
+    /// Short so an unreachable provider fails fast.
+    #[serde(default = "default_connect_timeout_secs")]
+    pub connect_timeout_secs: u64,
+    /// Total upstream request timeout, in seconds. This one bounds streaming
+    /// responses too, so it must be generous: a long reasoning turn with a
+    /// large output can legitimately stay open for many minutes.
+    #[serde(default = "default_request_timeout_secs")]
+    pub request_timeout_secs: u64,
+}
+
+fn default_connect_timeout_secs() -> u64 {
+    30
+}
+
+fn default_request_timeout_secs() -> u64 {
+    3600
 }
 
 fn default_port() -> u16 {
@@ -65,6 +82,8 @@ impl Default for AppConfig {
             disabled: DisabledConfig::default(),
             include_free_tier: false,
             desktop_aliases: false,
+            connect_timeout_secs: default_connect_timeout_secs(),
+            request_timeout_secs: default_request_timeout_secs(),
         }
     }
 }

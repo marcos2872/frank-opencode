@@ -149,6 +149,10 @@ pub enum ThinkingConfig {
 pub struct ModelVariantSettings {
     #[serde(rename = "reasoningEffort", default)]
     pub reasoning_effort: Option<String>,
+    /// Messages-API effort label the catalog carries alongside `thinking`
+    /// (e.g. `{"thinking": "high"}`); distinct from `reasoning_effort`.
+    #[serde(default)]
+    pub effort: Option<String>,
     #[serde(default)]
     pub thinking: Option<ThinkingConfig>,
     #[serde(rename = "budgetTokens", default)]
@@ -301,8 +305,12 @@ pub fn strip_window_suffix(s: &str) -> &str {
     let Some(open) = s.rfind('[') else {
         return s;
     };
-    let inner = s[open + 1..s.len() - 1].to_lowercase();
-    let (digits, unit) = inner.split_at(inner.len().saturating_sub(1));
+    let inner = &s[open + 1..s.len() - 1];
+    if inner.is_empty() || !inner.is_ascii() {
+        return s;
+    }
+    let inner = inner.to_ascii_lowercase();
+    let (digits, unit) = inner.split_at(inner.len() - 1);
     if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) && matches!(unit, "k" | "m")
     {
         &s[..open]
@@ -729,6 +737,11 @@ mod tests {
         assert_eq!(protocol_for_entry(&e), Responses);
     }
 
+    #[test]
+    fn window_suffix_with_unicode_is_unchanged() {
+        let input = "claude-x[é]";
+        assert_eq!(strip_window_suffix(input), input);
+    }
     #[test]
     fn strips_window_hint_suffix() {
         assert_eq!(strip_window_suffix("claude-x[1m]"), "claude-x");
