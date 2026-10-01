@@ -7,8 +7,9 @@ use crate::domain::{
 };
 use crate::infra::opencode::{fetch_catalog, upstream_bearer, CredentialStore};
 use crate::infra::upstream::{
-    anthropic_to_openai, anthropic_to_responses, estimate_tokens, join_url, openai_to_anthropic,
-    responses_to_anthropic, sse, with_heartbeat, ResponsesTranslator, StreamTranslator,
+    anthropic_to_openai, anthropic_to_responses, apply_variant, estimate_tokens, join_url,
+    openai_to_anthropic, responses_to_anthropic, sse, with_heartbeat, ResponsesTranslator,
+    StreamTranslator,
 };
 use axum::{
     body::Body,
@@ -167,20 +168,37 @@ impl AppState {
             .unwrap_or_default()
     }
 
-    async fn resolve(&self, requested: &str) -> Option<CatalogEntry> {
+    /// Resolve a requested model (gateway alias, `provider/model`, plain id,
+    /// each optionally with a `#variant` suffix) to its catalog entry and the
+    /// selected variant label. `Err` carries the 404 message.
+    async fn resolve(&self, requested: &str) -> Result<(CatalogEntry, Option<String>), String> {
+        let (base, variant) = match requested.split_once('#') {
+            Some((b, v)) => (b.to_string(), Some(v.to_string())),
+            None => (requested.to_string(), None),
+        };
+        let hit = self.lookup_entry(&base).await;
+        self.finish_resolve(hit, &base, variant).await
+    }
+
+    /// Catalog lookup under the read guards (kept out of `resolve` so the
+    /// variant checks in `finish_resolve` don't hold any lock).
+    async fn lookup_entry(&self, base: &str) -> Option<CatalogEntry> {
         let catalog = self.catalog.read().await;
         let aliases = self.aliases.read().await;
         // Alias hit?
-        if let Some(a) = aliases.iter().find(|a| a.gateway_id == requested) {
+        if let Some(a) = aliases.iter().find(|a| a.gateway_id == base) {
             if let Some(r) = ModelRef::parse(&a.opencode_ref) {
-                return catalog
+                let hit = catalog
                     .iter()
                     .find(|e| e.provider_id == r.provider_id && e.model_id == r.model_id)
                     .cloned();
+                if hit.is_some() {
+                    return hit;
+                }
             }
         }
         // Direct provider/model?
-        if let Some(r) = ModelRef::parse(requested) {
+        if let Some(r) = ModelRef::parse(base) {
             if let Some(hit) = catalog
                 .iter()
                 .find(|e| e.provider_id == r.provider_id && e.model_id == r.model_id)
@@ -189,23 +207,56 @@ impl AppState {
                 return Some(hit);
             }
         }
-        // Plain model id (first enabled match)?
-        // Ambiguity is order-dependent across providers, so sort for
-        // determinism and warn with the candidates instead of failing.
+        // Plain model id (first enabled match)? Sort for determinism
+        // (ambiguity is order-dependent across providers) and warn.
         let mut hits: Vec<CatalogEntry> = catalog
             .iter()
-            .filter(|e| e.model_id == requested)
+            .filter(|e| e.model_id == base)
             .cloned()
             .collect();
         hits.sort_by_key(|e| e.qualified());
         if hits.len() > 1 {
             tracing::warn!(
-                model = requested,
+                model = base,
                 candidates = ?hits.iter().map(|e| e.qualified()).collect::<Vec<_>>(),
                 "ambiguous model id, using first; prefer an alias or provider/model"
             );
         }
         hits.into_iter().next()
+    }
+
+    async fn finish_resolve(
+        &self,
+        entry: Option<CatalogEntry>,
+        base: &str,
+        variant: Option<String>,
+    ) -> Result<(CatalogEntry, Option<String>), String> {
+        let Some(entry) = entry else {
+            return Err(format!("unknown model '{base}' (see GET /v1/models)"));
+        };
+        let v = match variant {
+            None => None,
+            Some(v) => {
+                let known: Vec<&str> = entry.variants.iter().map(|x| x.id.as_str()).collect();
+                if known.iter().any(|x| **x == v) {
+                    Some(v)
+                } else if known.is_empty() {
+                    return Err(format!(
+                        "model '{}' has no variants; requested '{}'",
+                        entry.qualified(),
+                        v
+                    ));
+                } else {
+                    return Err(format!(
+                        "model '{}' has no variant '{}' (available: {})",
+                        entry.qualified(),
+                        v,
+                        known.join(", ")
+                    ));
+                }
+            }
+        };
+        Ok((entry, v))
     }
 }
 
@@ -345,11 +396,86 @@ fn session_headers(incoming: &HeaderMap) -> Vec<(String, String)> {
     out
 }
 
-async fn count_tokens(State(_s): State<AppState>, Json(body): Json<Value>) -> impl IntoResponse {
-    // Optional endpoint: Claude Code falls back to char estimate when absent.
-    // We implement the estimate server-side.
+/// `POST /v1/messages/count_tokens`: validate like the Messages endpoint,
+/// then return the Anthropic count when the upstream package is Anthropic
+/// (proxy), else the local per-part estimate. The upstream count_tokens
+/// endpoint exists only in the Anthropic wire protocol.
+async fn count_tokens(State(s): State<AppState>, Json(body): Json<Value>) -> Response {
+    // Model resolution first: same 404/400 semantics as /v1/messages.
+    let raw = body
+        .get("model")
+        .and_then(|m| m.as_str())
+        .unwrap_or("")
+        .to_string();
+    let requested = if raw.is_empty() {
+        s.effective_default().await
+    } else {
+        strip_window_suffix(&raw).to_string()
+    };
+    if requested.is_empty() {
+        return anthropic_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "missing model (and no default_model configured)",
+        );
+    }
+    let (entry, _variant) = match s.resolve(&requested).await {
+        Ok(ok) => ok,
+        Err(msg) => return anthropic_error(StatusCode::NOT_FOUND, "not_found_error", &msg),
+    };
+    // A count without messages is meaningless.
+    if body.get("messages").and_then(|m| m.as_array()).is_none() {
+        return anthropic_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "missing messages",
+        );
+    }
+
+    if let Some(base) = entry.base_url() {
+        if protocol_for(&entry.package) == Protocol::Anthropic {
+            if let Some(n) = proxy_count_tokens(&s, base, &entry, &body).await {
+                return Json(serde_json::json!({"input_tokens": n})).into_response();
+            }
+            // Proxy failed: fall through to the estimate.
+        }
+    }
     let n = estimate_tokens(&body);
-    Json(serde_json::json!({"input_tokens": n}))
+    Json(serde_json::json!({"input_tokens": n})).into_response()
+}
+
+/// Ask `{baseURL}/messages/count_tokens` and return the token count.
+/// Fallback to `None` on any transport/parse error so callers degrade to the
+/// local estimate (the endpoint is optional in this gateway's contract).
+async fn proxy_count_tokens(
+    s: &AppState,
+    base: &str,
+    entry: &CatalogEntry,
+    body: &Value,
+) -> Option<u64> {
+    let store = CredentialStore::new(s.db_path.clone());
+    let bearer = upstream_bearer(entry, &store)?;
+    let mut req_body = body.clone();
+    // The upstream counts under its own model id, not the gateway alias.
+    req_body["model"] = Value::String(entry.model_id.clone());
+    let url = join_url(base, "messages/count_tokens");
+    let resp = s
+        .http
+        .post(&url)
+        .header("content-type", "application/json")
+        .header(
+            "authorization",
+            format!("Bearer {}", bearer.expose_secret()),
+        )
+        .json(&req_body)
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let v: Value = resp.json().await.ok()?;
+    v.get("input_tokens").and_then(|n| n.as_u64())
 }
 
 async fn messages(
@@ -375,12 +501,11 @@ async fn messages(
             "missing model (and no default_model configured)",
         );
     }
-    let Some(entry) = s.resolve(&requested).await else {
-        return anthropic_error(
-            StatusCode::NOT_FOUND,
-            "not_found_error",
-            &format!("unknown model '{requested}' (see GET /v1/models)"),
-        );
+    let (entry, variant) = match s.resolve(&requested).await {
+        Ok(ok) => ok,
+        Err(msg) => {
+            return anthropic_error(StatusCode::NOT_FOUND, "not_found_error", &msg);
+        }
     };
 
     let stream = body
@@ -410,19 +535,43 @@ async fn messages(
     match protocol_for(&entry.package) {
         Protocol::Anthropic => {
             forward_anthropic(
-                &s, &headers, &mut body, &entry, &base, &bearer, &requested, stream,
+                &s,
+                &headers,
+                &mut body,
+                &entry,
+                &base,
+                &bearer,
+                &requested,
+                stream,
+                variant.as_deref(),
             )
             .await
         }
         Protocol::Responses => {
             forward_responses(
-                &s, &headers, &body, &entry, &base, &bearer, &requested, stream,
+                &s,
+                &headers,
+                &body,
+                &entry,
+                &base,
+                &bearer,
+                &requested,
+                stream,
+                variant.as_deref(),
             )
             .await
         }
         Protocol::ChatCompletions => {
             forward_openai(
-                &s, &headers, &body, &entry, &base, &bearer, &requested, stream,
+                &s,
+                &headers,
+                &body,
+                &entry,
+                &base,
+                &bearer,
+                &requested,
+                stream,
+                variant.as_deref(),
             )
             .await
         }
@@ -439,6 +588,7 @@ async fn forward_anthropic(
     bearer: &secrecy::SecretString,
     gateway_model: &str,
     stream: bool,
+    _variant: Option<&str>,
 ) -> Response {
     body["model"] = Value::String(entry.model_id.clone());
     // `stream` passthrough stays as the client sent it.
@@ -526,8 +676,15 @@ async fn forward_responses(
     bearer: &secrecy::SecretString,
     gateway_model: &str,
     stream: bool,
+    variant: Option<&str>,
 ) -> Response {
-    let resp_body = anthropic_to_responses(body, &entry.model_id);
+    // Apply the selected variant to the translated body, not the raw
+    // client body: the translators drop unknown fields.
+    let resp_body = if let Some(v) = variant {
+        apply_variant(anthropic_to_responses(body, &entry.model_id), entry, v)
+    } else {
+        anthropic_to_responses(body, &entry.model_id)
+    };
     let url = join_url(base, "responses");
     let mut req = s
         .http
@@ -640,8 +797,15 @@ async fn forward_openai(
     bearer: &secrecy::SecretString,
     gateway_model: &str,
     stream: bool,
+    variant: Option<&str>,
 ) -> Response {
-    let oai_body = anthropic_to_openai(body, &entry.model_id);
+    // Apply the selected variant to the translated body, not the raw
+    // client body: the translators drop unknown fields.
+    let oai_body = if let Some(v) = variant {
+        apply_variant(anthropic_to_openai(body, &entry.model_id), entry, v)
+    } else {
+        anthropic_to_openai(body, &entry.model_id)
+    };
     let url = join_url(base, "chat/completions");
     let mut req = s
         .http

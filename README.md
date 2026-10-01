@@ -60,6 +60,40 @@ Logs: `~/.local/share/frank-opencode/frank.log`.
 
 Arquivo: `~/.config/frank-opencode/config.toml` (ver `config.example.toml`).
 Overrides por env: `FRANK_PORT`, `FRANK_AUTH_TOKEN`, `FRANK_CONFIG`.
+`FRANK_AUTH_TOKEN` (quando não-vazio) sobrescreve o `auth_token` do arquivo.
+
+### Autenticação do gateway (`auth_token`)
+
+Por padrão `auth_token = ""`: o gateway aceita qualquer credencial
+(aceitável porque ele só escuta em `127.0.0.1`). Para exigir credencial:
+
+```bash
+# 1. Gere um token
+openssl rand -hex 32
+
+# 2. Salve no config do gateway
+mkdir -p ~/.config/frank-opencode
+# edite ~/.config/frank-opencode/config.toml:
+#   auth_token = "SEU_TOKEN_AQUI"
+
+# 3. Reinicie o gateway para valer (o config é lido no boot)
+frank-opencode --disable
+frank-opencode --enable   # ou --enable --port XXXX se usa porta custom
+
+# 4. Use o MESMO valor no Claude Code (ver "Setup no Claude Code" abaixo)
+export ANTHROPIC_AUTH_TOKEN="SEU_TOKEN_AQUI"
+```
+
+Alternativa sem editar arquivo (teste / efêmero): exporte `FRANK_AUTH_TOKEN`
+antes do `--enable` — ele sobrescreve o arquivo e é herdado pelo daemon filho.
+
+Regras:
+
+- Quando setado, todo endpoint exceto `GET /health` exige o token, via
+  `x-api-key: <token>` **ou** `Authorization: Bearer <token>`.
+- Token errado/ausente → `401 {"error":{"type":"authentication_error",...}}`.
+- Trocar o token exige reiniciar (`--disable` + `--enable`); só editar o
+  arquivo não afeta o daemon já rodando.
 
 ## Escolhendo modelos no Claude Code — modelMap
 
@@ -72,6 +106,20 @@ Sim, você escolhe modelos dentro do Claude Code via `/model`, alimentado por `G
   `[disabled]` esconde refs do picker.
 - `POST /v1/messages` também aceita refs diretas (`opencode-go/kimi-k2.7-code`) e
   model ids simples, mesmo fora da lista.
+
+### Variantes (`#variant`)
+
+Modelos que declaram variantes no catálogo do OpenCode (ex.: reasoning effort)
+aceitam o sufixo `#<variant>` no id — em aliases, refs diretas e ids simples
+(`claude-opencode-go-my-model#high`). A variante é validada contra o catálogo
+(404 com a lista de variantes disponíveis se não existir) e traduzida para o
+parâmetro do wire protocol do upstream:
+
+- **OpenAI-compatible** (`/chat/completions`): `reasoning_effort` (labels fora do
+  enum da OpenAI, como `xhigh`/`max`, são saturados para `high`).
+- **Responses API**: `reasoning`.
+- **Passthrough Anthropic**: sem equivalente (`reasoning_effort` não existe no
+  Messages API) — a variante é aceita e ignorada, e o modelo usa seu default.
 
 ## Setup no Claude Code
 
@@ -152,7 +200,9 @@ o modelo padrão efetivo e o `last_error` do refresh do catálogo em background
 
 ## Limites (MVP)
 
-- Sufixos `#variant` ignorados. `count_tokens` é estimativa aproximada por caracteres.
+- `count_tokens` é estimativa local por partes (sem tokenizer BPE): texto ≈ 1 token/4 chars,
+  +overhead por mensagem/tool, imagens base64 pelo tamanho real. Para pacotes Anthropic há proxy
+  para `{baseURL}/messages/count_tokens` (com fallback na estimativa se o upstream falhar).
 - Modelos free-tier `opencode/*` são bloqueados no upstream fora do OpenCode (ocultos por padrão).
 - `frank.log` é só-append: trunque de vez em quando (`: > frank.log`).
 - `--enable` recusa uma `--port` diferente com ele rodando; dê `--disable` antes.

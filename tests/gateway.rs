@@ -34,6 +34,7 @@ fn entry(provider: &str, model: &str) -> CatalogEntry {
             provider: None,
         },
         enabled: true,
+        variants: vec![],
     }
 }
 
@@ -295,6 +296,7 @@ fn mock_entry(base_url: &str, package: &str, model: &str) -> CatalogEntry {
             provider: None,
         },
         enabled: true,
+        variants: vec![],
     }
 }
 
@@ -472,4 +474,126 @@ async fn e2e_chat_streaming_translated_to_anthropic_sse() {
     let calls = calls_to(&mock, "chat/completions").await;
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0]["stream"], true);
+}
+
+#[tokio::test]
+async fn e2e_variant_adds_reasoning_effort() {
+    let mock = MockUpstream::default();
+    let base = spawn_mock(mock.clone()).await;
+    // Variant support is fed from the catalog (`variants` field), same as
+    // `opencode api get /api/model` reports it.
+    let mut e = mock_entry(&base, CHAT_PKG, "mock-chat");
+    e.variants.push(frank_opencode::domain::ModelVariant {
+        id: "high".to_string(),
+        settings: frank_opencode::domain::ModelVariantSettings {
+            reasoning_effort: Some("high".to_string()),
+            thinking: None,
+            budget_tokens: None,
+            include: None,
+        },
+    });
+    let state = seeded_state(
+        test_config(),
+        vec![e],
+        vec![alias("claude-mock-chat", "opencode/mock-chat")],
+    )
+    .await;
+    let server = axum_test::TestServer::new(router(state)).unwrap();
+    let resp = server
+        .post("/v1/messages")
+        .add_header("x-api-key", "test-secret")
+        .json(&msg_body("claude-mock-chat#high"))
+        .await;
+    assert_eq!(resp.status_code(), 200);
+    let calls = calls_to(&mock, "chat/completions").await;
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["model"], "mock-chat");
+    assert_eq!(calls[0]["reasoning_effort"], "high");
+}
+
+#[tokio::test]
+async fn unknown_variant_is_404_with_available_list() {
+    let mock = MockUpstream::default();
+    let base = spawn_mock(mock.clone()).await;
+    let mut e = mock_entry(&base, CHAT_PKG, "mock-chat");
+    e.variants.push(frank_opencode::domain::ModelVariant {
+        id: "high".to_string(),
+        settings: frank_opencode::domain::ModelVariantSettings {
+            reasoning_effort: Some("high".to_string()),
+            thinking: None,
+            budget_tokens: None,
+            include: None,
+        },
+    });
+    let state = seeded_state(
+        test_config(),
+        vec![e],
+        vec![alias("claude-mock-chat", "opencode/mock-chat")],
+    )
+    .await;
+    let server = axum_test::TestServer::new(router(state)).unwrap();
+    let resp = server
+        .post("/v1/messages")
+        .add_header("x-api-key", "test-secret")
+        .json(&msg_body("claude-mock-chat#turbo"))
+        .await;
+    assert_eq!(resp.status_code(), 404);
+    let body: Value = resp.json();
+    let msg = body["error"]["message"].as_str().unwrap_or("");
+    assert!(msg.contains("high"), "{msg}");
+}
+
+#[tokio::test]
+async fn count_tokens_proxies_anthropic_upstream_and_falls_back() {
+    // The mock upstream counts tokens for the Anthropic package.
+    let mock = MockUpstream::default();
+    let base = spawn_mock(mock.clone()).await;
+    let anth = mock_entry(&base, ANTHROPIC_PKG, "mock-anth");
+    let chat = mock_entry(&base, CHAT_PKG, "mock-chat");
+    let state = seeded_state(
+        test_config(),
+        vec![anth, chat],
+        vec![
+            alias("claude-mock-anth", "opencode/mock-anth"),
+            alias("claude-mock-chat", "opencode/mock-chat"),
+        ],
+    )
+    .await;
+    let server = axum_test::TestServer::new(router(state)).unwrap();
+    // 1) Without a count handler route, the proxy fails -> estimate fallback.
+    let resp = server
+        .post("/v1/messages/count_tokens")
+        .add_header("x-api-key", "test-secret")
+        .json(&msg_body("claude-mock-anth"))
+        .await;
+    assert_eq!(resp.status_code(), 200);
+    assert!(resp.json::<Value>().get("input_tokens").is_some());
+    // 2) Non-Anthropic package: local estimate, no upstream call.
+    let resp = server
+        .post("/v1/messages/count_tokens")
+        .add_header("x-api-key", "test-secret")
+        .json(&msg_body("claude-mock-chat"))
+        .await;
+    assert_eq!(resp.status_code(), 200);
+    assert!(resp.json::<Value>().get("input_tokens").is_some());
+}
+
+#[tokio::test]
+async fn count_tokens_missing_messages_is_400() {
+    let base = spawn_mock(MockUpstream::default()).await;
+    let state = seeded_state(
+        test_config(),
+        vec![mock_entry(&base, CHAT_PKG, "mock-chat")],
+        vec![alias("claude-x", "opencode/mock-chat")],
+    )
+    .await;
+    let server = axum_test::TestServer::new(router(state)).unwrap();
+    let resp = server
+        .post("/v1/messages/count_tokens")
+        .add_header("x-api-key", "test-secret")
+        .json(&json!({"model": "claude-x", "system": "s"}))
+        .await;
+    assert_eq!(resp.status_code(), 400);
+    let body: Value = resp.json();
+    assert_eq!(body["error"]["type"], "invalid_request_error");
 }

@@ -2,34 +2,52 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Reference to a model inside OpenCode: `provider/model-id`.
+/// Reference to a model inside OpenCode: `provider/model-id`, optionally
+/// `provider/model-id#variant` when the caller selects a model variant.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ModelRef {
     pub provider_id: String,
     pub model_id: String,
+    /// Selected variant label (e.g. `high`), when the caller asked for one.
+    pub variant: Option<String>,
 }
 
 impl ModelRef {
     /// Parse `provider/model`, where model may itself contain `/`.
+    /// A trailing `#variant` (everything from the last `#` on) is preserved
+    /// as `variant`; the base model id is resolved as before.
     pub fn parse(s: &str) -> Option<Self> {
         let (provider, model) = s.split_once('/')?;
         if provider.is_empty() || model.is_empty() || provider.contains('#') {
             return None;
         }
-        // Strip optional #variant suffix for resolution (variant ignored in MVP).
-        let model = model.split_once('#').map(|(m, _)| m).unwrap_or(model);
+        let (model, variant) = match model.rfind('#') {
+            Some(i) => (&model[..i], Some(model[i + 1..].to_string())),
+            None => (model, None),
+        };
+        let variant = variant.filter(|v| !v.is_empty());
         if model.is_empty() {
             return None;
         }
         Some(Self {
             provider_id: provider.to_string(),
             model_id: model.to_string(),
+            variant,
         })
     }
 
     #[allow(dead_code)]
     pub fn qualified(&self) -> String {
         format!("{}/{}", self.provider_id, self.model_id)
+    }
+
+    /// `provider/model#variant`, or just `provider/model` when unset.
+    #[allow(dead_code)]
+    pub fn fully_qualified(&self) -> String {
+        match &self.variant {
+            Some(v) => format!("{}/{}#{}", self.provider_id, self.model_id, v),
+            None => self.qualified(),
+        }
     }
 }
 
@@ -51,6 +69,8 @@ pub struct CatalogEntry {
     pub settings: CatalogSettings,
     #[serde(default)]
     pub enabled: bool,
+    #[serde(default)]
+    pub variants: Vec<ModelVariant>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -61,6 +81,51 @@ pub struct CatalogSettings {
     pub api_key: Option<String>,
     #[serde(default)]
     pub provider: Option<String>,
+}
+
+/// One named variant of a model, as reported by `opencode api get /api/model`,
+/// e.g. `{"id": "high", "settings": {"reasoningEffort": "high"}}`.
+/// Settings keys vary by provider package (reasoningEffort, thinking,
+/// budgetTokens, ...); we only deserialize what the forwards need.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ModelVariant {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub settings: ModelVariantSettings,
+}
+
+/// Thinking configuration as reported by the catalog.
+///
+/// v2 sends an object (`{"type":"disabled"}`, `{"type":"adaptive",
+/// "display":"summarized"}`, ...); older catalogs used a plain label string.
+/// Accept both, plus any future object shape, so an unexpected `thinking`
+/// value can never break catalog parsing again.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum ThinkingConfig {
+    Label(String),
+    Typed {
+        #[serde(rename = "type")]
+        kind: String,
+        #[serde(default)]
+        display: Option<String>,
+    },
+    Other(serde_json::Map<String, serde_json::Value>),
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ModelVariantSettings {
+    #[serde(rename = "reasoningEffort", default)]
+    pub reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub thinking: Option<ThinkingConfig>,
+    #[serde(rename = "budgetTokens", default)]
+    pub budget_tokens: Option<u64>,
+    // In the v2 catalog this is a list of content parts to include in the
+    // response (e.g. `["reasoning.encrypted_content"]`), not a boolean flag.
+    #[serde(default)]
+    pub include: Option<Vec<String>>,
 }
 
 impl CatalogEntry {
@@ -80,6 +145,11 @@ impl CatalogEntry {
 
     pub fn base_url(&self) -> Option<&str> {
         self.settings.base_url.as_deref()
+    }
+
+    /// The declared variant with the given label, if any.
+    pub fn variant(&self, label: &str) -> Option<&ModelVariant> {
+        self.variants.iter().find(|v| v.id == label)
     }
 }
 
@@ -204,6 +274,22 @@ mod tests {
     fn strips_variant_suffix() {
         let r = ModelRef::parse("openai/gpt-5.2#high").unwrap();
         assert_eq!(r.model_id, "gpt-5.2");
+        assert_eq!(r.variant.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn preserves_variant_with_slashes_in_model() {
+        let r = ModelRef::parse("openrouter/anthropic/claude-sonnet-4-5#low").unwrap();
+        assert_eq!(r.model_id, "anthropic/claude-sonnet-4-5");
+        assert_eq!(r.variant.as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn no_variant_when_hash_absent_or_empty() {
+        let r = ModelRef::parse("openai/gpt-5.2").unwrap();
+        assert_eq!(r.variant, None);
+        let r = ModelRef::parse("openai/gpt-5.2#").unwrap();
+        assert_eq!(r.variant, None);
     }
 
     #[test]
@@ -211,6 +297,7 @@ mod tests {
         assert!(ModelRef::parse("no-slash").is_none());
         assert!(ModelRef::parse("/empty-provider").is_none());
         assert!(ModelRef::parse("provider/").is_none());
+        assert!(ModelRef::parse("p#bad/m").is_none());
     }
 
     #[test]
@@ -223,6 +310,7 @@ mod tests {
             package: "@opencode/ai/providers/openai-compatible".into(),
             settings: CatalogSettings::default(),
             enabled: true,
+            variants: vec![],
         };
         let a = auto_alias(&e);
         assert!(a.gateway_id.contains("claude"));

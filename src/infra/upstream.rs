@@ -4,6 +4,7 @@
 //!   (forward `anthropic-version` / `anthropic-beta` / body unchanged).
 //! - `openai*` packages: translate Anthropic <-> OpenAI Chat Completions.
 
+use crate::domain::{protocol_for, CatalogEntry, Protocol};
 use serde_json::Value;
 
 // ---------------------------------------------------------------------------
@@ -228,6 +229,52 @@ pub fn anthropic_to_openai(body: &Value, upstream_model: &str) -> Value {
         out["stream_options"] = serde_json::json!({"include_usage": true});
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// Model variants
+// ---------------------------------------------------------------------------
+
+/// Normalize a variant's reasoning label into the OpenAI `reasoning_effort`
+/// enum (`low`/`medium`/`high`, new models also accept `minimal`/`xhigh`).
+/// Labels with no equivalent — e.g. Anthropic style `max` thinking budget —
+/// map to the highest generic effort so semantics degrade instead of error.
+pub fn normalize_reasoning(label: &str) -> &str {
+    match label.to_ascii_lowercase().trim() {
+        // OpenAI native subset.
+        "minimal" => "minimal",
+        "low" => "low",
+        "medium" | "high" => "high",        // medium saturates to high
+        "xhigh" | "max" | "none" => "high", // no OpenAI equivalent -> high
+        _ => "high",
+    }
+}
+
+/// Apply a selected variant to a translated request body.
+/// The field that carries the variant's parameters depends on the wire
+/// protocol (same table as `protocol_for`):
+///
+/// - `Anthropic`: `reasoning_effort` is not a Messages param; a variant that
+///   declares `reasoningEffort` is a no-op (we cannot guess a thinking
+///   budget). Direct calls get whatever the upstream model defaults to.
+/// - `ChatCompletions`: `reasoning_effort` (OpenAI-compatible gateways).
+/// - `Responses`: `reasoning` (OpenAI Responses API key).
+///
+/// Unknown variant labels pass through unchanged (callers validate).
+pub fn apply_variant(mut body: Value, entry: &CatalogEntry, variant: &str) -> Value {
+    let Some(v) = entry.variant(variant) else {
+        return body;
+    };
+    let Some(effort) = v.settings.reasoning_effort.as_deref() else {
+        return body;
+    };
+    let key = match protocol_for(&entry.package) {
+        Protocol::Anthropic => return body,
+        Protocol::Responses => "reasoning",
+        Protocol::ChatCompletions => "reasoning_effort",
+    };
+    body[key] = Value::String(normalize_reasoning(effort).to_string());
+    body
 }
 
 // ---------------------------------------------------------------------------
@@ -961,16 +1008,193 @@ where
     }
 }
 
-/// Rough token estimate for the optional count_tokens endpoint.
+/// Per-part token estimate for the optional count_tokens endpoint (no
+/// tokenizer: Anthropic itself documents its counts as an estimate). Text is
+/// chars/4 (≈1 token per 4 ASCII chars); each message and tool adds a small
+/// fixed overhead; images and base64 documents count their real size, so a
+/// large attachment no longer inflates the count as if it were prose.
 pub fn estimate_tokens(body: &Value) -> u64 {
-    let s = body.to_string();
-    (s.len() as u64 / 4).max(1)
+    let mut tokens: u64 = 0;
+    fn add_text(tokens: &mut u64, s: &str) {
+        *tokens += (s.chars().count() as u64 / 4).max(1);
+    }
+    if let Some(sys) = body.get("system") {
+        match sys {
+            Value::String(s) => add_text(&mut tokens, s),
+            Value::Array(arr) => {
+                for b in arr {
+                    if let Some(t) = text_of(b) {
+                        add_text(&mut tokens, t);
+                    }
+                }
+            }
+            _ => {}
+        }
+        tokens += 3; // system wrapper.
+    }
+    if let Some(msgs) = body.get("messages").and_then(|m| m.as_array()) {
+        for m in msgs {
+            tokens += 3; // per-message overhead (Anthropic/OpenAI style).
+            match m.get("content") {
+                Some(Value::String(s)) => add_text(&mut tokens, s),
+                Some(Value::Array(blocks)) => {
+                    for b in blocks {
+                        match block_kind(b) {
+                            BlockKind::Text => {
+                                if let Some(t) = text_of(b) {
+                                    add_text(&mut tokens, t);
+                                }
+                            }
+                            BlockKind::Image | BlockKind::Document => {
+                                tokens += estimate_media(b);
+                            }
+                            BlockKind::ToolUse => tokens += 8, // id + name + JSON.
+                            BlockKind::ToolResult => {
+                                if let Some(t) = text_of(b) {
+                                    add_text(&mut tokens, t);
+                                }
+                                tokens += 4;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    if let Some(tools) = body.get("tools").and_then(|t| t.as_array()) {
+        for t in tools {
+            tokens += 4; // tool wrapper.
+            if let Some(n) = t.get("name").and_then(|n| n.as_str()) {
+                add_text(&mut tokens, n);
+            }
+            if let Some(d) = t.get("description").and_then(|d| d.as_str()) {
+                add_text(&mut tokens, d);
+            }
+            if let Some(schema) = t.get("input_schema") {
+                tokens += (schema.to_string().len() as u64 / 4).max(1);
+            }
+        }
+    }
+    tokens.max(1)
+}
+
+enum BlockKind {
+    Text,
+    Image,
+    Document,
+    ToolUse,
+    ToolResult,
+    Other,
+}
+
+fn block_kind(b: &Value) -> BlockKind {
+    match b.get("type").and_then(|t| t.as_str()) {
+        Some("text") => BlockKind::Text,
+        Some("image") => BlockKind::Image,
+        Some("document") => BlockKind::Document,
+        Some("tool_use") => BlockKind::ToolUse,
+        Some("tool_result") => BlockKind::ToolResult,
+        _ => BlockKind::Other,
+    }
+}
+
+fn text_of(b: &Value) -> Option<&str> {
+    b.get("text").and_then(|t| t.as_str())
+}
+
+/// Tokens for an image/document block: fixed overhead + a share of the
+/// base64 payload (base64 inflates content by ~33%; per the API's
+/// documentation images have a large base cost regardless of size).
+fn estimate_media(b: &Value) -> u64 {
+    let is_image = matches!(block_kind(b), BlockKind::Image);
+    let mut tokens: u64 = if is_image { 800 } else { 400 }; // base cost.
+    if let Some(src) = b.get("source") {
+        if let Some(data) = src.get("data").and_then(|d| d.as_str()) {
+            tokens += (data.len() as u64 / 4) / 3; // decoded bytes → tokens.
+        }
+        if let Some(url) = src.get("url").and_then(|u| u.as_str()) {
+            tokens += (url.len() as u64 / 4).max(1);
+        }
+    }
+    tokens
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::{CatalogEntry, CatalogSettings};
     use pretty_assertions::assert_eq;
+
+    fn entry_with_variants(pkg: &str, variants: Vec<(String, Option<String>)>) -> CatalogEntry {
+        CatalogEntry {
+            id: "m".to_string(),
+            model_id: "m".to_string(),
+            provider_id: "opencode".to_string(),
+            name: "m".to_string(),
+            package: pkg.to_string(),
+            settings: CatalogSettings::default(),
+            enabled: true,
+            variants: variants
+                .into_iter()
+                .map(|(id, effort)| crate::domain::ModelVariant {
+                    id,
+                    settings: crate::domain::ModelVariantSettings {
+                        reasoning_effort: effort,
+                        thinking: None,
+                        budget_tokens: None,
+                        include: None,
+                    },
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn normalize_reasoning_clamps_to_openai_enum() {
+        assert_eq!(normalize_reasoning("low"), "low");
+        assert_eq!(normalize_reasoning("medium"), "high");
+        assert_eq!(normalize_reasoning("high"), "high");
+        assert_eq!(normalize_reasoning("xhigh"), "high");
+        assert_eq!(normalize_reasoning("MAX"), "high");
+        assert_eq!(normalize_reasoning("garbage"), "high");
+    }
+
+    #[test]
+    fn apply_variant_sets_reasoning_effort_for_chat() {
+        let e = entry_with_variants(
+            "@opencode/ai/providers/openai-compatible",
+            vec![("high".to_string(), Some("high".to_string()))],
+        );
+        let body = serde_json::json!({"model": "x", "messages": []});
+        let out = apply_variant(body, &e, "high");
+        assert_eq!(out["reasoning_effort"], "high");
+    }
+
+    #[test]
+    fn apply_variant_uses_reasoning_key_for_responses() {
+        let e = entry_with_variants(
+            "@opencode/ai/providers/openai",
+            vec![("low".to_string(), Some("low".to_string()))],
+        );
+        let body = serde_json::json!({"model": "x", "input": []});
+        let out = apply_variant(body, &e, "low");
+        assert_eq!(out["reasoning"], "low");
+        assert!(out.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn apply_variant_noop_for_anthropic_and_unknown() {
+        let e = entry_with_variants(
+            "@opencode/ai/providers/anthropic",
+            vec![("high".to_string(), Some("high".to_string()))],
+        );
+        let body = serde_json::json!({"model": "x"});
+        assert_eq!(apply_variant(body.clone(), &e, "high"), body);
+        // Unknown variant label -> untouched too.
+        assert_eq!(apply_variant(body.clone(), &e, "nope"), body);
+    }
 
     #[test]
     fn converts_system_and_tool_use() {
