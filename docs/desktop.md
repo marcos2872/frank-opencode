@@ -84,10 +84,17 @@ dessa lista caem — sobram os 11 cujos nomes escapam (`opus`, `sonnet`,
 `mai-code`, `hy4`, `muse-spark`, `space-bunny`). Listas explícitas
 (`inferenceModels`) passam pelo mesmo filtro, então não adianta listar lá.
 
-Para listar tudo, ative a evasão no frank (`config.toml` ou
-`FRANK_CONFIG` apontando para um arquivo com):
+Para listar tudo, ative a evasão no frank. No `~/.config/frank-opencode/config.toml`
+(cria se não existir — o gateway lê no boot, então reinicie depois):
 
 ```toml
+port = 3737
+auth_token = ""
+opencode_bin = "opencode"
+include_free_tier = false
+
+# Lista todos os modelos no picker do Claude Desktop
+# (reescreve deepseek -> d-eepseek etc. só no id anunciado)
 desktop_aliases = true
 ```
 
@@ -111,19 +118,13 @@ novo — o log `Model discovery: N found; picker = M` denuncia na hora.
 
 1. [x] `Continue with Gateway` aparece no login (exige `0644`, `0600` dá `EACCES`).
 2. [x] Aliases aparecem no picker de modelos (51/51 com `desktop_aliases`).
-3. [ ] Chat simples responde via kimi/minimax?
-4. [ ] Aba Code do Desktop funciona (ela usa o mesmo gateway)?
-5. [ ] Modelos não-Anthropic atrás de alias `claude-*` — há relatos
-   conflitantes (Opper diz que Cowork só aceita família Claude;
-   Eigent/OpenRouter diz que qualquer um passa).
-6. [ ] `cache_control`/betas experimentais: o frank traduz para
-   Chat/Responses no upstream, então prompt caching e tool search
-   podem não ter pass-through total (custo maior ou `400` em betas).
-7. [ ] Se o picker vier vazio ou sem tier `sonnet`/`opus`, avaliar
-   expor em `/v1/models`: `display_name`, `anthropic_family_tier`,
-   `supports1m`.
-8. [ ] Cowork agents com acesso web podem exigir liberar
-   `Allowed egress hosts`.
+3. [x] Chat simples responde via kimi/minimax.
+4. [x] Aba Code do Desktop funciona (ela usa o mesmo gateway).
+5. [x] Modelos não-Anthropic atrás de alias `claude-*` funcionam (com `desktop_aliases`).
+6. [x] `cache_control`/betas experimentais: o frank traduz para
+   Chat/Responses no upstream.
+7. [x] Picker com tiers `sonnet`/`opus` via descoberta.
+8. [x] Cowork agents com acesso web.
 
 ## Verificação rápida antes de abrir o app
 
