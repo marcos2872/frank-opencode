@@ -35,13 +35,62 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Check formatting
+        id: fmt
         run: cargo fmt --all --check
 
       - name: Clippy (deny warnings)
+        id: clippy
         run: cargo clippy --all-targets --locked -- -D warnings
 
       - name: Run full test suite
-        run: cargo test --locked --all-targets
+        id: tests
+        # `set -o pipefail` so a failing `cargo test` is not masked by the
+        # `tee` exit status; the output file feeds the job summary below.
+        run: |
+          set -o pipefail
+          cargo test --locked --all-targets 2>&1 | tee /tmp/test-output.txt
+
+      - name: Job summary
+        if: always()
+        env:
+          FMT: ${{ steps.fmt.outcome }}
+          CLIPPY: ${{ steps.clippy.outcome }}
+          TESTS: ${{ steps.tests.outcome }}
+          REF: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+        run: |
+          status() {
+            case "$1" in
+              success) echo "✅ pass" ;;
+              failure) echo "❌ fail" ;;
+              skipped) echo "⏭️ skipped" ;;
+              cancelled) echo "🚫 cancelled" ;;
+              *) echo "⏭️ ${1:-unknown}" ;;
+            esac
+          }
+          {
+            echo "## Resumo do CI — \`test\`"
+            echo ""
+            echo "\`${REF}\` @ \`${SHA:0:7}\`"
+            echo ""
+            echo "| Etapa | Resultado |"
+            echo "| --- | --- |"
+            echo "| Formatação (\`cargo fmt\`) | $(status "$FMT") |"
+            echo "| Clippy (\`-D warnings\`) | $(status "$CLIPPY") |"
+            echo "| Suíte de testes | $(status "$TESTS") |"
+            echo ""
+            if [ -f /tmp/test-output.txt ]; then
+              read -r passed failed ignored < <(awk '/^test result:/ {
+                for (i = 1; i <= NF; i++) {
+                  if ($(i + 1) == "passed;") p += $i
+                  if ($(i + 1) == "failed;") f += $i
+                  if ($(i + 1) == "ignored;") g += $i
+                }
+              } END { printf "%d %d %d\n", p, f, g }' /tmp/test-output.txt)
+              echo "**Testes:** ${passed:-0} passaram · ${failed:-0} falharam · ${ignored:-0} ignorados"
+            fi
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # Separate, blocking perf gate. The perf tests also run (report-only) inside
   # `test`; here the release profile enforces the p95 budget. `--test-threads=1`
@@ -64,4 +113,39 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Proxy translation latency (p95 < 15ms, release)
-        run: cargo test --release --locked --test perf -- --nocapture --test-threads=1
+        id: perf
+        # `set -o pipefail` so a failed budget assertion is not masked by `tee`.
+        run: |
+          set -o pipefail
+          cargo test --release --locked --test perf -- --nocapture --test-threads=1 2>&1 | tee /tmp/perf-output.txt
+
+      - name: Job summary
+        if: always()
+        env:
+          PERF: ${{ steps.perf.outcome }}
+          REF: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+        run: |
+          {
+            echo "## Resumo do CI — \`perf\`"
+            echo ""
+            echo "\`${REF}\` @ \`${SHA:0:7}\` — orçamento **p95 < ${FRANK_PERF_P95_MS}ms** (release)"
+            echo ""
+            echo "| Cenário | n | p50 | p95 | mean | min | max |"
+            echo "| --- | --: | --: | --: | --: | --: | --: |"
+            if [ -f /tmp/perf-output.txt ]; then
+              # The harness prints on stderr, interleaved with libtest's
+              # `test <name> ... ` progress, so extract the [perf] record with
+              # -oE instead of anchoring to the line start.
+              grep -oE '\[perf\] [a-z_]+: n=[0-9]+ warmup=[0-9]+ p50=[0-9.]+ms p95=[0-9.]+ms mean=[0-9.]+ms min=[0-9.]+ms max=[0-9.]+ms' /tmp/perf-output.txt \
+                | awk -F'[ =]+' '{ label = $2; sub(/:$/, "", label);
+                    printf "| %s | %s | %s | %s | %s | %s | %s |\n",
+                           label, $4, $8, $10, $12, $14, $16 }'
+            fi
+            echo ""
+            case "$PERF" in
+              success) echo "**Veredito:** ✅ p95 dentro do orçamento" ;;
+              failure) echo "**Veredito:** ❌ p95 acima do orçamento (ou testes falharam)" ;;
+              *) echo "**Veredito:** ⏭️ ${PERF:-unknown}" ;;
+            esac
+          } >> "$GITHUB_STEP_SUMMARY"
