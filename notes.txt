@@ -1,0 +1,5 @@
+tive esse erro usando o muse spark 1.3, mudando para o deepseek nao deu erro
+2026-10-02T11:04:38.459112Z  WARN msg=catalog loaded empty (attempt 1/6); retrying in 2s
+2026-10-02T11:04:40.541007Z  WARN catalog load attempt failed err=catalog fetch failed: invalid catalog JSON: EOF while parsing a string at line 1 column 49152 attempt=2
+2026-10-02T11:04:44.611406Z  WARN catalog load attempt failed err=catalog fetch failed: invalid catalog JSON: EOF while parsing a string at line 1 column 40960 attempt=3
+2026-10-02T11:04:52.669780Z  WARN catalog load attempt failed err=catalog fetch failed: invalid catalog JSON: EOF while parsing a string at line 1 column 40960 attempt=4
