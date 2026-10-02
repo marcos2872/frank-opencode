@@ -42,3 +42,26 @@ jobs:
 
       - name: Run full test suite
         run: cargo test --locked --all-targets
+
+  # Separate, blocking perf gate. The perf tests also run (report-only) inside
+  # `test`; here the release profile enforces the p95 budget. `--test-threads=1`
+  # keeps the two scenarios from contending for CPU and inflating each other's
+  # tail latency. To actually block merges, add `perf` to the branch
+  # protection required status checks (like `test`).
+  perf:
+    name: perf
+    runs-on: ubuntu-latest
+    needs: test
+    env:
+      FRANK_PERF_P95_MS: "15"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Proxy translation latency (p95 < 15ms, release)
+        run: cargo test --release --locked --test perf -- --nocapture --test-threads=1

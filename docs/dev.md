@@ -7,6 +7,7 @@ Pré-requisitos: Rust stable, `opencode` v2 logado (`opencode auth login`).
 ```bash
 cargo test                    # testes unitários (tradução, aliases, config) + e2e (tests/gateway.rs)
 cargo test --test gateway     # só os testes e2e do gateway
+cargo test --test perf        # latência de tradução do proxy (report-only em debug)
 cargo test <name>             # teste único por substring do nome
 cargo clippy -- -D warnings   # lint (precisa estar limpo)
 cargo fmt --check             # formatação (precisa estar limpa)
@@ -16,9 +17,11 @@ cargo fmt --check             # formatação (precisa estar limpa)
 
 O workflow [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) roda em todo
 push e em toda PR: `cargo fmt --all --check`, `cargo clippy --all-targets --
--D warnings` e `cargo test --all-targets`. A branch `main` está protegida: o
-status **test** é obrigatório e a branch precisa estar atualizada — **uma PR não
-mergeia enquanto os testes não passarem** (o admin ainda pode dar push direto).
+-D warnings` e `cargo test --all-targets`. Um job separado `perf` (após o `test`)
+compila em release e força o orçamento de latência (ver abaixo). A branch `main`
+está protegida: o status **test** é obrigatório e a branch precisa estar
+atualizada — **uma PR não mergeia enquanto os testes não passarem** (o admin
+ainda pode dar push direto).
 
 Para reproduzir o CI localmente, os mesmos comandos acima com `--all-targets`.
 
@@ -31,6 +34,33 @@ git config core.hooksPath .githooks
 ```
 
 Para pular um commit específico: `git commit --no-verify`.
+
+## Performance
+
+`tests/perf.rs` mede a **latência de tradução do proxy** no formato
+Claude-simulador → gateway → OpenCode-simulador:
+
+- O cliente é o próprio teste, via `axum_test::TestServer` in-process (o hop
+  cliente→proxy fica **fora** da métrica).
+- O upstream é um app axum mock num `TcpListener` real de loopback, então
+  `reqwest`/serialização/pool de conexões entram na conta — é o caminho de
+  produção. O payload é realista (~8–16 KB: system longo, par tool_use/tool_result
+  e 2 tools) para a tradução não ser trivial.
+- Cada amostra cronometra `POST /v1/messages` (não-streaming) inteiro. Após um
+  warmup descartado (absorve o 1º connect), reporta p50/p95/mean/min/max.
+
+Enforcement: builds **release** exigem `p95 <= 15ms` (job `perf` do CI, com
+`--test-threads=1` para os dois cenários não disputarem CPU). Builds **debug** —
+como o `cargo test --all-targets` do job `test` — rodam e reportam, sem reprovar
+(o timings sem otimização é ruidoso demais para gate). Para reproduzir ou ajustar:
+
+```bash
+cargo test --test perf -- --nocapture                                    # debug: só reporta
+cargo test --release --test perf -- --nocapture --test-threads=1         # release: força p95 < 15ms
+FRANK_PERF_P95_MS=25 cargo test --release --test perf                    # sobrepõe o limiar
+```
+
+Para encarecer o cenário, aumente `FILLER_LINES` em `realistic_body`.
 
 ## Rodando
 

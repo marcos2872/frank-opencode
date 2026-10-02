@@ -336,6 +336,10 @@ estar atualizada — uma PR só mergeia com os testes verdes. Há também um hoo
 pre-commit opcional; ative com `git config core.hooksPath .githooks`. Detalhes em
 [docs/dev.md](docs/dev.md).
 
+Há ainda um teste de latência do proxy (`tests/perf.rs`, Claude-simulador →
+gateway → OpenCode-simulador) com um job de CI que exige `p95 < 15ms` em release —
+ver [docs/dev.md](docs/dev.md#performance).
+
 ## Documentação
 
 - [Desenvolvimento](docs/dev.md) — como rodar em dev, testes, lint.

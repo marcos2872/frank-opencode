@@ -7,6 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```bash
 cargo test                    # unit + integration tests (tests/gateway.rs)
 cargo test --test gateway     # only the e2e gateway tests
+cargo test --test perf        # proxy translation latency (report-only in debug)
 cargo test <name>             # single test by name substring
 cargo clippy -- -D warnings   # must stay clean
 cargo fmt --check             # must stay clean
@@ -16,10 +17,13 @@ cargo run -- --serve          # foreground server on 127.0.0.1:3737
 
 CI: `.github/workflows/ci.yml` runs `cargo fmt --all --check`, `cargo clippy
 --all-targets -- -D warnings` and `cargo test --all-targets` on every push and
-PR. `main` is protected — the `test` check is required and the branch must be up
-to date, so a PR cannot merge with failing tests (admins may still push
-directly). An opt-in pre-commit hook (`.githooks/pre-commit`, same three
-commands) is enabled per clone with `git config core.hooksPath .githooks`.
+PR. A separate `perf` job builds `--release` and enforces `p95 < 15ms` on the
+proxy translation latency (`tests/perf.rs`: Claude simulator → gateway → OpenCode
+simulator; override with `FRANK_PERF_P95_MS`). `main` is protected — the `test`
+check is required and the branch must be up to date, so a PR cannot merge with
+failing tests (admins may still push directly). An opt-in pre-commit hook
+(`.githooks/pre-commit`, same three commands) is enabled per clone with
+`git config core.hooksPath .githooks`.
 
 Daemon lifecycle: `frank-opencode --enable [--port PORT] | --disable | --status`. Configuration is loaded from `~/.config/frank-opencode/config.toml` (or `--config`/`FRANK_CONFIG`), with `FRANK_PORT` and `FRANK_AUTH_TOKEN` overrides. State files
 (pid, port, session id, log) live in `~/.local/share/frank-opencode/` and are
