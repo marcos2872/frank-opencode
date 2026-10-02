@@ -25,6 +25,10 @@ ainda pode dar push direto).
 
 Para reproduzir o CI localmente, os mesmos comandos acima com `--all-targets`.
 
+Cada job publica um **resumo** ao final (painel *Summary* do GitHub Actions): o
+`test` mostra o status de cada etapa (fmt/clippy/testes) e o total de testes; o
+`perf` mostra a tabela p50/p95/etc. por cenário e o veredito do orçamento.
+
 Há um hook de pre-commit em [`.githooks/pre-commit`](../.githooks/pre-commit) que
 roda `fmt --check`, `clippy` e `test` antes de cada commit. Ele **não** é ativado
 automaticamente (o Git não versiona `.git/hooks`); habilite uma vez por clone:
