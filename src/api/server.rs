@@ -3,7 +3,7 @@
 use crate::config::AppConfig;
 use crate::domain::{
     auto_aliases_for, is_known_package, protocol_for_entry, strip_window_suffix, window_suffix,
-    AliasEntry, CatalogEntry, ModelRef, Protocol,
+    AliasEntry, CatalogEntry, GatewayError, ModelRef, Protocol,
 };
 use crate::infra::opencode::{fetch_catalog, upstream_bearer, CredentialStore};
 use crate::infra::upstream::{
@@ -97,25 +97,27 @@ impl AppState {
     /// Console free-tier (`opencode/*`) models are skipped unless
     /// `include_free_tier` is set: they 403 outside OpenCode.
     /// Failures keep the previous catalog and are recorded for `/health`.
-    pub async fn refresh(&self) -> Result<usize, String> {
+    pub async fn refresh(&self) -> Result<usize, GatewayError> {
         let bin = self.config.opencode_bin.clone();
         let fetch = tokio::task::spawn_blocking(move || fetch_catalog(&bin));
         let entries = match tokio::time::timeout(Duration::from_secs(20), fetch).await {
             Ok(Ok(Ok(entries))) => entries,
+            // `last_error` text is preserved verbatim (surfaced on `/health`):
+            // only the `Err` payload changes from `String` to typed.
             Ok(Ok(Err(e))) => {
-                let msg = format!("catalog fetch failed: {e}");
-                *self.last_error.write().await = Some(msg.clone());
-                return Err(msg);
+                *self.last_error.write().await = Some(format!("catalog fetch failed: {e}"));
+                return Err(e);
             }
             Ok(Err(e)) => {
-                let msg = format!("catalog task failed: {e}");
-                *self.last_error.write().await = Some(msg.clone());
-                return Err(msg);
+                let err = GatewayError::CatalogTask {
+                    source: e.to_string(),
+                };
+                *self.last_error.write().await = Some(format!("catalog task failed: {e}"));
+                return Err(err);
             }
             Err(_) => {
-                let msg = "catalog fetch timed out after 20s".to_string();
-                *self.last_error.write().await = Some(msg.clone());
-                return Err(msg);
+                *self.last_error.write().await = Some(GatewayError::CatalogTimeout.to_string());
+                return Err(GatewayError::CatalogTimeout);
             }
         };
         for e in &entries {
@@ -283,8 +285,11 @@ impl AppState {
 
     /// Resolve a requested model (gateway alias, `provider/model`, plain id,
     /// each optionally with a `#variant` suffix) to its catalog entry and the
-    /// selected variant label. `Err` carries the 404 message.
-    async fn resolve(&self, requested: &str) -> Result<(CatalogEntry, Option<String>), String> {
+    /// selected variant label. `Err` carries the 404 details.
+    async fn resolve(
+        &self,
+        requested: &str,
+    ) -> Result<(CatalogEntry, Option<String>), GatewayError> {
         let (base, variant) = match requested.split_once('#') {
             Some((b, v)) => (b.to_string(), Some(v.to_string())),
             None => (requested.to_string(), None),
@@ -339,9 +344,11 @@ impl AppState {
         entry: Option<CatalogEntry>,
         base: &str,
         variant: Option<String>,
-    ) -> Result<(CatalogEntry, Option<String>), String> {
+    ) -> Result<(CatalogEntry, Option<String>), GatewayError> {
         let Some(entry) = entry else {
-            return Err(format!("unknown model '{base}' (see GET /v1/models)"));
+            return Err(GatewayError::UnknownModel {
+                name: base.to_string(),
+            });
         };
         let v = match variant {
             None => None,
@@ -350,18 +357,16 @@ impl AppState {
                 if known.iter().any(|x| **x == v) {
                     Some(v)
                 } else if known.is_empty() {
-                    return Err(format!(
-                        "model '{}' has no variants; requested '{}'",
-                        entry.qualified(),
-                        v
-                    ));
+                    return Err(GatewayError::NoVariants {
+                        model: entry.qualified(),
+                        requested: v,
+                    });
                 } else {
-                    return Err(format!(
-                        "model '{}' has no variant '{}' (available: {})",
-                        entry.qualified(),
-                        v,
-                        known.join(", ")
-                    ));
+                    return Err(GatewayError::UnknownVariant {
+                        model: entry.qualified(),
+                        requested: v,
+                        available: known.iter().map(|s| s.to_string()).collect(),
+                    });
                 }
             }
         };
@@ -374,6 +379,14 @@ const MAX_REQUEST_BODY: usize = 64 * 1024 * 1024;
 fn anthropic_error(status: StatusCode, err_type: &str, msg: &str) -> Response {
     let body = serde_json::json!({"type": "error", "error": {"type": err_type, "message": msg}});
     (status, Json(body)).into_response()
+}
+
+/// Single mapping from a typed error to the Anthropic wire shape.
+/// `upstream_error_response` keeps its own path: it normalizes an arbitrary
+/// upstream body instead of rendering a typed error.
+fn gateway_error_response(e: &GatewayError) -> Response {
+    let status = StatusCode::from_u16(e.status_code()).unwrap_or(StatusCode::BAD_GATEWAY);
+    anthropic_error(status, e.error_type(), &e.to_string())
 }
 
 fn upstream_error_response(status: StatusCode, text: &str) -> Response {
@@ -570,23 +583,15 @@ async fn count_tokens(
         strip_window_suffix(&raw).to_string()
     };
     if requested.is_empty() {
-        return anthropic_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            "missing model (and no default_model configured)",
-        );
+        return gateway_error_response(&GatewayError::MissingModel);
     }
     let (entry, variant) = match s.resolve(&requested).await {
         Ok(ok) => ok,
-        Err(msg) => return anthropic_error(StatusCode::NOT_FOUND, "not_found_error", &msg),
+        Err(e) => return gateway_error_response(&e),
     };
     // A count without messages is meaningless.
     if body.get("messages").and_then(|m| m.as_array()).is_none() {
-        return anthropic_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            "missing messages",
-        );
+        return gateway_error_response(&GatewayError::MissingMessages);
     }
 
     if let Some(base) = entry.base_url() {
@@ -683,11 +688,7 @@ async fn messages(
         strip_window_suffix(&raw).to_string()
     };
     if requested.is_empty() {
-        return anthropic_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            "missing model (and no default_model configured)",
-        );
+        return gateway_error_response(&GatewayError::MissingModel);
     }
     let stream = body
         .get("stream")
@@ -705,29 +706,22 @@ async fn messages(
     }
     let (entry, variant) = match s.resolve(&requested).await {
         Ok(ok) => ok,
-        Err(msg) => {
-            return anthropic_error(StatusCode::NOT_FOUND, "not_found_error", &msg);
+        Err(e) => {
+            return gateway_error_response(&e);
         }
     };
 
     let store = CredentialStore::new(s.db_path.clone());
     let Some(bearer) = upstream_bearer(&entry, &store) else {
-        return anthropic_error(
-            StatusCode::UNAUTHORIZED,
-            "authentication_error",
-            &format!(
-                "no stored credential for '{}' (run `opencode auth login`)",
-                entry.provider_id
-            ),
-        );
+        return gateway_error_response(&GatewayError::NoCredential {
+            provider: entry.provider_id.clone(),
+        });
     };
 
     let Some(base) = entry.base_url().map(|x| x.to_string()) else {
-        return anthropic_error(
-            StatusCode::BAD_GATEWAY,
-            "api_error",
-            &format!("provider '{}' has no baseURL", entry.provider_id),
-        );
+        return gateway_error_response(&GatewayError::NoBaseUrl {
+            provider: entry.provider_id.clone(),
+        });
     };
 
     match protocol_for_entry(&entry) {
@@ -1045,11 +1039,9 @@ async fn forward_anthropic(
         match apply_variant_checked(std::mem::take(body), entry, v) {
             Ok(applied) => *body = applied,
             Err(e) => {
-                return anthropic_error(
-                    StatusCode::BAD_REQUEST,
-                    "invalid_request_error",
-                    &e.to_string(),
-                )
+                return gateway_error_response(&GatewayError::VariantNotRepresentable {
+                    detail: e.to_string(),
+                })
             }
         }
     }
@@ -1097,11 +1089,9 @@ async fn forward_anthropic(
     let resp = match req.json(&body).send().await {
         Ok(r) => r,
         Err(e) => {
-            return anthropic_error(
-                StatusCode::BAD_GATEWAY,
-                "api_error",
-                &format!("upstream unreachable: {e}"),
-            )
+            return gateway_error_response(&GatewayError::UpstreamUnreachable {
+                source: e.to_string(),
+            })
         }
     };
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
@@ -1130,11 +1120,9 @@ async fn forward_anthropic(
         let mut v: Value = match resp.json().await {
             Ok(v) => v,
             Err(e) => {
-                return anthropic_error(
-                    StatusCode::BAD_GATEWAY,
-                    "api_error",
-                    &format!("invalid upstream JSON: {e}"),
-                )
+                return gateway_error_response(&GatewayError::InvalidUpstreamJson {
+                    source: e.to_string(),
+                })
             }
         };
         if v.get("model").is_some() {
@@ -1186,11 +1174,9 @@ async fn forward_responses(
     let resp = match req.json(&resp_body).send().await {
         Ok(r) => r,
         Err(e) => {
-            return anthropic_error(
-                StatusCode::BAD_GATEWAY,
-                "api_error",
-                &format!("upstream unreachable: {e}"),
-            )
+            return gateway_error_response(&GatewayError::UpstreamUnreachable {
+                source: e.to_string(),
+            })
         }
     };
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
@@ -1204,11 +1190,9 @@ async fn forward_responses(
         let v: Value = match resp.json().await {
             Ok(v) => v,
             Err(e) => {
-                return anthropic_error(
-                    StatusCode::BAD_GATEWAY,
-                    "api_error",
-                    &format!("invalid upstream JSON: {e}"),
-                )
+                return gateway_error_response(&GatewayError::InvalidUpstreamJson {
+                    source: e.to_string(),
+                })
             }
         };
         if let Some(uid) = v.get("id").and_then(|x| x.as_str()) {
@@ -1338,11 +1322,9 @@ async fn forward_openai(
     let resp = match req.json(&oai_body).send().await {
         Ok(r) => r,
         Err(e) => {
-            return anthropic_error(
-                StatusCode::BAD_GATEWAY,
-                "api_error",
-                &format!("upstream unreachable: {e}"),
-            )
+            return gateway_error_response(&GatewayError::UpstreamUnreachable {
+                source: e.to_string(),
+            })
         }
     };
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
@@ -1356,11 +1338,9 @@ async fn forward_openai(
         let v: Value = match resp.json().await {
             Ok(v) => v,
             Err(e) => {
-                return anthropic_error(
-                    StatusCode::BAD_GATEWAY,
-                    "api_error",
-                    &format!("invalid upstream JSON: {e}"),
-                )
+                return gateway_error_response(&GatewayError::InvalidUpstreamJson {
+                    source: e.to_string(),
+                })
             }
         };
         if let Some(uid) = v

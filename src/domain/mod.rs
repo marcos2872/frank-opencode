@@ -1,5 +1,8 @@
 //! Domain: pure types and rules. No tokio, axum, rusqlite here.
 
+pub mod error;
+
+pub use error::GatewayError;
 use serde::{Deserialize, Serialize};
 
 /// Reference to a model inside OpenCode: `provider/model-id`, optionally

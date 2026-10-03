@@ -6,7 +6,7 @@
 //! - `auth.json` is legacy migration input only, NOT the source of truth.
 //! - Model catalog via `opencode api get /api/model` (handles service auth).
 
-use crate::domain::CatalogEntry;
+use crate::domain::{CatalogEntry, GatewayError};
 use secrecy::{ExposeSecret, SecretString};
 use std::path::PathBuf;
 use std::process::Command;
@@ -115,22 +115,28 @@ pub fn unwrap_envelope(raw: &str) -> String {
 }
 
 /// Fetch the enabled model catalog via the OpenCode CLI (service-auth aware).
-pub fn fetch_catalog(opencode_bin: &str) -> Result<Vec<CatalogEntry>, String> {
+pub fn fetch_catalog(opencode_bin: &str) -> Result<Vec<CatalogEntry>, GatewayError> {
     let out = Command::new(opencode_bin)
         .args(["api", "get", "/api/model"])
         .output()
-        .map_err(|e| format!("failed to run `{opencode_bin} api get /api/model`: {e}"))?;
+        .map_err(|e| GatewayError::CatalogSpawn {
+            bin: opencode_bin.to_string(),
+            source: e.to_string(),
+        })?;
     if !out.status.success() {
-        return Err(format!(
-            "opencode api failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
+        return Err(GatewayError::CatalogFailed {
+            stderr: String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        });
     }
-    let v: serde_json::Value =
-        serde_json::from_slice(&out.stdout).map_err(|e| format!("invalid catalog JSON: {e}"))?;
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .map_err(|e| GatewayError::CatalogJson {
+            source: e.to_string(),
+        })?;
     let data = v.get("data").cloned().unwrap_or(v);
-    let entries: Vec<CatalogEntry> =
-        serde_json::from_value(data).map_err(|e| format!("catalog shape: {e}"))?;
+    let entries: Vec<CatalogEntry> = serde_json::from_value(data)
+        .map_err(|e| GatewayError::CatalogShape {
+            source: e.to_string(),
+        })?;
     Ok(entries.into_iter().filter(|e| e.enabled).collect())
 }
 
