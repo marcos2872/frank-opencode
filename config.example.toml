@@ -20,7 +20,7 @@ include_free_tier = false
 # claude-opencode-go-d-eepseek-v4-1-flash so Desktop lists it.
 # Only the advertised id changes; refs and resolution are untouched.
 # Leave false for Claude Code (it lists every claude-* id already).
-desktop_aliases = false
+desktop_aliases = true
 
 # Answer Claude Code's auto-mode safety classifier (and its 1-token
 # liveness probes) locally instead of forwarding upstream. Those calls
@@ -31,7 +31,7 @@ desktop_aliases = false
 # never touches the provider. Real conversations (tools + a real system
 # prompt) still forward normally.
 # Tradeoff: with the mock on, auto mode's LLM safety review always passes.
-mock_classifier = false
+mock_classifier = true
 
 # Anthropic family tiers advertised on /v1/models (anthropic_family_tier +
 # is_family_default). Key = gateway id or opencode ref (provider/model),
@@ -45,8 +45,21 @@ mock_classifier = false
 tier = "haiku"
 family_default = true
 
-# [tiers."github-copilot/claude-sonnet-5"]
-# tier = "sonnet"
+[tiers."claude-opencode-go-d-eepseek-v4-1-flash"]
+tier = "sonnet"
+family_default = true
+
+[tiers."claude-opencode-go-m-imo-v2-6-flash"]
+tier = "opus"
+family_default = true
+#
+# [tiers."claude-opencode-go-muse-spark-1-3-contributor"]
+# tier = "fable"
+# family_default = true
+#
+# [tiers."claude-opencode-go-muse-spark-1-3-contributor"]
+# tier = "mythos"
+# family_default = true
 
 # Upstream transport timeouts, in seconds.
 # connect_timeout_secs fails fast when a provider is unreachable.
@@ -55,17 +68,43 @@ family_default = true
 connect_timeout_secs = 30
 request_timeout_secs = 3600
 
-# Manual aliases win over auto-generated ones.
-# Key = gateway id seen by Claude Code (keep "claude"/"anthropic" in it
-# so /v1/models discovery lists it in /model).
-[aliases."claude-sonnet-4-6-frank"]
-opencode = "opencode-go/kimi-k2.7-code"
-display_name = "Sonnet 4.6 (Kimi K2.7 Code via Go)"
-description = "Coding default"
+# --- Blindando o Copilot contra chamadas de fundo (ver README) -------------
+# O CLI do Claude Code descarta anthropic_family_tier do /v1/models e resolve
+# modelos de fundo por substring do id ("claude-sonnet-*"/"claude-opus-*"),
+# que batiam nas linhas do Copilot. Ids renomeados (cs = copilot-sonnet,
+# co = copilot-opus) quebram o match; display_name e ref ficam os mesmos.
+# Ids antigos (valem 404 no /v1/models, ref direta continua resolvendo):
+#   claude-github-copilot-claude-sonnet-5       -> claude-github-copilot-cs-5
+#   claude-github-copilot-claude-sonnet-5-5     -> claude-github-copilot-cs-5-5
+#   claude-github-copilot-claude-opus-4-8       -> claude-github-copilot-co-4-8
+#   claude-github-copilot-claude-opus-4-8-fast  -> claude-github-copilot-co-4-8-fast
+#   claude-github-copilot-claude-opus-5         -> claude-github-copilot-co-5
+#   claude-github-copilot-claude-opus-5-5       -> claude-github-copilot-co-5-5
 
-[aliases."claude-opus-frank"]
-opencode = "opencode-go/glm-5.3"
-display_name = "Opus (GLM 5.3 via Go)"
+[aliases."claude-github-copilot-cs-5"]
+opencode = "github-copilot/claude-sonnet-5"
+display_name = "Claude Sonnet 5 (github-copilot)"
+
+[aliases."claude-github-copilot-cs-5-5"]
+opencode = "github-copilot/claude-sonnet-5.5"
+display_name = "Claude Sonnet 5.5 (github-copilot)"
+
+[aliases."claude-github-copilot-co-4-8"]
+opencode = "github-copilot/claude-opus-4.8"
+display_name = "Claude Opus 4.8 (github-copilot)"
+
+[aliases."claude-github-copilot-co-4-8-fast"]
+opencode = "github-copilot/claude-opus-4.8-fast"
+display_name = "Claude Opus 4.8 Fast (github-copilot)"
+
+[aliases."claude-github-copilot-co-5"]
+opencode = "github-copilot/claude-opus-5"
+display_name = "Claude Opus 5 (github-copilot)"
+
+[aliases."claude-github-copilot-co-5-5"]
+opencode = "github-copilot/claude-opus-5.5"
+display_name = "Claude Opus 5.5 (github-copilot)"
+
 
 # Refs (gateway id or opencode ref) hidden from /v1/models.
 [disabled]
