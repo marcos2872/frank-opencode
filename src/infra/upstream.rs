@@ -132,6 +132,10 @@ fn block_text(b: &Value) -> Option<String> {
 /// Convert an Anthropic `/v1/messages` body into an OpenAI `/chat/completions` body.
 pub fn anthropic_to_openai(body: &Value, upstream_model: &str) -> Value {
     let mut messages: Vec<Value> = Vec::new();
+    // `tool_use` ids dropped for having no name: their `tool_result` must be
+    // dropped too, or the upstream sees an orphan `tool` message referencing a
+    // call that was never sent.
+    let mut dropped_tool_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     // system: string | array of text blocks -> single system message.
     if let Some(sys) = body.get("system") {
@@ -186,14 +190,28 @@ pub fn anthropic_to_openai(body: &Value, upstream_model: &str) -> Value {
                                 }
                             }
                             Some("tool_use") => {
-                                tool_calls.push(serde_json::json!({
-                                    "id": b.get("id").cloned().unwrap_or(Value::String("call_0".into())),
-                                    "type": "function",
-                                    "function": {
-                                        "name": b.get("name").cloned().unwrap_or(Value::String("".into())),
-                                        "arguments": serde_json::to_string(b.get("input").unwrap_or(&Value::Object(Default::default()))).unwrap_or_else(|_| "{}".into())
+                                // A `tool_use` without a name has no valid OpenAI
+                                // form: strict upstreams reject it with
+                                // `tool_calls[].function.name` missing. Drop it
+                                // (and its `tool_result` below) instead of
+                                // poisoning every later turn of the session.
+                                let name = b.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                                if name.is_empty() {
+                                    if let Some(id) = b.get("id").and_then(|x| x.as_str()) {
+                                        if !id.is_empty() {
+                                            dropped_tool_ids.insert(id.to_string());
+                                        }
                                     }
-                                }));
+                                } else {
+                                    tool_calls.push(serde_json::json!({
+                                        "id": b.get("id").cloned().unwrap_or(Value::String("call_0".into())),
+                                        "type": "function",
+                                        "function": {
+                                            "name": name,
+                                            "arguments": serde_json::to_string(b.get("input").unwrap_or(&Value::Object(Default::default()))).unwrap_or_else(|_| "{}".into())
+                                        }
+                                    }));
+                                }
                             }
                             Some("tool_result") => {
                                 let id = b
@@ -201,6 +219,12 @@ pub fn anthropic_to_openai(body: &Value, upstream_model: &str) -> Value {
                                     .and_then(|x| x.as_str())
                                     .unwrap_or("")
                                     .to_string();
+                                // Skip the result of a `tool_use` we dropped for
+                                // missing a name (see above); otherwise the `tool`
+                                // message would reference a call never sent.
+                                if dropped_tool_ids.contains(&id) {
+                                    continue;
+                                }
                                 let (txt, nested_images, _) = tool_result_parts(b);
                                 tool_results.push((id, txt, nested_images));
                             }
@@ -640,6 +664,10 @@ pub fn openai_to_anthropic(resp: &Value, gateway_model: &str) -> Value {
 
 /// Convert an Anthropic `/v1/messages` body into an OpenAI `/responses` body.
 pub fn anthropic_to_responses(body: &Value, upstream_model: &str) -> Value {
+    // `tool_use` ids dropped for having no name (see `anthropic_to_openai`): the
+    // matching `tool_result` must be dropped too, or Responses sees an orphan
+    // `function_call_output`.
+    let mut dropped_tool_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut input: Vec<Value> = vec![];
     if let Some(msgs) = body.get("messages").and_then(|m| m.as_array()) {
         for m in msgs {
@@ -674,12 +702,21 @@ pub fn anthropic_to_responses(body: &Value, upstream_model: &str) -> Value {
                                 }
                             }
                             Some("tool_use") => {
-                                calls.push(serde_json::json!({
-                                    "type": "function_call",
-                                    "call_id": b.get("id").cloned().unwrap_or(Value::String("call_0".into())),
-                                    "name": b.get("name").cloned().unwrap_or(Value::String("".into())),
-                                    "arguments": serde_json::to_string(b.get("input").unwrap_or(&Value::Object(Default::default()))).unwrap_or_else(|_| "{}".into())
-                                }));
+                                let name = b.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                                if name.is_empty() {
+                                    if let Some(id) = b.get("id").and_then(|x| x.as_str()) {
+                                        if !id.is_empty() {
+                                            dropped_tool_ids.insert(id.to_string());
+                                        }
+                                    }
+                                } else {
+                                    calls.push(serde_json::json!({
+                                        "type": "function_call",
+                                        "call_id": b.get("id").cloned().unwrap_or(Value::String("call_0".into())),
+                                        "name": name,
+                                        "arguments": serde_json::to_string(b.get("input").unwrap_or(&Value::Object(Default::default()))).unwrap_or_else(|_| "{}".into())
+                                    }));
+                                }
                             }
                             Some("tool_result") => {
                                 let id = b
@@ -687,6 +724,9 @@ pub fn anthropic_to_responses(body: &Value, upstream_model: &str) -> Value {
                                     .and_then(|x| x.as_str())
                                     .unwrap_or("")
                                     .to_string();
+                                if dropped_tool_ids.contains(&id) {
+                                    continue;
+                                }
                                 let (txt, _, nested_images) = tool_result_parts(b);
                                 outputs.push(serde_json::json!({
                                     "type": "function_call_output",
@@ -1119,6 +1159,9 @@ pub struct ToolBlock {
     pub name: String,
     pub started: bool,
     pub closed: bool,
+    /// `arguments` seen before the block opened (name not known yet). Flushed
+    /// as one `input_json_delta` when the name arrives.
+    pub pending_args: String,
 }
 
 impl StreamTranslator {
@@ -1211,36 +1254,58 @@ impl StreamTranslator {
                         block.id = id.to_string();
                     }
                 }
-                if let Some(f) = tc.get("function") {
-                    if let Some(name) = f.get("name").and_then(|x| x.as_str()) {
-                        if !name.is_empty() {
-                            block.name = name.to_string();
-                        }
+                if let Some(name) = tc
+                    .get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(|x| x.as_str())
+                {
+                    if !name.is_empty() && block.name.is_empty() {
+                        block.name = name.to_string();
                     }
                 }
-                if !block.started && has_identity {
-                    block.started = true;
-                    if block.id.is_empty() {
-                        block.id = format!("toolu_{idx}");
-                    }
-                    let bi = block.index;
-                    let id = block.id.clone();
-                    let name = block.name.clone();
-                    out.push(sse(&serde_json::json!({
-                        "type": "content_block_start", "index": bi,
-                        "content_block": {"type": "tool_use", "id": id, "name": name, "input": {}}
-                    })));
-                }
-                if let Some(args) = tc
+                let args = tc
                     .get("function")
                     .and_then(|f| f.get("arguments"))
-                    .and_then(|a| a.as_str())
-                {
-                    if !args.is_empty() && block.started {
+                    .and_then(|a| a.as_str());
+                if !block.started {
+                    // Anthropic `tool_use` requires a non-empty name, so never
+                    // open the block until the name is known even when the id or
+                    // arguments arrive first. Arguments seen beforehand are
+                    // buffered; opening here flushes them in order. If the
+                    // upstream never names the tool, `finish` drops the block so
+                    // the client never records a nameless `tool_use` (which a
+                    // strict upstream would reject as `tool_calls[].function.name`
+                    // on the next turn).
+                    if !block.name.is_empty() {
+                        block.started = true;
+                        if block.id.is_empty() {
+                            block.id = format!("toolu_{idx}");
+                        }
+                        let bi = block.index;
+                        let id = block.id.clone();
+                        let name = block.name.clone();
+                        out.push(sse(&serde_json::json!({
+                            "type": "content_block_start", "index": bi,
+                            "content_block": {"type": "tool_use", "id": id, "name": name, "input": {}}
+                        })));
+                        if !block.pending_args.is_empty() {
+                            let partial = std::mem::take(&mut block.pending_args);
+                            out.push(sse(&serde_json::json!({
+                                "type": "content_block_delta", "index": bi,
+                                "delta": {"type": "input_json_delta", "partial_json": partial}
+                            })));
+                        }
+                    } else if let Some(a) = args {
+                        if !a.is_empty() {
+                            block.pending_args.push_str(a);
+                        }
+                    }
+                } else if let Some(a) = args {
+                    if !a.is_empty() {
                         let bi = block.index;
                         out.push(sse(&serde_json::json!({
                             "type": "content_block_delta", "index": bi,
-                            "delta": {"type": "input_json_delta", "partial_json": args}
+                            "delta": {"type": "input_json_delta", "partial_json": a}
                         })));
                     }
                 }
@@ -1263,6 +1328,8 @@ impl StreamTranslator {
             ));
         }
         for b in &self.tool_blocks {
+            // Blocks never started (a nameless `tool_use` we refused to open)
+            // emit nothing: closing a block that never began is invalid.
             if b.started && !b.closed {
                 out.push(sse(
                     &serde_json::json!({"type": "content_block_stop", "index": b.index}),
@@ -1621,6 +1688,59 @@ mod tests {
     }
 
     #[test]
+    fn nameless_tool_use_is_dropped_with_its_result() {
+        // A `tool_use` with no name has no valid OpenAI/Responses form; it is
+        // dropped and its `tool_result` too, so the upstream never sees
+        // `function.name: ""` nor an orphan tool output.
+        let body = serde_json::json!({
+            "model": "x",
+            "messages": [
+                {"role": "user", "content": "go"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "t0", "input": {}},
+                    {"type": "tool_use", "id": "t1", "name": "Read", "input": {"p": "a"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t0", "content": "ghost"},
+                    {"type": "tool_result", "tool_use_id": "t1", "content": "ok"}
+                ]}
+            ],
+            "max_tokens": 10
+        });
+
+        let oai = anthropic_to_openai(&body, "up");
+        let msgs = oai["messages"].as_array().unwrap();
+        let calls = msgs
+            .iter()
+            .find(|m| m.get("tool_calls").is_some())
+            .expect("named tool_call kept")
+            .get("tool_calls")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert_eq!(calls.len(), 1, "{msgs:?}");
+        assert_eq!(calls[0]["function"]["name"], "Read");
+        let tools: Vec<&Value> = msgs.iter().filter(|m| m["role"] == "tool").collect();
+        assert_eq!(tools.len(), 1, "only the kept result survives: {msgs:?}");
+        assert_eq!(tools[0]["tool_call_id"], "t1");
+
+        let resp = anthropic_to_responses(&body, "up");
+        let input = resp["input"].as_array().unwrap();
+        let fcalls: Vec<&Value> = input
+            .iter()
+            .filter(|i| i["type"] == "function_call")
+            .collect();
+        assert_eq!(fcalls.len(), 1, "{input:?}");
+        assert_eq!(fcalls[0]["name"], "Read");
+        let fouts: Vec<&Value> = input
+            .iter()
+            .filter(|i| i["type"] == "function_call_output")
+            .collect();
+        assert_eq!(fouts.len(), 1, "no orphan function_call_output: {input:?}");
+        assert_eq!(fouts[0]["call_id"], "t1");
+    }
+
+    #[test]
     fn tool_result_error_and_images_survive_translation() {
         let body = serde_json::json!({
             "model": "x",
@@ -1872,10 +1992,10 @@ mod tests {
     }
 
     #[test]
-    fn stream_translator_opens_tool_when_args_arrive_first() {
-        // Strict gateways may stream arguments before the id/name. The block
-        // must still open (with a generated id/name), and the text block keeps
-        // index 0 so tool indices stay monotonic.
+    fn stream_translator_buffers_args_until_name_arrives() {
+        // Strict gateways may stream arguments before the id/name. Anthropic
+        // `tool_use` requires a name, so the block must NOT open on args alone;
+        // the arguments are buffered and flushed once the name shows up.
         let mut t = StreamTranslator::new("gw");
         let _ = t.prefix();
         let ev = t.feed(&serde_json::json!({
@@ -1883,17 +2003,55 @@ mod tests {
                 {"index": 0, "function": {"arguments": "{\"p\":"}}
             ]}}]
         }));
+        assert!(
+            !ev.iter().any(|e| e.contains("tool_use")),
+            "nameless tool block must not open: {ev:?}"
+        );
+        // The name arrives (name-only delta, no args): block opens and the
+        // buffered arguments are flushed right after the start.
+        let ev = t.feed(&serde_json::json!({
+            "choices": [{"delta": {"tool_calls": [
+                {"index": 0, "function": {"name": "Read"}}
+            ]}}]
+        }));
         let started = ev
             .iter()
             .find(|e| e.contains("content_block_start") && e.contains("tool_use"))
-            .expect("tool block opened from arguments alone");
+            .expect("tool block opens once named");
         assert!(started.contains("\"index\":1"), "{started}");
-        assert!(ev.iter().any(|e| e.contains("input_json_delta")));
+        assert!(started.contains("\"name\":\"Read\""), "{started}");
+        assert!(
+            ev.iter()
+                .any(|e| e.contains("input_json_delta") && e.contains("{\\\"p\\\":")),
+            "buffered args flushed on open: {ev:?}"
+        );
         // Second (text) delta still lands on index 0, not on the tool block.
         let ev = t.feed(&serde_json::json!({"choices": [{"delta": {"content": "x"}}]}));
         assert!(ev
             .iter()
             .any(|e| e.contains("\"index\":0") && e.contains("text_delta")));
+    }
+
+    #[test]
+    fn stream_translator_drops_tool_never_named() {
+        // If the name never arrives, the block is never opened and `finish`
+        // emits no tool block at all — the client must not record a nameless
+        // `tool_use` that a strict upstream would reject next turn.
+        let mut t = StreamTranslator::new("gw");
+        let _ = t.prefix();
+        let ev = t.feed(&serde_json::json!({
+            "choices": [{"delta": {"tool_calls": [
+                {"index": 0, "id": "call_1", "function": {"arguments": "{\"a\":1}"}}
+            ]}}]
+        }));
+        assert!(!ev.iter().any(|e| e.contains("tool_use")), "{ev:?}");
+        assert!(!t.tool_blocks[0].started);
+        let end = t.finish("tool_use", 0, 3);
+        assert!(
+            !end.iter().any(|e| e.contains("content_block_start"))
+                && !end.iter().any(|e| e.contains("\"type\":\"tool_use\"")),
+            "finish must not surface a nameless tool block: {end:?}"
+        );
     }
 
     #[test]
