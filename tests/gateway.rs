@@ -1554,10 +1554,7 @@ async fn e2e_count_tokens_non_anthropic_estimates_locally() {
 #[tokio::test]
 async fn e2e_upstream_error_shape_preserved() {
     let mock = MockUpstream {
-        chat_error: Some((
-            400,
-            "{\"error\":{\"message\":\"bad prompt\"}}".to_string(),
-        )),
+        chat_error: Some((400, "{\"error\":{\"message\":\"bad prompt\"}}".to_string())),
         ..MockUpstream::default()
     };
     let base = spawn_mock(mock.clone()).await;

@@ -111,11 +111,7 @@ fn protocol_table_routes_packages() {
             Protocol::Anthropic,
             true,
         ),
-        (
-            "@opencode/ai/providers/openai",
-            Protocol::Responses,
-            true,
-        ),
+        ("@opencode/ai/providers/openai", Protocol::Responses, true),
         (
             "@opencode/ai/providers/openai/responses",
             Protocol::Responses,
@@ -202,7 +198,10 @@ fn chat_translation_conversation_shape() {
     assert_eq!(out["model"], "up-model");
     let messages = out["messages"].as_array().unwrap();
     assert_eq!(messages.len(), 4);
-    assert_eq!(messages[0], json!({"role": "system", "content": "be concise"}));
+    assert_eq!(
+        messages[0],
+        json!({"role": "system", "content": "be concise"})
+    );
     assert_eq!(messages[1], json!({"role": "user", "content": "hi"}));
     // Assistant turn keeps its text and carries the tool calls.
     assert_eq!(messages[2]["role"], "assistant");
@@ -333,7 +332,10 @@ fn responses_translation_conversation_shape() {
     assert_eq!(out["instructions"], "be concise");
     assert_eq!(out["max_output_tokens"], 64);
     let input = out["input"].as_array().unwrap();
-    assert_eq!(input[0]["content"][0], json!({"type": "input_text", "text": "hi"}));
+    assert_eq!(
+        input[0]["content"][0],
+        json!({"type": "input_text", "text": "hi"})
+    );
     assert_eq!(
         input[1]["content"][0],
         json!({"type": "output_text", "text": "looking"})
@@ -582,9 +584,7 @@ fn chat_stream_translator_full_sequence() {
 fn responses_stream_translator_full_sequence() {
     let mut t = ResponsesTranslator::new("gw-model");
     let mut frames = t.prefix();
-    frames.extend(t.feed(
-        &json!({"type": "response.output_text.delta", "delta": "hi"}),
-    ));
+    frames.extend(t.feed(&json!({"type": "response.output_text.delta", "delta": "hi"})));
     frames.extend(t.feed(&json!({
         "type": "response.output_item.added",
         "output_index": 1,
@@ -652,8 +652,18 @@ fn join_url_trims_slashes_on_both_sides() {
 fn auto_aliases_keep_collision_and_fast_rows_distinct() {
     // `v4.1` vs `v4-1` slug to the same id; the first row keeps the base
     // alias and the second gets a numeric suffix — both must survive.
-    let a = catalog_row("opencode-go", "deepseek-v4.1-flash", "deepseek-v4.1-flash", "p");
-    let b = catalog_row("opencode-go", "deepseek-v4-1-flash", "deepseek-v4-1-flash", "p");
+    let a = catalog_row(
+        "opencode-go",
+        "deepseek-v4.1-flash",
+        "deepseek-v4.1-flash",
+        "p",
+    );
+    let b = catalog_row(
+        "opencode-go",
+        "deepseek-v4-1-flash",
+        "deepseek-v4-1-flash",
+        "p",
+    );
     let aliases = auto_aliases_for(&[a, b], false);
     assert_eq!(aliases.len(), 2);
     assert_eq!(
@@ -671,10 +681,7 @@ fn auto_aliases_keep_collision_and_fast_rows_distinct() {
         "claude-opus-4.8",
         "p",
     );
-    assert_eq!(
-        fast.preferred_ref(),
-        "github-copilot/claude-opus-4.8-fast"
-    );
+    assert_eq!(fast.preferred_ref(), "github-copilot/claude-opus-4.8-fast");
 }
 
 #[test]
@@ -685,7 +692,10 @@ fn evaded_aliases_hide_blocked_token_but_keep_ref() {
         "deepseek-v4.1-flash",
         "p",
     );
-    assert_eq!(evade_desktop_blocklist("deepseek-v4.1-flash"), "d-eepseek-v4.1-flash");
+    assert_eq!(
+        evade_desktop_blocklist("deepseek-v4.1-flash"),
+        "d-eepseek-v4.1-flash"
+    );
     let aliases = auto_aliases_for(std::slice::from_ref(&e), true);
     assert_eq!(aliases.len(), 1);
     assert!(!aliases[0].gateway_id.to_lowercase().contains("deepseek"));

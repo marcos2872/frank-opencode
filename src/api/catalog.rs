@@ -220,6 +220,4 @@ impl AppState {
         tracing::warn!(%msg);
         n.max(0) as usize
     }
-
-    /// Single source of truth for the default model (config or first alias).
 }
