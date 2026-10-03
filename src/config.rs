@@ -20,6 +20,47 @@ pub struct DisabledConfig {
     pub models: Vec<String>,
 }
 
+/// Anthropic family tier advertised on `/v1/models` (`anthropic_family_tier`).
+/// Claude Desktop's background calls (session-title generation, `small_fast`
+/// class) pick the first discovered model with tier `haiku`, then `sonnet`,
+/// then `opus`. Without tiers the Desktop falls back to id substring
+/// matching, which resolves to whichever `*sonnet*` row sorts first (today
+/// the Copilot row) — burning its quota on title generation. Any other string
+/// is a config load error (fail fast, like the rest of this file).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Tier {
+    Haiku,
+    Sonnet,
+    Opus,
+    Fable,
+    Mythos,
+}
+
+impl Tier {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Tier::Haiku => "haiku",
+            Tier::Sonnet => "sonnet",
+            Tier::Opus => "opus",
+            Tier::Fable => "fable",
+            Tier::Mythos => "mythos",
+        }
+    }
+}
+
+/// Tier mapping for one model. The table key matches a gateway id or an
+/// OpenCode ref (`provider/model`), same as `[disabled]`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TierConfig {
+    /// One of `haiku` / `sonnet` / `opus` / `fable` / `mythos`.
+    pub tier: Tier,
+    /// Winner when several aliases share the tier (Desktop picks the first
+    /// flagged; unflagged ties fall back to list order).
+    #[serde(default)]
+    pub family_default: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     #[serde(default = "default_port")]
@@ -36,6 +77,12 @@ pub struct AppConfig {
     pub aliases: HashMap<String, AliasConfig>,
     #[serde(default)]
     pub disabled: DisabledConfig,
+    /// Anthropic family tiers advertised on `/v1/models`
+    /// (`anthropic_family_tier` + `is_family_default`). Key = gateway id or
+    /// OpenCode ref (`provider/model`), matched like `[disabled]`. Unmapped
+    /// aliases announce no tier (current behavior, nothing breaks).
+    #[serde(default)]
+    pub tiers: HashMap<String, TierConfig>,
     /// Include Console free-tier (`opencode/*`, public key) models.
     /// They 403 outside OpenCode, so they are hidden by default.
     #[serde(default)]
@@ -92,6 +139,7 @@ impl Default for AppConfig {
             opencode_bin: "opencode".to_string(),
             aliases: HashMap::new(),
             disabled: DisabledConfig::default(),
+            tiers: HashMap::new(),
             include_free_tier: false,
             desktop_aliases: false,
             mock_classifier: false,
@@ -154,6 +202,15 @@ impl AppConfig {
             .iter()
             .any(|d| d == opencode_ref || d == gateway_id)
     }
+
+    /// Tier mapping for an alias: gateway id first, then the OpenCode ref
+    /// (mirrors `is_disabled` matching so manual renames keep working).
+    pub fn tier_for(&self, opencode_ref: &str, gateway_id: &str) -> Option<TierConfig> {
+        self.tiers
+            .get(gateway_id)
+            .or_else(|| self.tiers.get(opencode_ref))
+            .cloned()
+    }
 }
 
 #[cfg(test)]
@@ -203,5 +260,43 @@ opencode = "opencode-go/kimi-k2.7-code"
         assert!(!off.mock_classifier);
         let on: AppConfig = toml::from_str("mock_classifier = true\n").unwrap();
         assert!(on.mock_classifier);
+    }
+
+    #[test]
+    fn tiers_default_empty_and_parse() {
+        assert!(AppConfig::default().tiers.is_empty());
+        let cfg: AppConfig = toml::from_str(
+            r#"
+[tiers."claude-opencode-go-muse-spark-1-3-contributor"]
+tier = "haiku"
+family_default = true
+[tiers."github-copilot/claude-sonnet-5"]
+tier = "sonnet"
+"#,
+        )
+        .unwrap();
+        let fast = cfg
+            .tier_for(
+                "opencode-go/muse-spark-1-3-contributor",
+                "claude-opencode-go-muse-spark-1-3-contributor",
+            )
+            .unwrap();
+        assert_eq!(fast.tier, Tier::Haiku);
+        assert!(fast.family_default);
+        let copilot = cfg
+            .tier_for("github-copilot/claude-sonnet-5", "claude-x")
+            .unwrap();
+        assert_eq!(copilot.tier, Tier::Sonnet);
+        assert!(!copilot.family_default);
+        // Unknown keys are valid TOML but no mapping matches.
+        assert!(cfg.tier_for("other/model", "claude-y").is_none());
+    }
+
+    #[test]
+    fn tier_rejects_unknown_label() {
+        let err = toml::from_str::<AppConfig>("[tiers.x]\ntier = \"turbo\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("turbo"), "{err}");
     }
 }

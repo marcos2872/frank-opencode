@@ -100,6 +100,13 @@ default_model = "claude-opencode-go-muse-spark-1-3-contributor"
 # Lista todos os modelos no picker do Claude Desktop
 # (reescreve deepseek -> d-eepseek etc. só no id anunciado)
 desktop_aliases = true
+
+# Direciona as chamadas de fundo do Desktop (títulos de sessão, classe
+# small_fast) para o modelo barato em vez do primeiro *sonnet* alfabético
+# (hoje o Copilot). Ver README "Tiers da família Anthropic".
+[tiers."claude-opencode-go-muse-spark-1-3-contributor"]
+tier = "haiku"
+family_default = true
 ```
 
 e reinicie o gateway + o Desktop. Só o id anunciado muda

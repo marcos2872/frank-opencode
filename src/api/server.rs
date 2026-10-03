@@ -134,7 +134,7 @@ impl AppState {
                     .iter()
                     .find(|e| e.qualified() == a.opencode)
                     .and_then(|e| e.context_window());
-                AliasEntry {
+                let mut alias = AliasEntry {
                     gateway_id: gw.clone(),
                     opencode_ref: a.opencode.clone(),
                     display_name: a.display_name.clone().unwrap_or_else(|| gw.clone()),
@@ -143,7 +143,11 @@ impl AppState {
                         .clone()
                         .unwrap_or_else(|| format!("via frank-opencode · {}", a.opencode)),
                     context_window: window,
-                }
+                    family_tier: None,
+                    family_default: false,
+                };
+                self.apply_tier(&mut alias);
+                alias
             })
             .collect();
         manual.sort_by(|a, b| a.gateway_id.cmp(&b.gateway_id));
@@ -176,7 +180,8 @@ impl AppState {
         // `auto_aliases_for` already dedups, but manual ids win).
         let mut taken: std::collections::HashSet<String> =
             aliases.iter().map(|a| a.gateway_id.clone()).collect();
-        for a in auto {
+        for mut a in auto {
+            self.apply_tier(&mut a);
             if taken.insert(a.gateway_id.clone()) {
                 aliases.push(a);
             } else {
@@ -250,6 +255,15 @@ impl AppState {
         *self.last_error.write().await = Some(msg.clone());
         tracing::warn!(%msg);
         n.max(0) as usize
+    }
+
+    /// Fill the Anthropic family tier on an alias from `[tiers]` config.
+    /// Gateway id wins over the OpenCode ref; unmapped aliases keep no tier.
+    fn apply_tier(&self, alias: &mut AliasEntry) {
+        if let Some(t) = self.config.tier_for(&alias.opencode_ref, &alias.gateway_id) {
+            alias.family_tier = Some(t.tier.as_str().to_string());
+            alias.family_default = t.family_default;
+        }
     }
 
     /// Single source of truth for the default model (config or first alias).
@@ -492,6 +506,18 @@ async fn list_models(State(s): State<AppState>) -> impl IntoResponse {
                 // matching, so the internal gateway_id is untouched.
                 if let Some(sfx) = window_suffix(w) {
                     item["id"] = Value::String(format!("{a}{sfx}", a = a.gateway_id));
+                }
+            }
+            // Anthropic family tier from `[tiers]` config. Claude Desktop's
+            // `small_fast` background class (session titles) picks the first
+            // `haiku` model; without a tier it falls back to id substring
+            // matching and lands on the first `*sonnet*` row. `is_family_default`
+            // is only honored by the Desktop together with a tier, so both
+            // are emitted (or neither) for the flagged alias.
+            if let Some(tier) = &a.family_tier {
+                item["anthropic_family_tier"] = Value::String(tier.clone());
+                if a.family_default {
+                    item["is_family_default"] = Value::Bool(true);
                 }
             }
             item

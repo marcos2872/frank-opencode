@@ -50,6 +50,8 @@ fn alias(gateway: &str, opencode_ref: &str) -> AliasEntry {
         display_name: gateway.to_string(),
         description: "test".to_string(),
         context_window: None,
+        family_tier: None,
+        family_default: false,
     }
 }
 
@@ -150,6 +152,47 @@ async fn models_expose_context_window_when_catalog_knows_it() {
     let item = &data["data"][0];
     assert_eq!(item["id"], "claude-z");
     assert_eq!(item["context_window"], 128_000);
+}
+
+#[tokio::test]
+async fn models_announce_anthropic_family_tier_only_when_mapped() {
+    // A tiered alias emits `anthropic_family_tier` (and `is_family_default`
+    // when flagged); unmapped aliases omit both so Desktop keeps its current
+    // substring fallback.
+    let mut fast = alias("claude-spark", "opencode-go/muse-spark");
+    fast.family_tier = Some("haiku".to_string());
+    fast.family_default = true;
+    let plain = alias("claude-other", "other/model");
+    let state = seeded_state(test_config(), vec![], vec![plain, fast]).await;
+    let server = axum_test::TestServer::new(router(state)).unwrap();
+    let data: Value = server
+        .get("/v1/models")
+        .add_header("x-api-key", "test-secret")
+        .await
+        .json();
+    // Aliases sort by gateway_id: claude-other first, claude-spark second.
+    let other = &data["data"][0];
+    assert!(other.get("anthropic_family_tier").is_none(), "{other}");
+    assert!(other.get("is_family_default").is_none(), "{other}");
+    let spark = &data["data"][1];
+    assert_eq!(spark["anthropic_family_tier"], "haiku");
+    assert_eq!(spark["is_family_default"], true);
+
+    // Tier without the default flag omits `is_family_default` (the Desktop
+    // only honors the flag together with a tier — same rule as its own
+    // `inferenceModels` entries).
+    let mut sonnet = alias("claude-copilot", "github-copilot/claude-sonnet-5");
+    sonnet.family_tier = Some("sonnet".to_string());
+    let state = seeded_state(test_config(), vec![], vec![sonnet]).await;
+    let server = axum_test::TestServer::new(router(state)).unwrap();
+    let data: Value = server
+        .get("/v1/models")
+        .add_header("x-api-key", "test-secret")
+        .await
+        .json();
+    let item = &data["data"][0];
+    assert_eq!(item["anthropic_family_tier"], "sonnet");
+    assert!(item.get("is_family_default").is_none(), "{item}");
 }
 
 #[tokio::test]
