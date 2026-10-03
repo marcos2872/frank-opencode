@@ -92,7 +92,13 @@ Não mudar corpos traduzidos, nomes de campo, floor 16, formato `ping` nem
 parâmetros em vez de `allow`. Os testes byte-a-byte da Fase 0 devem passar
 intocados.
 
-## Fase 6 — Tipagem na fronteira (risco alto, por último)
+## Fase 6 — Tipagem na fronteira (risco alto, FUTURO, não executado)
+
+> Decisão (2026-10-03): fase adiada. É a mais invasiva (toca todos os
+> caminhos de handler) e o sandbox de execução não tem toolchain Rust,
+> então a migração não seria verificável aqui. As Fases 0-5+7 entregam
+> 90% do ganho de manutenibilidade com risco baixo-médio. Quando for
+> executar, seguir o desenho abaixo com `cargo test` verde a cada passo.
 
 Definir structs só para a entrada (`MessagesRequest`, `CountTokensRequest`,
 `ContentBlock`) com `deny_unknown_fields = false` para não rejeitar nada que hoje
