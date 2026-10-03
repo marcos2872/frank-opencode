@@ -693,8 +693,10 @@ async fn e2e_fast_flavor_keeps_distinct_alias_and_headers() {
     // Aliases built the same way `refresh()` does: no duplicate ids.
     // Shield off here: this test covers fast-flavor disambiguation, not the
     // CLI family shield (covered by the domain shield tests).
-    let aliases =
-        frank_opencode::domain::auto_aliases_for(&[normal.clone(), fast.clone()], false, false);
+    let aliases = frank_opencode::domain::auto_aliases_for(
+        &[normal.clone(), fast.clone()],
+        frank_opencode::domain::AliasOptions::default(),
+    );
     assert_eq!(aliases.len(), 2);
     assert_ne!(aliases[0].gateway_id, aliases[1].gateway_id);
     let state = seeded_state(test_config(), vec![normal, fast], aliases.clone()).await;

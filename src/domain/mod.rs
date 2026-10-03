@@ -469,23 +469,18 @@ pub fn slugify(s: &str) -> String {
     out.trim_matches('-').to_string()
 }
 
-/// Build the automatic gateway alias for a catalog entry.
-///
-/// The `claude-` prefix is intentional: Claude Code gateway discovery only
-/// keeps `/v1/models` entries whose id contains `claude` or `anthropic`.
-pub fn auto_alias(entry: &CatalogEntry) -> AliasEntry {
-    let slug = slugify(&format!("{}-{}", entry.provider_id, entry.model_id));
-    let gateway_id = format!("claude-{slug}");
-    let opencode_ref = entry.preferred_ref();
-    AliasEntry {
-        gateway_id,
-        opencode_ref: opencode_ref.clone(),
-        display_name: format!("{} ({})", entry.name, entry.provider_id),
-        description: format!("via frank-opencode · {opencode_ref}"),
-        context_window: entry.context_window(),
-        family_tier: None,
-        family_default: false,
-    }
+/// Options controlling the automatic gateway-id rewrites in
+/// [`auto_aliases_for`]. A struct (not positional `bool`s) so call sites read
+/// as `AliasOptions { evade: true, ..Default::default() }` and a third rewrite
+/// later doesn't become a third flag.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AliasOptions {
+    /// Opt-in `desktop_aliases`: rewrite `DESKTOP_BLOCKED_TOKENS` fragments
+    /// via `evade_desktop_blocklist` before slugging.
+    pub evade: bool,
+    /// Default-on `cli_shield_aliases`: rewrite family spelling via
+    /// `shield_cli_family_match` first. Disjoint from `evade`; both compose.
+    pub shield: bool,
 }
 
 /// Build automatic aliases for a batch, guaranteeing unique `gateway_id`s.
@@ -497,16 +492,16 @@ pub fn auto_alias(entry: &CatalogEntry) -> AliasEntry {
 /// fall back to `provider-id` and then numeric suffixes. Callers must still
 /// dedup against manual aliases (see `AppState::refresh`).
 ///
-/// When `evade` is set (opt-in `desktop_aliases` config for Claude Desktop,
-/// whose bundled denylist drops discovered ids containing third-party model
-/// tokens), the model/id fragments are rewritten via
-/// `evade_desktop_blocklist` before slugging. When `shield` is set (default-on
-/// `cli_shield_aliases` config for the Claude Code CLI, which resolves
-/// background models by id-substring family spelling), the fragments are
-/// rewritten via `shield_cli_family_match` first. The rewrites are disjoint
-/// and compose. `opencode_ref`, display names and resolution are unaffected:
-/// only the advertised `gateway_id` changes.
-pub fn auto_aliases_for(entries: &[CatalogEntry], evade: bool, shield: bool) -> Vec<AliasEntry> {
+/// When `opts.evade` is set (opt-in `desktop_aliases` config for Claude
+/// Desktop, whose bundled denylist drops discovered ids containing
+/// third-party model tokens), the model/id fragments are rewritten via
+/// `evade_desktop_blocklist` before slugging. When `opts.shield` is set
+/// (default-on `cli_shield_aliases` config for the Claude Code CLI, which
+/// resolves background models by id-substring family spelling), the fragments
+/// are rewritten via `shield_cli_family_match` first. The rewrites are
+/// disjoint and compose. `opencode_ref`, display names and resolution are
+/// unaffected: only the advertised `gateway_id` changes.
+pub fn auto_aliases_for(entries: &[CatalogEntry], opts: AliasOptions) -> Vec<AliasEntry> {
     use std::collections::HashSet;
     let mut sorted: Vec<&CatalogEntry> = entries.iter().collect();
     sorted.sort_by(|a, b| {
@@ -520,18 +515,18 @@ pub fn auto_aliases_for(entries: &[CatalogEntry], evade: bool, shield: bool) -> 
         // Shield first (family spelling), then evade (blocklist tokens):
         // disjoint rewrites that compose (`co-4-8` never contains a blocked
         // token, and `d-eepseek` never contains a family spelling).
-        let shielded_model = if shield {
+        let shielded_model = if opts.shield {
             shield_cli_family_match(&e.model_id)
         } else {
             e.model_id.clone()
         };
-        let model_part = if evade {
+        let model_part = if opts.evade {
             evade_desktop_blocklist(&shielded_model)
         } else {
             shielded_model
         };
         let shielded_id = if !e.id.is_empty() {
-            if shield {
+            if opts.shield {
                 shield_cli_family_match(&e.id)
             } else {
                 e.id.clone()
@@ -540,7 +535,7 @@ pub fn auto_aliases_for(entries: &[CatalogEntry], evade: bool, shield: bool) -> 
             String::new()
         };
         let id_part = if !shielded_id.is_empty() {
-            if evade {
+            if opts.evade {
                 evade_desktop_blocklist(&shielded_id)
             } else {
                 shielded_id
@@ -654,7 +649,9 @@ mod tests {
             headers: None,
             body: None,
         };
-        let a = auto_alias(&e);
+        let aliases = auto_aliases_for(&[e], AliasOptions::default());
+        assert_eq!(aliases.len(), 1);
+        let a = &aliases[0];
         assert!(a.gateway_id.contains("claude"));
         assert_eq!(a.opencode_ref, "opencode-go/kimi-k2.7-code");
         assert_eq!(a.context_window, None);
@@ -901,7 +898,7 @@ mod tests {
             .collect(),
         );
         fast.body = Some(serde_json::json!({"speed": "fast"}));
-        let aliases = auto_aliases_for(&[normal, fast], false, false);
+        let aliases = auto_aliases_for(&[normal, fast], AliasOptions::default());
         assert_eq!(aliases.len(), 2);
         let ids: Vec<&str> = aliases.iter().map(|a| a.gateway_id.as_str()).collect();
         // No duplicates.
@@ -933,7 +930,7 @@ mod tests {
             "deepseek-v4-1-flash",
             "B",
         );
-        let aliases = auto_aliases_for(&[a, b], false, false);
+        let aliases = auto_aliases_for(&[a, b], AliasOptions::default());
         assert_eq!(aliases.len(), 2);
         assert_ne!(aliases[0].gateway_id, aliases[1].gateway_id);
     }
@@ -992,7 +989,7 @@ mod tests {
             .map(|(m, n)| test_entry("opencode-go", m, m, n))
             .collect();
         // Without evasion the Desktop drops all but the last one.
-        let plain = auto_aliases_for(&entries, false, false);
+        let plain = auto_aliases_for(&entries, AliasOptions::default());
         assert_eq!(
             plain
                 .iter()
@@ -1002,7 +999,13 @@ mod tests {
         );
         // With evasion every alias passes, stays unique and keeps the
         // original ref for resolution.
-        let evaded = auto_aliases_for(&entries, true, false);
+        let evaded = auto_aliases_for(
+            &entries,
+            AliasOptions {
+                evade: true,
+                ..AliasOptions::default()
+            },
+        );
         assert_eq!(evaded.len(), models.len());
         for a in &evaded {
             assert!(desktop_would_list(&a.gateway_id), "{}", a.gateway_id);
@@ -1119,7 +1122,7 @@ mod tests {
             .map(|(p, i, m, n)| test_entry(p, i, m, n))
             .collect();
         // Without the shield every family row matches the CLI's rule.
-        let plain = auto_aliases_for(&entries, false, false);
+        let plain = auto_aliases_for(&entries, AliasOptions::default());
         assert_eq!(
             plain
                 .iter()
@@ -1129,7 +1132,13 @@ mod tests {
         );
         // With the shield no advertised id matches, every row keeps a unique
         // id, and refs/display names are untouched for resolution and picker.
-        let shielded = auto_aliases_for(&entries, false, true);
+        let shielded = auto_aliases_for(
+            &entries,
+            AliasOptions {
+                shield: true,
+                ..AliasOptions::default()
+            },
+        );
         assert_eq!(shielded.len(), models.len());
         for a in &shielded {
             assert!(!cli_would_match_family(&a.gateway_id), "{}", a.gateway_id);
@@ -1178,7 +1187,13 @@ mod tests {
                 "DeepSeek",
             ),
         ];
-        let both = auto_aliases_for(&entries, true, true);
+        let both = auto_aliases_for(
+            &entries,
+            AliasOptions {
+                evade: true,
+                shield: true,
+            },
+        );
         assert_eq!(both.len(), 2);
         let by_ref = |r: &str| both.iter().find(|a| a.opencode_ref == r).unwrap();
         let copilot = by_ref("github-copilot/claude-sonnet-5");

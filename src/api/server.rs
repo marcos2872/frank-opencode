@@ -3,7 +3,7 @@
 use crate::config::AppConfig;
 use crate::domain::{
     auto_aliases_for, is_known_package, protocol_for_entry, strip_window_suffix, window_suffix,
-    AliasEntry, CatalogEntry, ModelRef, Protocol,
+    AliasEntry, AliasOptions, CatalogEntry, ModelRef, Protocol,
 };
 use crate::infra::opencode::{fetch_catalog, upstream_bearer, CredentialStore};
 use crate::infra::upstream::{
@@ -177,8 +177,10 @@ impl AppState {
             .collect();
         let mut auto: Vec<AliasEntry> = auto_aliases_for(
             &remaining,
-            self.config.desktop_aliases,
-            self.config.cli_shield_aliases,
+            AliasOptions {
+                evade: self.config.desktop_aliases,
+                shield: self.config.cli_shield_aliases,
+            },
         )
         .into_iter()
         .filter(|a| !self.config.is_disabled(&a.opencode_ref, &a.gateway_id))
@@ -709,7 +711,7 @@ async fn proxy_count_tokens(
 async fn messages(
     State(s): State<AppState>,
     headers: HeaderMap,
-    Json(mut body): Json<Value>,
+    Json(body): Json<Value>,
 ) -> Response {
     let raw = body
         .get("model")
@@ -772,45 +774,45 @@ async fn messages(
 
     match protocol_for_entry(&entry) {
         Protocol::Anthropic => {
-            forward_anthropic(
-                &s,
-                &headers,
-                &mut body,
-                &entry,
-                &base,
-                &bearer,
-                &requested,
+            forward_anthropic(ForwardCtx {
+                s: &s,
+                headers: &headers,
+                body: &body,
+                entry: &entry,
+                base: &base,
+                bearer: &bearer,
+                gateway_model: &requested,
                 stream,
-                variant.as_deref(),
-            )
+                variant: variant.as_deref(),
+            })
             .await
         }
         Protocol::Responses => {
-            forward_responses(
-                &s,
-                &headers,
-                &body,
-                &entry,
-                &base,
-                &bearer,
-                &requested,
+            forward_responses(ForwardCtx {
+                s: &s,
+                headers: &headers,
+                body: &body,
+                entry: &entry,
+                base: &base,
+                bearer: &bearer,
+                gateway_model: &requested,
                 stream,
-                variant.as_deref(),
-            )
+                variant: variant.as_deref(),
+            })
             .await
         }
         Protocol::ChatCompletions => {
-            forward_openai(
-                &s,
-                &headers,
-                &body,
-                &entry,
-                &base,
-                &bearer,
-                &requested,
+            forward_openai(ForwardCtx {
+                s: &s,
+                headers: &headers,
+                body: &body,
+                entry: &entry,
+                base: &base,
+                bearer: &bearer,
+                gateway_model: &requested,
                 stream,
-                variant.as_deref(),
-            )
+                variant: variant.as_deref(),
+            })
             .await
         }
     }
@@ -1078,18 +1080,37 @@ fn apply_entry_body(target: &mut Value, entry: &CatalogEntry) {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn forward_anthropic(
-    s: &AppState,
-    headers: &HeaderMap,
-    body: &mut Value,
-    entry: &CatalogEntry,
-    base: &str,
-    bearer: &secrecy::SecretString,
-    gateway_model: &str,
+/// Shared context for the three protocol `forward_*` functions: everything
+/// `messages()` resolved that a forward needs. A struct (not 9 positional
+/// args) so a new field doesn't become a tenth parameter.
+struct ForwardCtx<'a> {
+    s: &'a AppState,
+    headers: &'a HeaderMap,
+    body: &'a Value,
+    entry: &'a CatalogEntry,
+    base: &'a str,
+    bearer: &'a secrecy::SecretString,
+    gateway_model: &'a str,
     stream: bool,
-    variant: Option<&str>,
-) -> Response {
+    variant: Option<&'a str>,
+}
+
+async fn forward_anthropic(ctx: ForwardCtx<'_>) -> Response {
+    let ForwardCtx {
+        s,
+        headers,
+        body,
+        entry,
+        base,
+        bearer,
+        gateway_model,
+        stream,
+        variant,
+    } = ctx;
+    // The Messages API forwards client fields verbatim, so work on a copy:
+    // nothing after the forward reads the caller's body back.
+    let mut body = body.clone();
+    let body = &mut body;
     body["model"] = Value::String(entry.model_id.clone());
     // Apply the selected variant to the raw body: the Messages API forwards
     // client fields verbatim, so `thinking`/`include` land unchanged. A
@@ -1200,18 +1221,18 @@ async fn forward_anthropic(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn forward_responses(
-    s: &AppState,
-    headers: &HeaderMap,
-    body: &Value,
-    entry: &CatalogEntry,
-    base: &str,
-    bearer: &secrecy::SecretString,
-    gateway_model: &str,
-    stream: bool,
-    variant: Option<&str>,
-) -> Response {
+async fn forward_responses(ctx: ForwardCtx<'_>) -> Response {
+    let ForwardCtx {
+        s,
+        headers,
+        body,
+        entry,
+        base,
+        bearer,
+        gateway_model,
+        stream,
+        variant,
+    } = ctx;
     // Apply the selected variant to the translated body, not the raw
     // client body: the translators drop unknown fields.
     let mut resp_body = if let Some(v) = variant {
@@ -1351,18 +1372,18 @@ async fn forward_responses(
         .unwrap()
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn forward_openai(
-    s: &AppState,
-    headers: &HeaderMap,
-    body: &Value,
-    entry: &CatalogEntry,
-    base: &str,
-    bearer: &secrecy::SecretString,
-    gateway_model: &str,
-    stream: bool,
-    variant: Option<&str>,
-) -> Response {
+async fn forward_openai(ctx: ForwardCtx<'_>) -> Response {
+    let ForwardCtx {
+        s,
+        headers,
+        body,
+        entry,
+        base,
+        bearer,
+        gateway_model,
+        stream,
+        variant,
+    } = ctx;
     // Apply the selected variant to the translated body, not the raw
     // client body: the translators drop unknown fields.
     let mut oai_body = if let Some(v) = variant {
