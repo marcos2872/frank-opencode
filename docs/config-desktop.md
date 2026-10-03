@@ -129,10 +129,11 @@ sem `tools`, sem `stream`).
 
 A tabela `[tiers]` anuncia `anthropic_family_tier` (e `is_family_default` para
 o vencedor do tier) nos itens do `/v1/models`. A chave casa gateway id ou ref
-`provider/model`, como o `[disabled]`:
+`provider/model`, como o `[disabled]` — prefira a ref, que sobrevive às
+renomeações automáticas (`cli_shield_aliases`, `desktop_aliases`):
 
 ```toml
-[tiers."claude-opencode-go-muse-spark-1-3-contributor"]
+[tiers."opencode-go/muse-spark-1-3-contributor"]
 tier = "haiku"
 family_default = true
 
@@ -159,7 +160,7 @@ chat intencional.
 > `anthropicFamilyTier` que ele conhece é da config `models` do
 > managed-settings, não do discovery). Chamadas de fundo do CLI que caem no
 > Copilot não são cobertas por `[tiers]` — veja
-> [Blindando o Copilot](config-cli.md#blindando-o-copilot-contra-chamadas-de-fundo-ids-renomeados).
+> [Blindando o Copilot](config-cli.md#blindando-o-copilot-contra-chamadas-de-fundo-ids-blindados).
 
 ## Por que deve funcionar
 

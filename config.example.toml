@@ -35,29 +35,31 @@ mock_classifier = true
 
 # Anthropic family tiers advertised on /v1/models (anthropic_family_tier +
 # is_family_default). Key = gateway id or opencode ref (provider/model),
-# matched like [disabled]. Claude Desktop's background calls (session
-# titles, small_fast class) pick the first discovered haiku, then sonnet,
-# then opus — ignoring your chat model. Without a tier it falls back to id
-# substring matching and lands on the first *sonnet* row (usually Copilot),
-# burning its quota on every title (max_tokens 200, no tools). Valid tiers:
-# haiku, sonnet, opus, fable, mythos. Unmapped aliases announce no tier.
-[tiers."claude-opencode-go-muse-spark-1-3-contributor"]
+# matched like [disabled] — prefer the ref, which survives the automatic
+# cli_shield_aliases / desktop_aliases renames below. Claude Desktop's
+# background calls (session titles, small_fast class) pick the first
+# discovered haiku, then sonnet, then opus — ignoring your chat model.
+# Without a tier it falls back to id substring matching and lands on the
+# first *sonnet* row (usually Copilot), burning its quota on every title
+# (max_tokens 200, no tools). Valid tiers: haiku, sonnet, opus, fable,
+# mythos. Unmapped aliases announce no tier.
+[tiers."opencode-go/muse-spark-1-3-contributor"]
 tier = "haiku"
 family_default = true
 
-[tiers."claude-opencode-go-d-eepseek-v4-1-flash"]
+[tiers."opencode-go/deepseek-v4.1-flash"]
 tier = "sonnet"
 family_default = true
 
-[tiers."claude-opencode-go-m-imo-v2-6-flash"]
+[tiers."opencode-go/mimo-v2.6-flash"]
 tier = "opus"
 family_default = true
 #
-# [tiers."claude-opencode-go-muse-spark-1-3-contributor"]
+# [tiers."opencode-go/some-fable-model"]
 # tier = "fable"
 # family_default = true
 #
-# [tiers."claude-opencode-go-muse-spark-1-3-contributor"]
+# [tiers."opencode-go/some-mythos-model"]
 # tier = "mythos"
 # family_default = true
 
@@ -68,42 +70,21 @@ family_default = true
 connect_timeout_secs = 30
 request_timeout_secs = 3600
 
-# --- Blindando o Copilot contra chamadas de fundo (ver README) -------------
-# O CLI do Claude Code descarta anthropic_family_tier do /v1/models e resolve
-# modelos de fundo por substring do id ("claude-sonnet-*"/"claude-opus-*"),
-# que batiam nas linhas do Copilot. Ids renomeados (cs = copilot-sonnet,
-# co = copilot-opus) quebram o match; display_name e ref ficam os mesmos.
-# Ids antigos (valem 404 no /v1/models, ref direta continua resolvendo):
-#   claude-github-copilot-claude-sonnet-5       -> claude-github-copilot-cs-5
-#   claude-github-copilot-claude-sonnet-5-5     -> claude-github-copilot-cs-5-5
-#   claude-github-copilot-claude-opus-4-8       -> claude-github-copilot-co-4-8
-#   claude-github-copilot-claude-opus-4-8-fast  -> claude-github-copilot-co-4-8-fast
-#   claude-github-copilot-claude-opus-5         -> claude-github-copilot-co-5
-#   claude-github-copilot-claude-opus-5-5       -> claude-github-copilot-co-5-5
-
-[aliases."claude-github-copilot-cs-5"]
-opencode = "github-copilot/claude-sonnet-5"
-display_name = "Claude Sonnet 5 (github-copilot)"
-
-[aliases."claude-github-copilot-cs-5-5"]
-opencode = "github-copilot/claude-sonnet-5.5"
-display_name = "Claude Sonnet 5.5 (github-copilot)"
-
-[aliases."claude-github-copilot-co-4-8"]
-opencode = "github-copilot/claude-opus-4.8"
-display_name = "Claude Opus 4.8 (github-copilot)"
-
-[aliases."claude-github-copilot-co-4-8-fast"]
-opencode = "github-copilot/claude-opus-4.8-fast"
-display_name = "Claude Opus 4.8 Fast (github-copilot)"
-
-[aliases."claude-github-copilot-co-5"]
-opencode = "github-copilot/claude-opus-5"
-display_name = "Claude Opus 5 (github-copilot)"
-
-[aliases."claude-github-copilot-co-5-5"]
-opencode = "github-copilot/claude-opus-5.5"
-display_name = "Claude Opus 5.5 (github-copilot)"
+# Shield the Claude Code CLI's background-model resolution (on by default).
+# The CLI canonicalizes discovered ids by family substring
+# (claude-sonnet-*/claude-opus-*, plus haiku/fable/mythos for future rows)
+# and discards anthropic_family_tier, so any catalog row carrying that
+# spelling — today the github-copilot Claude rows, tomorrow any provider
+# shipping claude-* models — attracts side queries (title-gen etc.) that burn
+# quota. The gateway rewrites those fragments automatically, like
+# desktop_aliases: claude-github-copilot-claude-sonnet-5 is advertised as
+# claude-github-copilot-cs-5 (cs = copilot-sonnet, co = copilot-opus,
+# ch = copilot-haiku, cf/c/m for fable/mythos). Only the advertised id
+# changes; refs, display names and resolution are untouched, and [tiers]
+# keyed by opencode ref (provider/model) keep working across renames.
+# Set false to keep the historical claude-<provider>-<model> spelling (then
+# shield specific rows with manual [aliases] as before).
+cli_shield_aliases = true
 
 
 # Refs (gateway id or opencode ref) hidden from /v1/models.

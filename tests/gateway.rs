@@ -691,7 +691,10 @@ async fn e2e_fast_flavor_keeps_distinct_alias_and_headers() {
     )]));
     fast.body = Some(json!({"speed": "fast"}));
     // Aliases built the same way `refresh()` does: no duplicate ids.
-    let aliases = frank_opencode::domain::auto_aliases_for(&[normal.clone(), fast.clone()], false);
+    // Shield off here: this test covers fast-flavor disambiguation, not the
+    // CLI family shield (covered by the domain shield tests).
+    let aliases =
+        frank_opencode::domain::auto_aliases_for(&[normal.clone(), fast.clone()], false, false);
     assert_eq!(aliases.len(), 2);
     assert_ne!(aliases[0].gateway_id, aliases[1].gateway_id);
     let state = seeded_state(test_config(), vec![normal, fast], aliases.clone()).await;
@@ -1262,6 +1265,103 @@ async fn boot_retry_recovers_after_failures() {
     assert!(aliases
         .iter()
         .any(|a| a.gateway_id == "claude-opencode-recovered-model"));
+}
+
+// ---------------------------------------------------------------------------
+// cli_shield_aliases: refresh() shields family spelling on auto aliases by
+// default; manual aliases and direct refs still resolve.
+// ---------------------------------------------------------------------------
+
+/// Shim catalog body with two rows sharing a modelID: a Copilot Claude row
+/// (family spelling) and a neutral row.
+fn shield_catalog_body() -> Value {
+    json!({
+        "data": [
+            {
+                "id": "claude-sonnet-5",
+                "modelID": "claude-sonnet-5",
+                "providerID": "github-copilot",
+                "name": "Claude Sonnet 5",
+                "package": "aisdk:@ai-sdk/github-copilot",
+                "settings": {"baseURL": "http://127.0.0.1:9", "endpoint": "messages"},
+                "enabled": true,
+                "variants": []
+            },
+            {
+                "id": "kimi-k2.7-code",
+                "modelID": "kimi-k2.7-code",
+                "providerID": "opencode-go",
+                "name": "Kimi K2.7 Code",
+                "package": "@opencode/ai/providers/openai-compatible",
+                "settings": {"baseURL": "http://127.0.0.1:9"},
+                "enabled": true,
+                "variants": []
+            }
+        ]
+    })
+}
+
+fn write_shield_shim(dir: &std::path::Path) -> String {
+    let body = shield_catalog_body().to_string();
+    std::fs::create_dir_all(dir).expect("create shim dir");
+    let path = dir.join("opencode");
+    let script = format!("#!/bin/sh\ncat <<'EOM'\n{body}\nEOM\n");
+    std::fs::write(&path, script).expect("write shim");
+    std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+        .expect("chmod shim");
+    path.to_string_lossy().to_string()
+}
+
+#[tokio::test]
+async fn refresh_shields_family_spelling_by_default() {
+    let dir = shim_dir();
+    let mut cfg = test_config();
+    cfg.opencode_bin = write_shield_shim(&dir);
+    // Default: shield on (AppConfig::default has cli_shield_aliases = true).
+    assert!(cfg.cli_shield_aliases);
+    let state = seeded_state(cfg, vec![], vec![]).await;
+    let n = state.refresh().await.expect("refresh");
+    assert_eq!(n, 2);
+    let aliases = state.aliases.read().await;
+    let ids: Vec<&str> = aliases.iter().map(|a| a.gateway_id.as_str()).collect();
+    // Family spelling gone from the advertised Copilot id; neutral row kept.
+    assert!(ids.contains(&"claude-github-copilot-cs-5"), "{ids:?}");
+    assert!(
+        !ids.iter().any(|id| id.contains("claude-sonnet")),
+        "{ids:?}"
+    );
+    assert!(
+        ids.contains(&"claude-opencode-go-kimi-k2-7-code"),
+        "{ids:?}"
+    );
+    // The shielded alias resolves to the Copilot row for /v1/messages.
+    let data: Value = axum_test::TestServer::new(router(state.clone()))
+        .unwrap()
+        .get("/v1/models")
+        .add_header("x-api-key", "test-secret")
+        .await
+        .json();
+    assert!(data["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|m| m["id"] == "claude-github-copilot-cs-5"));
+}
+
+#[tokio::test]
+async fn refresh_keeps_historical_spelling_when_shield_off() {
+    let dir = shim_dir();
+    let mut cfg = test_config();
+    cfg.opencode_bin = write_shield_shim(&dir);
+    cfg.cli_shield_aliases = false;
+    let state = seeded_state(cfg, vec![], vec![]).await;
+    state.refresh().await.expect("refresh");
+    let aliases = state.aliases.read().await;
+    let ids: Vec<&str> = aliases.iter().map(|a| a.gateway_id.as_str()).collect();
+    assert!(
+        ids.contains(&"claude-github-copilot-claude-sonnet-5"),
+        "{ids:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------

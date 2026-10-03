@@ -85,57 +85,32 @@ Feche e reabra o Claude Code depois de alterar essas variáveis. Sem
 `CLAUDE_CODE_SUBAGENT_MODEL_FORCE`, uma definição de agente ou uma escolha por
 invocação pode substituir o modelo padrão.
 
-## Blindando o Copilot contra chamadas de fundo (ids renomeados)
+## Blindando o Copilot contra chamadas de fundo (ids blindados)
 
 **Sintoma:** `WARN upstream rejected request … status=429 body=quota exceeded`
 com `gateway_model=claude-github-copilot-claude-sonnet-5`, `stream=true`,
 `max_tokens: 64000` e `tools: []`, sem você ter selecionado o Copilot.
 
 **Causa:** o CLI do Claude Code (ao contrário do Desktop) resolve os modelos
-de fundo (small-fast e fallbacks de família haiku→sonnet→opus) **canonicando
-os ids descobertos por substring** — `claude-sonnet-5` / `claude-opus-*`
-dentro do id. As linhas do Copilot são as primeiras em ordem alfabética e
-casam; os tiers não entram nessa conta (o CLI os descarta — veja a nota em
-[Configuração do Desktop](config-desktop.md#tiers-da-família-anthropic)). O
-`max_tokens: 64000` é o `max_output_tokens` default do `claude-sonnet-5` no
+de fundo (small-fast e fallbacks de família haiku→sonnet→opus→fable→mythos)
+**canonicando os ids descobertos por substring** — `claude-sonnet-5` /
+`claude-opus-*` dentro do id. As linhas do Copilot são as primeiras em ordem
+alfabética e casam; os tiers não entram nessa conta (o CLI os descarta — veja
+a nota em [Configuração do Desktop](config-desktop.md#tiers-da-família-anthropic)).
+O `max_tokens: 64000` é o `max_output_tokens` default do `claude-sonnet-5` no
 catálogo embutido do CLI; `stream=true` + `tools: []` identifica uma *side
 query* (title-gen etc.), não o seu turno principal — esse continua indo para o
 `default_model` com tools e funciona normalmente.
 
-**Correção (opção B):** renomeie os 6 ids do Copilot para que não casem a
-família no spelling. Os ids novos usam `cs` (copilot-sonnet) / `co`
-(copilot-opus); `display_name` e ref ficam iguais, então o picker continua
-legível e a seleção intencional continua funcionando:
+**Correção (automática, padrão):** `cli_shield_aliases = true` (default) faz o
+gateway reescrever os fragmentos com spelling de família antes do slug, como o
+`desktop_aliases` faz para a denylist — sem `[aliases]` manual, então novos
+providers que tragam modelos `claude-*` já nascem blindados. Os ids anunciados
+usam `cs` (copilot-sonnet) / `co` (copilot-opus) / `ch` / `cf` / `cm`;
+`display_name` e ref ficam iguais, então o picker continua legível e a seleção
+intencional continua funcionando:
 
-```toml
-[aliases."claude-github-copilot-cs-5"]
-opencode = "github-copilot/claude-sonnet-5"
-display_name = "Claude Sonnet 5 (github-copilot)"
-
-[aliases."claude-github-copilot-cs-5-5"]
-opencode = "github-copilot/claude-sonnet-5.5"
-display_name = "Claude Sonnet 5.5 (github-copilot)"
-
-[aliases."claude-github-copilot-co-4-8"]
-opencode = "github-copilot/claude-opus-4.8"
-display_name = "Claude Opus 4.8 (github-copilot)"
-
-[aliases."claude-github-copilot-co-4-8-fast"]
-opencode = "github-copilot/claude-opus-4.8-fast"
-display_name = "Claude Opus 4.8 Fast (github-copilot)"
-
-[aliases."claude-github-copilot-co-5"]
-opencode = "github-copilot/claude-opus-5"
-display_name = "Claude Opus 5 (github-copilot)"
-
-[aliases."claude-github-copilot-co-5-5"]
-opencode = "github-copilot/claude-opus-5.5"
-display_name = "Claude Opus 5.5 (github-copilot)"
-```
-
-Mapeamento antigo → novo:
-
-| id antigo (some do `/v1/models`) | id novo | ref (continua resolvendo) |
+| id histórico (some do `/v1/models`) | id blindado | ref (continua resolvendo) |
 |---|---|---|
 | `claude-github-copilot-claude-sonnet-5` | `claude-github-copilot-cs-5` | `github-copilot/claude-sonnet-5` |
 | `claude-github-copilot-claude-sonnet-5-5` | `claude-github-copilot-cs-5-5` | `github-copilot/claude-sonnet-5.5` |
@@ -146,13 +121,21 @@ Mapeamento antigo → novo:
 
 Efeitos:
 
-- os ids antigos somem do `/v1/models` (se um `settings.json: model` antigo
+- os ids históricos somem do `/v1/models` (se um `settings.json: model` antigo
   referenciar um deles, vira 404 — atualize para o id novo ou para a ref);
 - a **ref direta continua resolvendo** em `POST /v1/messages`
   (`"model": "github-copilot/claude-sonnet-5"`) — dá para usar o Copilot de
   propósito sem mudar nada quando a quota voltar;
-- nenhum id descoberto casa mais `claude-sonnet-*`/`claude-opus-*`, então as
-  chamadas de fundo do CLI param de parar no Copilot.
+- nenhum id descoberto casa mais o spelling de família, então as chamadas de
+  fundo do CLI param de parar no Copilot;
+- `[tiers]` continua valendo: prefira chavear pela ref (`provider/model`),
+  que é estável entre renomeações — a chave por gateway id também funciona,
+  mas precisa acompanhar o id blindado.
+
+**Opt-out:** `cli_shield_aliases = false` mantém o spelling histórico
+`claude-<provider>-<model>` (útil se algum fluxo externo depende dos ids
+antigos). Para blindar só linhas específicas nesse modo, use `[aliases]`
+manual por linha.
 
 **Complemento (opção C):** fixe o small-fast do CLI no modelo barato, para
 title-gen e afins nunca consultarem a família por fallback. No bloco `env` do
@@ -174,7 +157,7 @@ curl -s http://127.0.0.1:3737/v1/models | jq -r '.data[].id' | grep copilot
 # deve listar só ...-cs-* / ...-co-* e os gpt/grok/gemini (evadidos), nenhum claude-sonnet/claude-opus
 ```
 
-Para reverter: apague o bloco `[aliases]` do config e o
+Para reverter: sete `cli_shield_aliases = false` e apague o
 `ANTHROPIC_SMALL_FAST_MODEL` do settings (backups em `*.bak` ao lado dos
 arquivos) e reinicie.
 
