@@ -19,6 +19,25 @@ pub fn join_url(base: &str, path: &str) -> String {
     )
 }
 
+/// Floor for `max_tokens` on translated (non-Anthropic) upstreams: the
+/// OpenCode zen backend rejects output limits below 16 — e.g.
+/// `muse-spark-1.3-contributor` returns 400
+/// `` `max_output_tokens` The number must be `>= 16` ``. Claude Code
+/// verifies a model before switching to it mid-session with a
+/// `max_tokens: 1` probe, so without the floor the switch fails with 400.
+/// Real requests ask for thousands of tokens; raising a sub-16 value only
+/// affects probes.
+const MIN_UPSTREAM_OUTPUT_TOKENS: u64 = 16;
+
+/// Raise a client `max_tokens` below [`MIN_UPSTREAM_OUTPUT_TOKENS`] to the
+/// floor; anything else (including non-integer values) passes through.
+fn floor_output_tokens(v: &Value) -> Value {
+    match v.as_u64() {
+        Some(n) if n < MIN_UPSTREAM_OUTPUT_TOKENS => Value::from(MIN_UPSTREAM_OUTPUT_TOKENS),
+        _ => v.clone(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Anthropic -> OpenAI Chat Completions
 // ---------------------------------------------------------------------------
@@ -305,7 +324,7 @@ pub fn anthropic_to_openai(body: &Value, upstream_model: &str) -> Value {
         }
     }
     if let Some(m) = body.get("max_tokens") {
-        out["max_tokens"] = m.clone();
+        out["max_tokens"] = floor_output_tokens(m);
     }
     if let Some(stop) = body.get("stop_sequences") {
         out["stop"] = stop.clone();
@@ -768,7 +787,7 @@ pub fn anthropic_to_responses(body: &Value, upstream_model: &str) -> Value {
         }
     }
     if let Some(m) = body.get("max_tokens") {
-        out["max_output_tokens"] = m.clone();
+        out["max_output_tokens"] = floor_output_tokens(m);
     }
     if body
         .get("stream")
@@ -1775,16 +1794,44 @@ mod tests {
                 ]}
             ],
             "tools": [{"name": "Read", "description": "d", "input_schema": {"type": "object"}}],
-            "max_tokens": 10
+            "max_tokens": 4096
         });
         let r = anthropic_to_responses(&body, "upstream");
         assert_eq!(r["model"], "upstream");
         assert_eq!(r["instructions"], "be concise");
-        assert_eq!(r["max_output_tokens"], 10);
+        assert_eq!(r["max_output_tokens"], 4096);
         let input = r["input"].as_array().unwrap();
         assert!(input.iter().any(|i| i["type"] == "function_call"));
         assert!(input.iter().any(|i| i["type"] == "function_call_output"));
         assert_eq!(r["tools"][0]["name"], "Read");
+    }
+
+    #[test]
+    fn max_tokens_floored_at_backend_minimum() {
+        // Claude Code's model-switch probe sends `max_tokens: 1`; the zen
+        // backend rejects output limits below 16 (muse-spark 400 on switch).
+        let probe = serde_json::json!({
+            "model": "x",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 1
+        });
+        assert_eq!(anthropic_to_openai(&probe, "up")["max_tokens"], 16);
+        assert_eq!(
+            anthropic_to_responses(&probe, "up")["max_output_tokens"],
+            16
+        );
+
+        // Values at or above the floor pass through unchanged on both paths.
+        let normal = serde_json::json!({
+            "model": "x",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 64000
+        });
+        assert_eq!(anthropic_to_openai(&normal, "up")["max_tokens"], 64000);
+        assert_eq!(
+            anthropic_to_responses(&normal, "up")["max_output_tokens"],
+            64000
+        );
     }
 
     #[test]
