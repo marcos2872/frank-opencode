@@ -107,30 +107,9 @@ jobs:
           } > "$summary"
           cat "$summary" >> "$GITHUB_STEP_SUMMARY"
 
-          # No PR, publica o mesmo resumo como comentário sticky: atualiza o
-          # comentário marcado em vez de acumular um por push. Em PR de fork o
-          # token é read-only e o `gh` falha — warning, não derruba o job.
-          if [ -n "$PR_NUMBER" ]; then
-            marker='<!-- frank-ci-summary -->'
-            comment=$(mktemp)
-            {
-              echo "$marker"
-              cat "$summary"
-              echo "📊 [Ver run completo](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})"
-              echo ""
-            } > "$comment"
-            existing=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
-              --jq '.[] | select(.body | contains("<!-- frank-ci-summary -->")) | .id' 2>/dev/null | head -n1 || true)
-            if [ -n "$existing" ]; then
-              gh api -X PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${existing}" \
-                -F "body=@${comment}" \
-                || echo "::warning::não atualizou o comentário de resumo no PR #${PR_NUMBER}"
-            else
-              gh api -X POST "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
-                -F "body=@${comment}" \
-                || echo "::warning::não criou o comentário de resumo no PR #${PR_NUMBER}"
-            fi
-          fi
+          # Em PR, publica o resumo como comentário sticky (script
+          # compartilhado com o job perf; no-op em push, warning em fork).
+          bash .github/scripts/pr-sticky-comment.sh '<!-- frank-ci-summary -->' "$summary"
 
       # Só aqui o job falha — os steps acima rodam com continue-on-error para
       # que o resumo sempre seja publicado (e fmt/clippy/testes todos executem).
@@ -165,13 +144,18 @@ jobs:
           set -o pipefail
           cargo test --release --locked --test perf -- --nocapture --test-threads=1 2>&1 | tee /tmp/perf-output.txt
 
-      - name: Job summary
+      - name: Job summary (painel + comentário na PR)
+        # `always()` para o resumo sair mesmo quando o gate falha.
         if: always()
         env:
+          GH_TOKEN: ${{ github.token }}
           PERF: ${{ steps.perf.outcome }}
           REF: ${{ github.ref_name }}
           SHA: ${{ github.sha }}
+          # Vazio em push (sem PR) — o comentário só sai quando existir PR.
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
+          summary=$(mktemp)
           {
             echo "## Resumo do CI — \`perf\`"
             echo ""
@@ -194,4 +178,8 @@ jobs:
               failure) echo "**Veredito:** ❌ p95 acima do orçamento (ou testes falharam)" ;;
               *) echo "**Veredito:** ⏭️ ${PERF:-unknown}" ;;
             esac
-          } >> "$GITHUB_STEP_SUMMARY"
+          } > "$summary"
+          cat "$summary" >> "$GITHUB_STEP_SUMMARY"
+          # Em PR, publica como comentário sticky (marcador próprio: convive
+          # com o do job test na mesma PR).
+          bash .github/scripts/pr-sticky-comment.sh '<!-- frank-ci-perf-summary -->' "$summary"

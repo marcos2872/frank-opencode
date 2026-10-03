@@ -28,9 +28,10 @@ Para reproduzir o CI localmente, os mesmos comandos acima com `--all-targets`.
 Cada job publica um **resumo** ao final (painel *Summary* do GitHub Actions): o
 `test` mostra o status de cada etapa (fmt/clippy/testes) e o total de testes; o
 `perf` mostra a tabela p50/p95/etc. por cenário e o veredito do orçamento. Em
-PRs, o resumo do `test` também é publicado como **comentário sticky** (um único
-comentário marcado, atualizado a cada push — em PR de fork o token é read-only
-e o comentário é pulado com warning). Os steps do `test` rodam com
+PRs, os resumos dos dois jobs também são publicados como **comentário sticky**
+(por job, via [`.github/scripts/pr-sticky-comment.sh`](../.github/scripts/pr-sticky-comment.sh):
+um único comentário marcado, atualizado a cada push — em PR de fork o token é
+read-only e o comentário é pulado com warning). Os steps do `test` rodam com
 `continue-on-error` e a falha é propagada no step final `Propagar falha`, então
 o resumo/comentário sai completo mesmo quando fmt, clippy ou testes falham.
 
