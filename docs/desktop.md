@@ -93,6 +93,10 @@ auth_token = ""
 opencode_bin = "opencode"
 include_free_tier = false
 
+# Fallback de requisições sem "model" (sem ele vale o 1º alias alfabético,
+# hoje um claude-github-copilot-... — ver README "Modelo padrão").
+default_model = "claude-opencode-go-muse-spark-1-3-contributor"
+
 # Lista todos os modelos no picker do Claude Desktop
 # (reescreve deepseek -> d-eepseek etc. só no id anunciado)
 desktop_aliases = true
@@ -102,6 +106,14 @@ e reinicie o gateway + o Desktop. Só o id anunciado muda
 (`deepseek` → `d-eepseek`); refs, display names e resolução intactos.
 Trade-off: se a Anthropic ampliar a denylist, novos tokens podem cair de
 novo — o log `Model discovery: N found; picker = M` denuncia na hora.
+
+Sobre o fallback: se alguma chamada chegar sem `model`, o gateway usa esse
+`default_model` — sem ele, cai no primeiro alias em ordem alfabética (um
+modelo do Copilot, que pode nem ter acesso na sua conta e gera `400
+model_not_supported` no log sem você ter escolhido o Copilot). `[disabled]`
+tira refs do picker; no Desktop o picker é o único jeito de escolher modelo,
+então desabilitado = não selecionável ali (a ref direta `provider/model`
+continua resolvendo para clientes de API como o Claude Code).
 
 ## Por que deve funcionar
 

@@ -22,6 +22,17 @@ include_free_tier = false
 # Leave false for Claude Code (it lists every claude-* id already).
 desktop_aliases = false
 
+# Answer Claude Code's auto-mode safety classifier (and its 1-token
+# liveness probes) locally instead of forwarding upstream. Those calls
+# use hardcoded first-party ids (claude-sonnet-5, claude-opus-4-8) that
+# resolve to whichever catalog row carries that model id; out of quota
+# they log a 429 WARN on every check. The gateway replies the "allow"
+# verdict itself (<severity>0</severity> / <block>no</block> / "ok") and
+# never touches the provider. Real conversations (tools + a real system
+# prompt) still forward normally.
+# Tradeoff: with the mock on, auto mode's LLM safety review always passes.
+mock_classifier = false
+
 # Upstream transport timeouts, in seconds.
 # connect_timeout_secs fails fast when a provider is unreachable.
 # request_timeout_secs bounds the whole request, streaming included, so it is

@@ -13,6 +13,8 @@ concurrency:
 
 permissions:
   contents: read
+  # Publica o resumo do job `test` como comentário na PR.
+  pull-requests: write
 
 env:
   CARGO_INCREMENTAL: "0"
@@ -34,11 +36,150 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
+      # Steps com continue-on-error: todos rodam mesmo quando um falha, para
+      # que o resumo (painel + comentário na PR) saia completo. A falha real é
+      # propagada no step "Propagar falha" lá embaixo — sem ele o job ficaria
+      # verde com tests vermelhos.
       - name: Check formatting
+        id: fmt
+        continue-on-error: true
         run: cargo fmt --all --check
 
       - name: Clippy (deny warnings)
+        id: clippy
+        continue-on-error: true
         run: cargo clippy --all-targets --locked -- -D warnings
 
       - name: Run full test suite
-        run: cargo test --locked --all-targets
+        id: tests
+        continue-on-error: true
+        # `set -o pipefail` so a failing `cargo test` is not masked by the
+        # `tee` exit status; the output file feeds the job summary below.
+        run: |
+          set -o pipefail
+          cargo test --locked --all-targets 2>&1 | tee /tmp/test-output.txt
+
+      - name: Job summary (painel + comentário na PR)
+        # `always()` para o resumo sair mesmo quando algo falha.
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FMT: ${{ steps.fmt.outcome }}
+          CLIPPY: ${{ steps.clippy.outcome }}
+          TESTS: ${{ steps.tests.outcome }}
+          REF: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+          # Vazio em push (sem PR) — o comentário só sai quando existir PR.
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          status() {
+            case "$1" in
+              success) echo "✅ pass" ;;
+              failure) echo "❌ fail" ;;
+              skipped) echo "⏭️ skipped" ;;
+              cancelled) echo "🚫 cancelled" ;;
+              *) echo "⏭️ ${1:-unknown}" ;;
+            esac
+          }
+          summary=$(mktemp)
+          {
+            echo "## Resumo do CI — \`test\`"
+            echo ""
+            echo "\`${REF}\` @ \`${SHA:0:7}\`"
+            echo ""
+            echo "| Etapa | Resultado |"
+            echo "| --- | --- |"
+            echo "| Formatação (\`cargo fmt\`) | $(status "$FMT") |"
+            echo "| Clippy (\`-D warnings\`) | $(status "$CLIPPY") |"
+            echo "| Suíte de testes | $(status "$TESTS") |"
+            echo ""
+            if [ -f /tmp/test-output.txt ]; then
+              read -r passed failed ignored < <(awk '/^test result:/ {
+                for (i = 1; i <= NF; i++) {
+                  if ($(i + 1) == "passed;") p += $i
+                  if ($(i + 1) == "failed;") f += $i
+                  if ($(i + 1) == "ignored;") g += $i
+                }
+              } END { printf "%d %d %d\n", p, f, g }' /tmp/test-output.txt)
+              echo "**Testes:** ${passed:-0} passaram · ${failed:-0} falharam · ${ignored:-0} ignorados"
+            fi
+            echo ""
+          } > "$summary"
+          cat "$summary" >> "$GITHUB_STEP_SUMMARY"
+
+          # Em PR, publica o resumo como comentário sticky (script
+          # compartilhado com o job perf; no-op em push, warning em fork).
+          bash .github/scripts/pr-sticky-comment.sh '<!-- frank-ci-summary -->' "$summary"
+
+      # Só aqui o job falha — os steps acima rodam com continue-on-error para
+      # que o resumo sempre seja publicado (e fmt/clippy/testes todos executem).
+      - name: Propagar falha
+        if: ${{ steps.fmt.outcome == 'failure' || steps.clippy.outcome == 'failure' || steps.tests.outcome == 'failure' }}
+        run: exit 1
+
+  # Separate, blocking perf gate. The perf tests also run (report-only) inside
+  # `test`; here the release profile enforces the p95 budget. `--test-threads=1`
+  # keeps the two scenarios from contending for CPU and inflating each other's
+  # tail latency. To actually block merges, add `perf` to the branch
+  # protection required status checks (like `test`).
+  perf:
+    name: perf
+    runs-on: ubuntu-latest
+    needs: test
+    env:
+      FRANK_PERF_P95_MS: "15"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Proxy translation latency (p95 < 15ms, release)
+        id: perf
+        # `set -o pipefail` so a failed budget assertion is not masked by `tee`.
+        run: |
+          set -o pipefail
+          cargo test --release --locked --test perf -- --nocapture --test-threads=1 2>&1 | tee /tmp/perf-output.txt
+
+      - name: Job summary (painel + comentário na PR)
+        # `always()` para o resumo sair mesmo quando o gate falha.
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PERF: ${{ steps.perf.outcome }}
+          REF: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+          # Vazio em push (sem PR) — o comentário só sai quando existir PR.
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          summary=$(mktemp)
+          {
+            echo "## Resumo do CI — \`perf\`"
+            echo ""
+            echo "\`${REF}\` @ \`${SHA:0:7}\` — orçamento **p95 < ${FRANK_PERF_P95_MS}ms** (release)"
+            echo ""
+            echo "| Cenário | n | p50 | p95 | mean | min | max |"
+            echo "| --- | --: | --: | --: | --: | --: | --: |"
+            if [ -f /tmp/perf-output.txt ]; then
+              # The harness prints on stderr, interleaved with libtest's
+              # `test <name> ... ` progress, so extract the [perf] record with
+              # -oE instead of anchoring to the line start.
+              grep -oE '\[perf\] [a-z_]+: n=[0-9]+ warmup=[0-9]+ p50=[0-9.]+ms p95=[0-9.]+ms mean=[0-9.]+ms min=[0-9.]+ms max=[0-9.]+ms' /tmp/perf-output.txt \
+                | awk -F'[ =]+' '{ label = $2; sub(/:$/, "", label);
+                    printf "| %s | %s | %s | %s | %s | %s | %s |\n",
+                           label, $4, $8, $10, $12, $14, $16 }'
+            fi
+            echo ""
+            case "$PERF" in
+              success) echo "**Veredito:** ✅ p95 dentro do orçamento" ;;
+              failure) echo "**Veredito:** ❌ p95 acima do orçamento (ou testes falharam)" ;;
+              *) echo "**Veredito:** ⏭️ ${PERF:-unknown}" ;;
+            esac
+          } > "$summary"
+          cat "$summary" >> "$GITHUB_STEP_SUMMARY"
+          # Em PR, publica como comentário sticky (marcador próprio: convive
+          # com o do job test na mesma PR).
+          bash .github/scripts/pr-sticky-comment.sh '<!-- frank-ci-perf-summary -->' "$summary"

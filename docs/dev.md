@@ -7,6 +7,7 @@ Pré-requisitos: Rust stable, `opencode` v2 logado (`opencode auth login`).
 ```bash
 cargo test                    # testes unitários (tradução, aliases, config) + e2e (tests/gateway.rs)
 cargo test --test gateway     # só os testes e2e do gateway
+cargo test --test perf        # latência de tradução do proxy (report-only em debug)
 cargo test <name>             # teste único por substring do nome
 cargo clippy -- -D warnings   # lint (precisa estar limpo)
 cargo fmt --check             # formatação (precisa estar limpa)
@@ -16,11 +17,23 @@ cargo fmt --check             # formatação (precisa estar limpa)
 
 O workflow [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) roda em todo
 push e em toda PR: `cargo fmt --all --check`, `cargo clippy --all-targets --
--D warnings` e `cargo test --all-targets`. A branch `main` está protegida: o
-status **test** é obrigatório e a branch precisa estar atualizada — **uma PR não
-mergeia enquanto os testes não passarem** (o admin ainda pode dar push direto).
+-D warnings` e `cargo test --all-targets`. Um job separado `perf` (após o `test`)
+compila em release e força o orçamento de latência (ver abaixo). A branch `main`
+está protegida: o status **test** é obrigatório e a branch precisa estar
+atualizada — **uma PR não mergeia enquanto os testes não passarem** (o admin
+ainda pode dar push direto).
 
 Para reproduzir o CI localmente, os mesmos comandos acima com `--all-targets`.
+
+Cada job publica um **resumo** ao final (painel *Summary* do GitHub Actions): o
+`test` mostra o status de cada etapa (fmt/clippy/testes) e o total de testes; o
+`perf` mostra a tabela p50/p95/etc. por cenário e o veredito do orçamento. Em
+PRs, os resumos dos dois jobs também são publicados como **comentário sticky**
+(por job, via [`.github/scripts/pr-sticky-comment.sh`](../.github/scripts/pr-sticky-comment.sh):
+um único comentário marcado, atualizado a cada push — em PR de fork o token é
+read-only e o comentário é pulado com warning). Os steps do `test` rodam com
+`continue-on-error` e a falha é propagada no step final `Propagar falha`, então
+o resumo/comentário sai completo mesmo quando fmt, clippy ou testes falham.
 
 Há um hook de pre-commit em [`.githooks/pre-commit`](../.githooks/pre-commit) que
 roda `fmt --check`, `clippy` e `test` antes de cada commit. Ele **não** é ativado
@@ -32,12 +45,63 @@ git config core.hooksPath .githooks
 
 Para pular um commit específico: `git commit --no-verify`.
 
+## Performance
+
+`tests/perf.rs` mede a **latência de tradução do proxy** no formato
+Claude-simulador → gateway → OpenCode-simulador:
+
+- O cliente é o próprio teste, via `axum_test::TestServer` in-process (o hop
+  cliente→proxy fica **fora** da métrica).
+- O upstream é um app axum mock num `TcpListener` real de loopback, então
+  `reqwest`/serialização/pool de conexões entram na conta — é o caminho de
+  produção. A suíte é uma matriz protocolo × formato de input (chat/responses/
+  passthrough × minimal/realistic/imagem base64 ~512KB/gigante ~1MB/
+  tools pesadas/multiturn/kitchen-sink/streaming, mais `count_tokens` local e
+  via proxy) para nenhum formato de payload passar sem medição.
+- Cada amostra cronometra a requisição inteira. No streaming, a métrica é o
+  tempo total até drenar o SSE Anthropic visível ao cliente (~50 chunks
+  enlatados por amostra no simulador). Após um warmup descartado (absorve o
+  1º connect), reporta p50/p95/mean/min/max.
+
+Enforcement: builds **release** exigem o orçamento p95 **por cenário** — 15ms
+nos leves (minimal/realistic/passthrough/count via proxy), 25ms nos pesados
+(imagem/gigante/tools/multiturn/kitchen-sink/streaming/`count_tokens` local),
+que pagam parse/clone/serialize O(tamanho). O job `perf` do CI roda com
+`--test-threads=1` para os cenários não disputarem CPU. **Labels de cenário
+precisam ser `[a-z_]+`** (minúsculas + underscore): o grep do resumo não casa
+outra coisa e a linha some da tabela silenciosamente. Builds **debug** —
+como o `cargo test --all-targets` do job `test` — rodam e reportam, sem reprovar
+(o timings sem otimização é ruidoso demais para gate). Para reproduzir ou ajustar:
+
+```bash
+cargo test --test perf -- --nocapture                                    # debug: só reporta
+cargo test --release --test perf -- --nocapture --test-threads=1         # release: força os orçamentos
+FRANK_PERF_P95_MS=25 cargo test --release --test perf                    # sobrepõe TODOS os cenários
+```
+
+Para encarecer o cenário, aumente `FILLER_LINES` em `realistic_body`.
+
 ## Rodando
 
 ```bash
 cargo run -- --refresh        # imprime catálogo: N modelos habilitados + aliases do gateway
-RUST_LOG=warn cargo run -- --serve          # servidor em foreground na :3737 (RUST_LOG=debug p/ logs)
+RUST_LOG=warn cargo run -- --serve          # servidor em foreground na :3737
 cargo run -- --serve --port 3739
+```
+
+O `--port` sobrescreve só a porta; o resto (`default_model`, aliases,
+`[disabled]`, ...) continua vindo do `config.toml`, lido no boot.
+
+Níveis de log — `trace` é o "all", do mais ao menos verboso:
+`trace > debug > info > warn > error`:
+
+```bash
+RUST_LOG=trace cargo run -- --serve --port 3737   # tudo, incluindo hyper/reqwest/tokio
+RUST_LOG=debug cargo run -- --serve --port 3737   # meio-termo, menos spam que trace
+# só o projeto, sem o barulho das dependências:
+RUST_LOG=frank_opencode=trace cargo run -- --serve --port 3737
+# projeto em trace, dependências em warn:
+RUST_LOG=trace,hyper=warn,reqwest=warn,tokio=warn cargo run -- --serve --port 3737
 ```
 
 Verificando o servidor:
@@ -45,6 +109,9 @@ Verificando o servidor:
 ```bash
 curl -s http://127.0.0.1:3737/health
 curl -s "http://127.0.0.1:3737/v1/models?limit=1000" | head -c 500
+# fallback de requisição sem "model" (ver README "Modelo padrão"):
+curl -s http://127.0.0.1:3737/health | jq '{default_model, models}'
+curl -s http://127.0.0.1:3737/v1/models | jq -r '.data[0].id'
 ```
 
 ## Resetando o cache do Claude Code (dev)
