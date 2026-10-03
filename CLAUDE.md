@@ -17,9 +17,12 @@ cargo run -- --serve          # foreground server on 127.0.0.1:3737
 
 CI: `.github/workflows/ci.yml` runs `cargo fmt --all --check`, `cargo clippy
 --all-targets -- -D warnings` and `cargo test --all-targets` on every push and
-PR. A separate `perf` job builds `--release` and enforces `p95 < 15ms` on the
-proxy translation latency (`tests/perf.rs`: Claude simulator → gateway → OpenCode
-simulator; override with `FRANK_PERF_P95_MS`). `main` is protected — the `test`
+PR. Steps use `continue-on-error` + a final `Propagar falha` step so the job
+summary and sticky PR comment (`.github/scripts/pr-sticky-comment.sh`) always
+publish even when steps fail. A separate `perf` job builds `--release` and
+enforces per-scenario p95 budgets (`tests/perf.rs`: protocol × input-shape
+matrix, 15ms light / 25ms heavy; `FRANK_PERF_P95_MS` overrides all; scenario
+labels must stay `[a-z_]+` or the summary regex misses them). `main` is protected — the `test`
 check is required and the branch must be up to date, so a PR cannot merge with
 failing tests (admins may still push directly). An opt-in pre-commit hook
 (`.githooks/pre-commit`, same three commands) is enabled per clone with
@@ -62,6 +65,10 @@ Layers:
     representable field (`reasoningEffort` alone) is a 400, not a silent no-op.
   - catalog defaults — merge per-model `headers` and `body` fields (for example
     fast-mode beta headers and `speed`) into forwarded requests.
+  - `floor_output_tokens` — raises `max_tokens` / `max_output_tokens` below 16
+    to 16 on translated protocols (the zen backend rejects smaller output
+    limits; Claude Code probes model switches with `max_tokens: 1`). The
+    Anthropic passthrough path is untouched.
   - `estimate_tokens` — per-part local count for `count_tokens` (no tokenizer).
   - `with_heartbeat` — injects `event: ping` during upstream silence.
   - `sse_error` — Anthropic mid-stream `error` event, used when the upstream
@@ -80,7 +87,13 @@ Layers:
 
 - **Model resolution** (`AppState::resolve`): alias → `provider/model` → plain
   model id (ambiguous ids sort by qualified name, warn). Variants validated
-  against the catalog; unknown label → 404 listing available ones.
+  against the catalog; unknown label → 404 listing available ones. An empty
+  `model` falls back to `config.default_model` (`effective_default`); with
+  neither set it is a 400.
+- **mock_classifier** (`config.toml`, default `false`): answers Claude Code's
+  auto-mode safety-classifier checks and liveness probes locally, before
+  `resolve` and only when `!stream` — real conversations (which carry tools)
+  are never matched and still forward.
 - **Free-tier**: `opencode/*` models 403 outside OpenCode, so they are hidden
   from `/v1/models` unless `include_free_tier = true`. They use the public key
   from `settings.apiKey` (`upstream_bearer`).

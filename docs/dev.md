@@ -54,20 +54,29 @@ Claude-simulador → gateway → OpenCode-simulador:
   cliente→proxy fica **fora** da métrica).
 - O upstream é um app axum mock num `TcpListener` real de loopback, então
   `reqwest`/serialização/pool de conexões entram na conta — é o caminho de
-  produção. O payload é realista (~8–16 KB: system longo, par tool_use/tool_result
-  e 2 tools) para a tradução não ser trivial.
-- Cada amostra cronometra `POST /v1/messages` (não-streaming) inteiro. Após um
-  warmup descartado (absorve o 1º connect), reporta p50/p95/mean/min/max.
+  produção. A suíte é uma matriz protocolo × formato de input (chat/responses/
+  passthrough × minimal/realistic/imagem base64 ~512KB/gigante ~1MB/
+  tools pesadas/multiturn/kitchen-sink/streaming, mais `count_tokens` local e
+  via proxy) para nenhum formato de payload passar sem medição.
+- Cada amostra cronometra a requisição inteira. No streaming, a métrica é o
+  tempo total até drenar o SSE Anthropic visível ao cliente (~50 chunks
+  enlatados por amostra no simulador). Após um warmup descartado (absorve o
+  1º connect), reporta p50/p95/mean/min/max.
 
-Enforcement: builds **release** exigem `p95 <= 15ms` (job `perf` do CI, com
-`--test-threads=1` para os dois cenários não disputarem CPU). Builds **debug** —
+Enforcement: builds **release** exigem o orçamento p95 **por cenário** — 15ms
+nos leves (minimal/realistic/passthrough/count via proxy), 25ms nos pesados
+(imagem/gigante/tools/multiturn/kitchen-sink/streaming/`count_tokens` local),
+que pagam parse/clone/serialize O(tamanho). O job `perf` do CI roda com
+`--test-threads=1` para os cenários não disputarem CPU. **Labels de cenário
+precisam ser `[a-z_]+`** (minúsculas + underscore): o grep do resumo não casa
+outra coisa e a linha some da tabela silenciosamente. Builds **debug** —
 como o `cargo test --all-targets` do job `test` — rodam e reportam, sem reprovar
 (o timings sem otimização é ruidoso demais para gate). Para reproduzir ou ajustar:
 
 ```bash
 cargo test --test perf -- --nocapture                                    # debug: só reporta
-cargo test --release --test perf -- --nocapture --test-threads=1         # release: força p95 < 15ms
-FRANK_PERF_P95_MS=25 cargo test --release --test perf                    # sobrepõe o limiar
+cargo test --release --test perf -- --nocapture --test-threads=1         # release: força os orçamentos
+FRANK_PERF_P95_MS=25 cargo test --release --test perf                    # sobrepõe TODOS os cenários
 ```
 
 Para encarecer o cenário, aumente `FILLER_LINES` em `realistic_body`.
