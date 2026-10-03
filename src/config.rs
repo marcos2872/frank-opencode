@@ -128,10 +128,16 @@ impl AppConfig {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),
             Err(e) => return Err(format!("cannot read config {}: {e}", path.display())),
         };
-        // Env overrides (FRANK_PORT / FRANK_AUTH_TOKEN).
+        // Env overrides (FRANK_PORT / FRANK_AUTH_TOKEN). An invalid port is
+        // ignored with a warning (never silently): booting on the wrong port
+        // is worse than booting on the configured one.
         if let Ok(p) = std::env::var("FRANK_PORT") {
-            if let Ok(n) = p.parse::<u16>() {
-                cfg.port = n;
+            match p.parse::<u16>() {
+                Ok(n) => cfg.port = n,
+                Err(_) => tracing::warn!(
+                    value = %p,
+                    "ignoring invalid FRANK_PORT (not a port number)"
+                ),
             }
         }
         if let Ok(t) = std::env::var("FRANK_AUTH_TOKEN") {

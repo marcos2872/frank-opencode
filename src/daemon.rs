@@ -55,7 +55,18 @@ fn gateway_healthy(port: u16) -> bool {
     let Ok(n) = s.read(&mut buf) else {
         return false;
     };
-    String::from_utf8_lossy(&buf[..n]).contains("200")
+    // Parse the status line (`HTTP/1.x 200 ...`) instead of matching "200"
+    // anywhere in the head: a body or header containing "200" is not health.
+    let status_line = String::from_utf8_lossy(&buf[..n])
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    let mut parts = status_line.split_whitespace();
+    matches!(
+        (parts.next(), parts.next()),
+        (Some(v), Some("200")) if v.starts_with("HTTP/")
+    )
 }
 
 /// Write a small state file with owner-only permissions (0600 on unix).
@@ -87,6 +98,28 @@ pub fn stored_port() -> Option<u16> {
     fs::read_to_string(port_file()).ok()?.trim().parse().ok()
 }
 
+/// Open (or create) a log file in append mode with owner-only permissions.
+/// Sibling of [`write_private`] for the daemon log, which must append rather
+/// than truncate; same create-or-tighten 0600 semantics.
+pub(crate) fn open_private_append(path: PathBuf) -> std::io::Result<std::fs::File> {
+    use std::fs::OpenOptions;
+    let mut opts = OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let f = opts.open(&path)?;
+    #[cfg(unix)]
+    {
+        // `mode` only applies at creation; enforce for pre-existing files too.
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(f)
+}
+
 /// Enable: spawn detached child running `--serve`, wait for /health.
 pub fn enable(port: u16, config_arg: Option<PathBuf>) -> anyhow::Result<()> {
     if let Some(pid) = read_pid() {
@@ -106,20 +139,7 @@ pub fn enable(port: u16, config_arg: Option<PathBuf>) -> anyhow::Result<()> {
     }
     fs::create_dir_all(dir())?;
     let exe = std::env::current_exe()?;
-    let mut log_opts = fs::OpenOptions::new();
-    log_opts.create(true).append(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        log_opts.mode(0o600);
-    }
-    let log = log_opts.open(log_file())?;
-    #[cfg(unix)]
-    {
-        // `mode` only applies at creation; enforce for pre-existing files too.
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(log_file(), std::fs::Permissions::from_mode(0o600));
-    }
+    let log = open_private_append(log_file())?;
     let log_err = log.try_clone()?;
     let mut cmd = Command::new(exe);
     cmd.arg("--serve")

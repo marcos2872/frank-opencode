@@ -54,6 +54,22 @@ pub struct AppState {
     pub db_path: PathBuf,
 }
 
+/// Find a catalog row by provider + model, preferring the `id` match so
+/// disambiguated rows (`provider/id`, e.g. `.../claude-opus-4.8-fast`)
+/// resolve to their own headers/body instead of collapsing to the first
+/// row with the same `modelID`.
+fn find_by_provider_model(catalog: &[CatalogEntry], r: &ModelRef) -> Option<CatalogEntry> {
+    catalog
+        .iter()
+        .find(|e| e.provider_id == r.provider_id && e.id == r.model_id)
+        .or_else(|| {
+            catalog
+                .iter()
+                .find(|e| e.provider_id == r.provider_id && e.model_id == r.model_id)
+        })
+        .cloned()
+}
+
 impl AppState {
     pub fn new(config: AppConfig, db_path: PathBuf) -> Self {
         let http = reqwest::Client::builder()
@@ -288,36 +304,14 @@ impl AppState {
         // same `modelID`.
         if let Some(a) = aliases.iter().find(|a| a.gateway_id == base) {
             if let Some(r) = ModelRef::parse(&a.opencode_ref) {
-                if let Some(hit) = catalog
-                    .iter()
-                    .find(|e| e.provider_id == r.provider_id && e.id == r.model_id)
-                    .cloned()
-                {
-                    return Some(hit);
-                }
-                if let Some(hit) = catalog
-                    .iter()
-                    .find(|e| e.provider_id == r.provider_id && e.model_id == r.model_id)
-                    .cloned()
-                {
+                if let Some(hit) = find_by_provider_model(&catalog, &r) {
                     return Some(hit);
                 }
             }
         }
         // Direct provider/model (or provider/id for fast flavors)?
         if let Some(r) = ModelRef::parse(base) {
-            if let Some(hit) = catalog
-                .iter()
-                .find(|e| e.provider_id == r.provider_id && e.id == r.model_id)
-                .cloned()
-            {
-                return Some(hit);
-            }
-            if let Some(hit) = catalog
-                .iter()
-                .find(|e| e.provider_id == r.provider_id && e.model_id == r.model_id)
-                .cloned()
-            {
+            if let Some(hit) = find_by_provider_model(&catalog, &r) {
                 return Some(hit);
             }
         }
@@ -931,7 +925,7 @@ fn system_text(body: &Value) -> Option<String> {
 /// non-streaming response shape the translators build.
 fn mock_message(text: &str, gateway_model: &str) -> Value {
     serde_json::json!({
-        "id": format!("msg_{}", &uuid::Uuid::new_v4().to_string().replace('-', "")[..24]),
+        "id": crate::infra::upstream::new_message_id(),
         "type": "message",
         "role": "assistant",
         "model": gateway_model,

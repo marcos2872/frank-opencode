@@ -39,6 +39,22 @@ fn floor_output_tokens(v: &Value) -> Value {
 }
 
 // ---------------------------------------------------------------------------
+// Message IDs
+// ---------------------------------------------------------------------------
+
+/// New Anthropic message id (`msg_<24 lowercase hex>`).
+///
+/// Single construction site for every translator (and the classifier mock)
+/// so the format cannot drift between the non-streaming converters and the
+/// streaming translators.
+pub fn new_message_id() -> String {
+    format!(
+        "msg_{}",
+        &uuid::Uuid::new_v4().to_string().replace('-', "")[..24]
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Anthropic -> OpenAI Chat Completions
 // ---------------------------------------------------------------------------
 
@@ -548,10 +564,7 @@ fn parse_args(s: &str) -> Value {
 
 /// Convert an OpenAI Chat Completion response into an Anthropic Messages response.
 pub fn openai_to_anthropic(resp: &Value, gateway_model: &str) -> Value {
-    let msg_id = format!(
-        "msg_{}",
-        &uuid::Uuid::new_v4().to_string().replace('-', "")[..24]
-    );
+    let msg_id = new_message_id();
     let choice = resp
         .get("choices")
         .and_then(|c| c.as_array())
@@ -801,10 +814,7 @@ pub fn anthropic_to_responses(body: &Value, upstream_model: &str) -> Value {
 
 /// Convert an OpenAI Responses API response into an Anthropic Messages response.
 pub fn responses_to_anthropic(resp: &Value, gateway_model: &str) -> Value {
-    let msg_id = format!(
-        "msg_{}",
-        &uuid::Uuid::new_v4().to_string().replace('-', "")[..24]
-    );
+    let msg_id = new_message_id();
     let items = resp
         .get("output")
         .and_then(|o| o.as_array())
@@ -900,10 +910,7 @@ impl ResponsesTranslator {
     pub fn new(gateway_model: &str) -> Self {
         Self {
             gateway_model: gateway_model.to_string(),
-            msg_id: format!(
-                "msg_{}",
-                &uuid::Uuid::new_v4().to_string().replace('-', "")[..24]
-            ),
+            msg_id: new_message_id(),
             ..Default::default()
         }
     }
@@ -1125,10 +1132,7 @@ impl StreamTranslator {
     pub fn new(gateway_model: &str) -> Self {
         Self {
             gateway_model: gateway_model.to_string(),
-            msg_id: format!(
-                "msg_{}",
-                &uuid::Uuid::new_v4().to_string().replace('-', "")[..24]
-            ),
+            msg_id: new_message_id(),
             ..Default::default()
         }
     }

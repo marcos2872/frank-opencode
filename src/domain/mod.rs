@@ -266,8 +266,22 @@ pub fn protocol_for_entry(entry: &CatalogEntry) -> Protocol {
         return match entry.settings.endpoint.as_deref() {
             Some("responses") => Protocol::Responses,
             Some("messages") => Protocol::Anthropic,
-            // Includes `"chat"` and any unknown/absent endpoint label.
-            _ => Protocol::ChatCompletions,
+            Some("chat") => Protocol::ChatCompletions,
+            // No endpoint declared: historical ChatCompletions fallback, kept
+            // quiet (some aisdk rows legitimately omit it).
+            None => Protocol::ChatCompletions,
+            // Unknown endpoint label: same fallback, but loud — a
+            // miscataloged row silently hitting the wrong wire protocol is
+            // a 400 factory.
+            Some(other) => {
+                tracing::warn!(
+                    provider_id = %entry.provider_id,
+                    package = %entry.package,
+                    endpoint = other,
+                    "unknown aisdk endpoint, using ChatCompletions fallback"
+                );
+                Protocol::ChatCompletions
+            }
         };
     }
     protocol_for(&entry.package)
@@ -388,11 +402,22 @@ const DESKTOP_BLOCKED_TOKENS: &[&str] = &[
 /// (case-insensitive) occurrence (`deepseek` → `d-eepseek`). The Desktop
 /// filter only inspects the alias `id`, so display names and `opencode_ref`
 /// resolution are untouched. Deterministic and slug-safe.
+/// Blocklist tokens longest-first, cached process-wide: `evade_*` is called
+/// once per alias at catalog refresh, and no longer needs to copy + sort
+/// the table on every call.
+fn desktop_tokens_by_length() -> &'static [&'static str] {
+    use std::sync::OnceLock;
+    static SORTED: OnceLock<Vec<&'static str>> = OnceLock::new();
+    SORTED.get_or_init(|| {
+        let mut tokens: Vec<&'static str> = DESKTOP_BLOCKED_TOKENS.to_vec();
+        tokens.sort_by_key(|t| std::cmp::Reverse(t.len()));
+        tokens
+    })
+}
+
 pub fn evade_desktop_blocklist(s: &str) -> String {
     let mut out = s.to_string();
-    let mut tokens: Vec<&str> = DESKTOP_BLOCKED_TOKENS.to_vec();
-    tokens.sort_by_key(|t| std::cmp::Reverse(t.len()));
-    for token in tokens {
+    for &token in desktop_tokens_by_length() {
         let mut search_from = 0;
         loop {
             let lower = out.to_lowercase();
