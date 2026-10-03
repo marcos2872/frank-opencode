@@ -175,10 +175,14 @@ impl AppState {
             })
             .map(|e| (*e).clone())
             .collect();
-        let mut auto: Vec<AliasEntry> = auto_aliases_for(&remaining, self.config.desktop_aliases)
-            .into_iter()
-            .filter(|a| !self.config.is_disabled(&a.opencode_ref, &a.gateway_id))
-            .collect();
+        let mut auto: Vec<AliasEntry> = auto_aliases_for(
+            &remaining,
+            self.config.desktop_aliases,
+            self.config.cli_shield_aliases,
+        )
+        .into_iter()
+        .filter(|a| !self.config.is_disabled(&a.opencode_ref, &a.gateway_id))
+        .collect();
         auto.sort_by(|a, b| a.gateway_id.cmp(&b.gateway_id));
         // Avoid gateway_id collisions with manual entries (and among autos:
         // `auto_aliases_for` already dedups, but manual ids win).

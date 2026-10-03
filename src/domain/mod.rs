@@ -420,6 +420,39 @@ pub fn evade_desktop_blocklist(s: &str) -> String {
     }
     out
 }
+/// Rewrite a model/id fragment so the Claude Code CLI no longer resolves it
+/// as a first-party family id for background calls (`small_fast`, family
+/// fallbacks). The CLI canonicalizes discovered ids by substring
+/// (`claude-sonnet-*` / `claude-opus-*`), so any catalog row carrying that
+/// spelling — today the `github-copilot` Claude rows, tomorrow any provider
+/// that ships `claude-*` models — attracts side queries (title-gen etc.).
+/// Mapping (`claude-sonnet` → `cs`, `claude-opus` → `co`, `claude-haiku` →
+/// `ch`, `claude-fable` → `cf`, `claude-mythos` → `cm`, bare `claude` → `c`,
+/// plus bare `sonnet`/`opus`/`haiku`/`fable`/`mythos` → `s`/`o`/`h`/`f`/`m`
+/// for prefix-less future rows) breaks the match while keeping the id
+/// readable. Only the advertised `gateway_id` changes: `opencode_ref`,
+/// display names and resolution are untouched. Deterministic, slug-safe,
+/// and disjoint from `evade_desktop_blocklist` (no shared tokens), so both
+/// rewrites compose.
+pub fn shield_cli_family_match(s: &str) -> String {
+    let mut out = s.to_lowercase();
+    for (from, to) in [
+        ("claude-sonnet", "cs"),
+        ("claude-opus", "co"),
+        ("claude-haiku", "ch"),
+        ("claude-fable", "cf"),
+        ("claude-mythos", "cm"),
+        ("claude", "c"),
+        ("sonnet", "s"),
+        ("opus", "o"),
+        ("haiku", "h"),
+        ("fable", "f"),
+        ("mythos", "m"),
+    ] {
+        out = out.replace(from, to);
+    }
+    out
+}
 /// Sanitize a model id into a URL/claude-safe slug.
 pub fn slugify(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -467,9 +500,13 @@ pub fn auto_alias(entry: &CatalogEntry) -> AliasEntry {
 /// When `evade` is set (opt-in `desktop_aliases` config for Claude Desktop,
 /// whose bundled denylist drops discovered ids containing third-party model
 /// tokens), the model/id fragments are rewritten via
-/// `evade_desktop_blocklist` before slugging. `opencode_ref`, display names
-/// and resolution are unaffected: only the advertised `gateway_id` changes.
-pub fn auto_aliases_for(entries: &[CatalogEntry], evade: bool) -> Vec<AliasEntry> {
+/// `evade_desktop_blocklist` before slugging. When `shield` is set (default-on
+/// `cli_shield_aliases` config for the Claude Code CLI, which resolves
+/// background models by id-substring family spelling), the fragments are
+/// rewritten via `shield_cli_family_match` first. The rewrites are disjoint
+/// and compose. `opencode_ref`, display names and resolution are unaffected:
+/// only the advertised `gateway_id` changes.
+pub fn auto_aliases_for(entries: &[CatalogEntry], evade: bool, shield: bool) -> Vec<AliasEntry> {
     use std::collections::HashSet;
     let mut sorted: Vec<&CatalogEntry> = entries.iter().collect();
     sorted.sort_by(|a, b| {
@@ -480,16 +517,33 @@ pub fn auto_aliases_for(entries: &[CatalogEntry], evade: bool) -> Vec<AliasEntry
     let mut taken: HashSet<String> = HashSet::new();
     let mut out = Vec::with_capacity(sorted.len());
     for e in sorted {
-        let model_part = if evade {
-            evade_desktop_blocklist(&e.model_id)
+        // Shield first (family spelling), then evade (blocklist tokens):
+        // disjoint rewrites that compose (`co-4-8` never contains a blocked
+        // token, and `d-eepseek` never contains a family spelling).
+        let shielded_model = if shield {
+            shield_cli_family_match(&e.model_id)
         } else {
             e.model_id.clone()
         };
-        let id_part = if !e.id.is_empty() {
-            if evade {
-                evade_desktop_blocklist(&e.id)
+        let model_part = if evade {
+            evade_desktop_blocklist(&shielded_model)
+        } else {
+            shielded_model
+        };
+        let shielded_id = if !e.id.is_empty() {
+            if shield {
+                shield_cli_family_match(&e.id)
             } else {
                 e.id.clone()
+            }
+        } else {
+            String::new()
+        };
+        let id_part = if !shielded_id.is_empty() {
+            if evade {
+                evade_desktop_blocklist(&shielded_id)
+            } else {
+                shielded_id
             }
         } else {
             model_part.clone()
@@ -847,7 +901,7 @@ mod tests {
             .collect(),
         );
         fast.body = Some(serde_json::json!({"speed": "fast"}));
-        let aliases = auto_aliases_for(&[normal, fast], false);
+        let aliases = auto_aliases_for(&[normal, fast], false, false);
         assert_eq!(aliases.len(), 2);
         let ids: Vec<&str> = aliases.iter().map(|a| a.gateway_id.as_str()).collect();
         // No duplicates.
@@ -879,7 +933,7 @@ mod tests {
             "deepseek-v4-1-flash",
             "B",
         );
-        let aliases = auto_aliases_for(&[a, b], false);
+        let aliases = auto_aliases_for(&[a, b], false, false);
         assert_eq!(aliases.len(), 2);
         assert_ne!(aliases[0].gateway_id, aliases[1].gateway_id);
     }
@@ -938,7 +992,7 @@ mod tests {
             .map(|(m, n)| test_entry("opencode-go", m, m, n))
             .collect();
         // Without evasion the Desktop drops all but the last one.
-        let plain = auto_aliases_for(&entries, false);
+        let plain = auto_aliases_for(&entries, false, false);
         assert_eq!(
             plain
                 .iter()
@@ -948,7 +1002,7 @@ mod tests {
         );
         // With evasion every alias passes, stays unique and keeps the
         // original ref for resolution.
-        let evaded = auto_aliases_for(&entries, true);
+        let evaded = auto_aliases_for(&entries, true, false);
         assert_eq!(evaded.len(), models.len());
         for a in &evaded {
             assert!(desktop_would_list(&a.gateway_id), "{}", a.gateway_id);
@@ -962,6 +1016,184 @@ mod tests {
             .find(|a| a.opencode_ref == "opencode-go/deepseek-v4.1-flash")
             .unwrap();
         assert!(deepseek.display_name.contains("DeepSeek"));
+    }
+
+    #[test]
+    fn shield_rewrites_family_spelling() {
+        assert_eq!(shield_cli_family_match("claude-sonnet-5"), "cs-5");
+        assert_eq!(shield_cli_family_match("claude-sonnet-5.5"), "cs-5.5");
+        assert_eq!(shield_cli_family_match("claude-opus-4.8"), "co-4.8");
+        assert_eq!(
+            shield_cli_family_match("claude-opus-4.8-fast"),
+            "co-4.8-fast"
+        );
+        assert_eq!(shield_cli_family_match("claude-haiku-4.5"), "ch-4.5");
+        assert_eq!(shield_cli_family_match("claude-fable-1"), "cf-1");
+        assert_eq!(shield_cli_family_match("claude-mythos-2"), "cm-2");
+        // Non-family names pass through untouched.
+        assert_eq!(
+            shield_cli_family_match("muse-spark-1.3-contributor"),
+            "muse-spark-1.3-contributor"
+        );
+        assert_eq!(shield_cli_family_match("kimi-k2.7-code"), "kimi-k2.7-code");
+        assert_eq!(shield_cli_family_match("gpt-6-luna"), "gpt-6-luna");
+    }
+
+    /// Mirror of the CLI's background-model rule: it canonicalizes discovered
+    /// ids by family substring (`claude-sonnet-*` / `claude-opus-*`, plus
+    /// haiku/fable/mythos spellings for future rows) and ignores
+    /// `anthropic_family_tier`.
+    fn cli_would_match_family(id: &str) -> bool {
+        let lower = id.to_lowercase();
+        [
+            "claude-sonnet",
+            "claude-opus",
+            "claude-haiku",
+            "claude-fable",
+            "claude-mythos",
+        ]
+        .iter()
+        .any(|t| lower.contains(t))
+    }
+
+    #[test]
+    fn shielded_aliases_break_cli_family_match() {
+        let models = [
+            (
+                "github-copilot",
+                "claude-sonnet-5",
+                "claude-sonnet-5",
+                "Claude Sonnet 5",
+            ),
+            (
+                "github-copilot",
+                "claude-sonnet-5.5",
+                "claude-sonnet-5.5",
+                "Claude Sonnet 5.5",
+            ),
+            (
+                "github-copilot",
+                "claude-opus-4.8",
+                "claude-opus-4.8",
+                "Claude Opus 4.8",
+            ),
+            (
+                "github-copilot",
+                "claude-opus-4.8-fast",
+                "claude-opus-4.8",
+                "Claude Opus 4.8 Fast",
+            ),
+            (
+                "github-copilot",
+                "claude-opus-5",
+                "claude-opus-5",
+                "Claude Opus 5",
+            ),
+            (
+                "github-copilot",
+                "claude-haiku-4.5",
+                "claude-haiku-4.5",
+                "Claude Haiku 4.5",
+            ),
+            (
+                "some-provider",
+                "claude-fable-1",
+                "claude-fable-1",
+                "Claude Fable 1",
+            ),
+            (
+                "some-provider",
+                "claude-mythos-2",
+                "claude-mythos-2",
+                "Claude Mythos 2",
+            ),
+            (
+                "opencode-go",
+                "kimi-k2.7-code",
+                "kimi-k2.7-code",
+                "Kimi K2.7 Code",
+            ),
+        ];
+        let entries: Vec<CatalogEntry> = models
+            .iter()
+            .map(|(p, i, m, n)| test_entry(p, i, m, n))
+            .collect();
+        // Without the shield every family row matches the CLI's rule.
+        let plain = auto_aliases_for(&entries, false, false);
+        assert_eq!(
+            plain
+                .iter()
+                .filter(|a| cli_would_match_family(&a.gateway_id))
+                .count(),
+            8
+        );
+        // With the shield no advertised id matches, every row keeps a unique
+        // id, and refs/display names are untouched for resolution and picker.
+        let shielded = auto_aliases_for(&entries, false, true);
+        assert_eq!(shielded.len(), models.len());
+        for a in &shielded {
+            assert!(!cli_would_match_family(&a.gateway_id), "{}", a.gateway_id);
+            // Discovery still requires the `claude` marker.
+            assert!(a.gateway_id.contains("claude"), "{}", a.gateway_id);
+        }
+        let mut ids: Vec<&str> = shielded.iter().map(|a| a.gateway_id.as_str()).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), models.len());
+        // Same `cs-`/`co-` spelling the manual aliases used.
+        let by_ref = |r: &str| shielded.iter().find(|a| a.opencode_ref == r).unwrap();
+        assert_eq!(
+            by_ref("github-copilot/claude-sonnet-5").gateway_id,
+            "claude-github-copilot-cs-5"
+        );
+        assert_eq!(
+            by_ref("github-copilot/claude-opus-4.8-fast").gateway_id,
+            "claude-github-copilot-co-4-8-fast"
+        );
+        assert_eq!(
+            by_ref("github-copilot/claude-opus-4.8-fast").display_name,
+            "Claude Opus 4.8 Fast (github-copilot)"
+        );
+        // Fast flavors still disambiguate under the shield (same modelID,
+        // distinct id).
+        assert_ne!(
+            by_ref("github-copilot/claude-opus-4.8").gateway_id,
+            by_ref("github-copilot/claude-opus-4.8-fast").gateway_id
+        );
+    }
+
+    #[test]
+    fn shield_composes_with_desktop_evade() {
+        let entries = vec![
+            test_entry(
+                "github-copilot",
+                "claude-sonnet-5",
+                "claude-sonnet-5",
+                "Sonnet",
+            ),
+            test_entry(
+                "opencode-go",
+                "deepseek-v4.1-flash",
+                "deepseek-v4.1-flash",
+                "DeepSeek",
+            ),
+        ];
+        let both = auto_aliases_for(&entries, true, true);
+        assert_eq!(both.len(), 2);
+        let by_ref = |r: &str| both.iter().find(|a| a.opencode_ref == r).unwrap();
+        let copilot = by_ref("github-copilot/claude-sonnet-5");
+        assert!(
+            !cli_would_match_family(&copilot.gateway_id),
+            "{}",
+            copilot.gateway_id
+        );
+        let deepseek = by_ref("opencode-go/deepseek-v4.1-flash");
+        assert!(
+            desktop_would_list(&deepseek.gateway_id),
+            "{}",
+            deepseek.gateway_id
+        );
+        assert_ne!(copilot.gateway_id, deepseek.gateway_id);
     }
 
     #[test]

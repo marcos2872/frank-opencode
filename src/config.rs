@@ -95,6 +95,20 @@ pub struct AppConfig {
     /// Off by default (Claude Code lists every `claude-*` id already).
     #[serde(default)]
     pub desktop_aliases: bool,
+    /// Rewrite auto-generated gateway ids so the Claude Code CLI no longer
+    /// resolves background models (small_fast, family fallbacks) onto
+    /// catalog rows that carry first-party family spelling (`claude-sonnet-*`
+    /// / `claude-opus-*`, plus `haiku`/`fable`/`mythos` for future rows):
+    /// `claude-github-copilot-claude-sonnet-5` is advertised as
+    /// `claude-github-copilot-cs-5`. The CLI canonicalizes discovered ids by
+    /// substring and discards `anthropic_family_tier`, so tiers alone cannot
+    /// cover it. Automatic, like `desktop_aliases`: new providers shipping
+    /// `claude-*` models are shielded without manual `[aliases]`. Only the
+    /// advertised id changes; refs, display names and resolution are
+    /// untouched. On by default; set false to keep the historical
+    /// `claude-<provider>-<model>` spelling.
+    #[serde(default = "default_true")]
+    pub cli_shield_aliases: bool,
     /// Answer Claude Code's auto-mode safety-classifier calls (and its
     /// tiny liveness probes) locally instead of forwarding upstream.
     /// Those auxiliary requests use hardcoded first-party ids
@@ -130,6 +144,10 @@ fn default_port() -> u16 {
     DEFAULT_PORT
 }
 
+fn default_true() -> bool {
+    true
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -142,6 +160,7 @@ impl Default for AppConfig {
             tiers: HashMap::new(),
             include_free_tier: false,
             desktop_aliases: false,
+            cli_shield_aliases: true,
             mock_classifier: false,
             connect_timeout_secs: default_connect_timeout_secs(),
             request_timeout_secs: default_request_timeout_secs(),
@@ -260,6 +279,15 @@ opencode = "opencode-go/kimi-k2.7-code"
         assert!(!off.mock_classifier);
         let on: AppConfig = toml::from_str("mock_classifier = true\n").unwrap();
         assert!(on.mock_classifier);
+    }
+
+    #[test]
+    fn cli_shield_defaults_on_and_parses() {
+        assert!(AppConfig::default().cli_shield_aliases);
+        let missing: AppConfig = toml::from_str("port = 4000\n").unwrap();
+        assert!(missing.cli_shield_aliases);
+        let off: AppConfig = toml::from_str("cli_shield_aliases = false\n").unwrap();
+        assert!(!off.cli_shield_aliases);
     }
 
     #[test]

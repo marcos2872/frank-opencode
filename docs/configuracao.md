@@ -121,7 +121,12 @@ Você escolhe modelos dentro do Claude Code via `/model`, alimentado por
 
 - **Automático:** cada modelo habilitado do OpenCode ganha um alias `claude-<provider>-<model>`
   (o prefixo `claude-` é obrigatório — a descoberta do Claude Code só mantém ids contendo
-  `claude`/`anthropic`). Modelos >= 1M são anunciados como `claude-...[1m]` (único sufixo que
+  `claude`/`anthropic`). Linhas com spelling de família first-party (`claude-sonnet-*`,
+  `claude-opus-*`, mais `haiku`/`fable`/`mythos`) são blindadas por padrão
+  (`cli_shield_aliases = true`): `claude-github-copilot-claude-sonnet-5` é anunciado como
+  `claude-github-copilot-cs-5`, para as chamadas de fundo do CLI não caírem no Copilot —
+  ver [CLI](config-cli.md#blindando-o-copilot-contra-chamadas-de-fundo-ids-blindados).
+  Modelos >= 1M são anunciados como `claude-...[1m]` (único sufixo que
   o Claude lê); use essa forma com sufixo no `settings.json: model` para não aparecer como
   `Custom model` (sem sufixo funciona na API, o gateway remove ao resolver). Linhas com mesmo
   `provider/model` mas `id` distinto (ex. `opus-4.8` vs `opus-4.8-fast`) ganham aliases distintos.

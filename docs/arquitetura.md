@@ -28,6 +28,10 @@ flowchart LR
   `opencode api get /api/model`, incl. `variants`), `protocol_for(package)` →
   protocolo de wire, `auto_alias` (o id do gateway precisa conter
   `claude`/`anthropic` para a descoberta de `/v1/models` do Claude Code),
+  `shield_cli_family_match` (reescrita automática do spelling de família nos
+  ids anunciados — `claude-sonnet` → `cs`, `claude-opus` → `co`, mais
+  `haiku`/`fable`/`mythos` — via `cli_shield_aliases`, default on, para as
+  chamadas de fundo do CLI não caírem nessas linhas),
   `strip_window_suffix` (`[1m]`/`[200k]` hints que o Claude Code anexa a ids desconhecidos).
 - **`infra/opencode.rs`** — estado do OpenCode. Credenciais **somente** da tabela
   `credential` da SQLite (read-only; `auth.json` nunca é fonte de verdade; nunca

@@ -47,7 +47,10 @@ Layers:
   and distinct catalog `id` rows), `protocol_for_entry` → wire protocol (including
   `settings.endpoint` for mixed `github-copilot` catalogs), `auto_alias` (gateway
   id must contain `claude`/`anthropic` for Claude Code's `/v1/models` discovery),
-  optional `desktop_aliases` rewriting for Claude Desktop's denylist, and
+  `shield_cli_family_match` (automatic family-spelling rewrite on advertised ids —
+  `claude-sonnet`→`cs`, `claude-opus`→`co`, plus `haiku`/`fable`/`mythos` — via
+  default-on `cli_shield_aliases`, so CLI background calls stop landing on those
+  rows), optional `desktop_aliases` rewriting for Claude Desktop's denylist, and
   `strip_window_suffix` (`[1m]`/`[200k]` hints Claude Code appends to unknown ids).
 - **`infra/opencode.rs`** — OpenCode state. Credentials ONLY from the SQLite
   `credential` table (read-only; never `auth.json` as source of truth; never
@@ -103,9 +106,11 @@ Layers:
   first `haiku`, then `sonnet`, then `opus` — unmapped aliases announce no tier.
   **Claude Code CLI ignores these**: its discovery cache schema strips to
   `{id, display_name, description}` + window, so it resolves background models
-  by id-substring family spelling (which lands on the Copilot rows). Cover the
-  CLI with renamed `[aliases]` ids instead (README "Blindando o Copilot",
-  `cs-`/`co-` ids) plus `ANTHROPIC_SMALL_FAST_MODEL` in `~/.claude/settings.json`.
+  by id-substring family spelling (which lands on the Copilot rows). The CLI is
+  covered by the automatic `cli_shield_aliases` rewrite instead (default on;
+  docs "Blindando o Copilot", `cs-`/`co-` ids) plus `ANTHROPIC_SMALL_FAST_MODEL`
+  in `~/.claude/settings.json`. Prefer `[tiers]` keys by `provider/model` ref,
+  which survive the automatic renames.
 - **Free-tier**: `opencode/*` models 403 outside OpenCode, so they are hidden
   from `/v1/models` unless `include_free_tier = true`. They use the public key
   from `settings.apiKey` (`upstream_bearer`).
