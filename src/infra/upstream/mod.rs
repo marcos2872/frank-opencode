@@ -9,6 +9,7 @@ pub mod common;
 pub mod responses;
 pub mod shared;
 pub mod sse;
+pub mod sse_pump;
 pub mod tokens;
 pub mod variant;
 

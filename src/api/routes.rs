@@ -5,7 +5,7 @@
 use crate::api::errors::{anthropic_error, gateway_error_response};
 use crate::api::headers::{apply_entry_body, entry_headers, session_headers};
 use crate::api::mock::mock_check_response;
-use crate::api::server::{forward_anthropic, forward_openai, forward_responses};
+use crate::api::forward::{forward_anthropic, forward_openai, forward_responses};
 use crate::api::state::AppState;
 use crate::domain::{
     protocol_for_entry, strip_window_suffix, window_suffix, GatewayError, Protocol,
@@ -329,8 +329,3 @@ async fn messages(
         }
     }
 }
-
-/// Truncate an upstream error body for logs (never log credentials here;
-///
-/// callers only pass status + body, never the bearer).
-/// Message from a Responses `response.failed` event: the upstream reports the

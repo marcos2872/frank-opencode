@@ -1,8 +1,10 @@
 //! API module.
 pub mod catalog;
 pub mod errors;
+pub mod forward;
 pub mod headers;
 pub mod mock;
+pub mod request;
 pub mod resolve;
 pub mod routes;
 pub mod server;
