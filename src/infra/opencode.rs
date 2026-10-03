@@ -12,6 +12,9 @@ use std::path::PathBuf;
 use std::process::Command;
 
 /// Resolve the OpenCode v2 database path without guessing.
+///
+/// Order: `OPENCODE_DB` env → `opencode debug paths db` (channel-aware) →
+/// `XDG_DATA_HOME` default → `dirs::data_dir` default.
 pub fn resolve_db_path(opencode_bin: &str) -> PathBuf {
     // 1. Explicit env (documented override).
     if let Ok(p) = std::env::var("OPENCODE_DB") {
@@ -48,6 +51,13 @@ pub struct CredentialStore {
     pub db_path: PathBuf,
 }
 
+/// Open the credential DB read-only. Single construction site for every
+/// credential read so the flags cannot drift between call sites.
+fn open_ro_conn(db_path: &PathBuf) -> Option<rusqlite::Connection> {
+    rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .ok()
+}
+
 impl CredentialStore {
     pub fn new(db_path: PathBuf) -> Self {
         Self { db_path }
@@ -59,11 +69,7 @@ impl CredentialStore {
     /// v2 stores a JSON envelope `{"type":..,"key":".."}` in `value`,
     /// so unwrap it; fall back to the raw value for forward compatibility.
     pub fn get(&self, integration_id: &str) -> Option<SecretString> {
-        let conn = rusqlite::Connection::open_with_flags(
-            &self.db_path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .ok()?;
+        let conn = open_ro_conn(&self.db_path)?;
         let mut stmt = conn
             .prepare(
                 "SELECT value FROM credential WHERE integration_id = ?1 AND (active = 1 OR active IS NULL) LIMIT 1",
@@ -76,12 +82,9 @@ impl CredentialStore {
     /// List integrations with stored credentials (metadata only, no secrets).
     #[allow(dead_code)]
     pub fn list_integrations(&self) -> Vec<String> {
-        let conn = match rusqlite::Connection::open_with_flags(
-            &self.db_path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        ) {
-            Ok(c) => c,
-            Err(_) => return vec![],
+        let conn = match open_ro_conn(&self.db_path) {
+            Some(c) => c,
+            None => return vec![],
         };
         let mut stmt = match conn.prepare(
             "SELECT DISTINCT integration_id FROM credential WHERE active = 1 OR active IS NULL",

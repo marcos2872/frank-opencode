@@ -98,6 +98,18 @@ pub fn stored_port() -> Option<u16> {
     fs::read_to_string(port_file()).ok()?.trim().parse().ok()
 }
 
+/// Poll `done` every `interval` up to `attempts` times; true when it fires.
+/// Shared by `enable` (wait for health) and `disable` (wait for exit).
+fn wait_for(attempts: u32, interval: std::time::Duration, mut done: impl FnMut() -> bool) -> bool {
+    for _ in 0..attempts {
+        std::thread::sleep(interval);
+        if done() {
+            return true;
+        }
+    }
+    false
+}
+
 /// Open (or create) a log file in append mode with owner-only permissions.
 /// Sibling of [`write_private`] for the daemon log, which must append rather
 /// than truncate; same create-or-tighten 0600 semantics.
@@ -168,21 +180,25 @@ pub fn enable(port: u16, config_arg: Option<PathBuf>) -> anyhow::Result<()> {
     write_private(port_file(), &port.to_string())?;
 
     // Wait for health (catalog now loads in background, so this is fast).
-    for _ in 0..40 {
-        std::thread::sleep(std::time::Duration::from_millis(200));
+    // Stop early if the child dies: no point polling a dead daemon.
+    let mut alive = true;
+    let healthy = wait_for(40, std::time::Duration::from_millis(200), || {
         if gateway_healthy(port) {
-            println!(
-                "frank-opencode enabled on http://127.0.0.1:{port} (pid {})",
-                child.id()
-            );
-            print_next_steps(port);
-            return Ok(());
+            return true;
         }
-        if let Some(pid) = read_pid() {
-            if !pid_alive(pid) {
-                break;
-            }
-        }
+        alive = match read_pid() {
+            Some(pid) => pid_alive(pid),
+            None => false,
+        };
+        !alive
+    });
+    if healthy && alive && gateway_healthy(port) {
+        println!(
+            "frank-opencode enabled on http://127.0.0.1:{port} (pid {})",
+            child.id()
+        );
+        print_next_steps(port);
+        return Ok(());
     }
     anyhow::bail!(
         "daemon did not become healthy; see {}",
@@ -211,12 +227,9 @@ pub fn disable() -> anyhow::Result<()> {
         let _ = Command::new("kill").arg(pid.to_string()).status();
     }
     // Give it a moment, then confirm.
-    for _ in 0..25 {
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        if !pid_alive(pid) {
-            break;
-        }
-    }
+    wait_for(25, std::time::Duration::from_millis(200), || {
+        !pid_alive(pid)
+    });
     if pid_alive(pid) {
         anyhow::bail!("could not stop pid {pid}; kill it manually");
     }
