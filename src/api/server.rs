@@ -662,33 +662,22 @@ async fn proxy_count_tokens(
     // The upstream counts under its own model id, not the gateway alias.
     req_body["model"] = Value::String(entry.model_id.clone());
     let url = join_url(base, "messages/count_tokens");
-    let mut req = s
-        .http
-        .post(&url)
-        .header("content-type", "application/json")
-        .header(
-            "authorization",
-            format!("Bearer {}", bearer.expose_secret()),
-        )
-        .header("x-api-key", bearer.expose_secret().to_string())
-        .header(
-            "anthropic-version",
-            headers
-                .get("anthropic-version")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("2023-06-01"),
-        );
+    // Client-only `anthropic-beta` here (no catalog merge: unlike the
+    // Messages forward, the count proxy never merges fast-mode betas).
+    let mut req = upstream_post(s, &url, &bearer).header(
+        "anthropic-version",
+        headers
+            .get("anthropic-version")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("2023-06-01"),
+    );
     if let Some(beta) = headers.get("anthropic-beta").and_then(|v| v.to_str().ok()) {
         req = req.header("anthropic-beta", beta);
     }
-    for (k, v) in entry_headers(entry) {
-        if !k.eq_ignore_ascii_case("anthropic-beta") {
-            req = req.header(k, v);
-        }
-    }
-    for (k, v) in session_headers(headers) {
-        req = req.header(k, v);
-    }
+    let req = with_session_headers(
+        with_entry_headers_except(req, entry, &["anthropic-beta"]),
+        headers,
+    );
     req_body.as_object_mut().map(|o| o.remove("stream"));
     // Apply the selected variant and the catalog body defaults, so the count
     // matches what the real forward would send (thinking changes the input
@@ -1080,6 +1069,165 @@ fn apply_entry_body(target: &mut Value, entry: &CatalogEntry) {
     }
 }
 
+/// Shared upstream plumbing for the `forward_*` functions and
+/// `proxy_count_tokens`, so a change to auth headers, error mapping or SSE
+/// framing is made once instead of N times. Protocol-specific headers
+/// (Anthropic version/beta) stay in their forward; everything identical across
+/// paths lives here.
+///
+/// Base POST every upstream forward starts from: content-type plus the
+/// bearer credential (both header shapes the backends accept).
+fn upstream_post(
+    s: &AppState,
+    url: &str,
+    bearer: &secrecy::SecretString,
+) -> reqwest::RequestBuilder {
+    s.http
+        .post(url)
+        .header("content-type", "application/json")
+        .header(
+            "authorization",
+            format!("Bearer {}", bearer.expose_secret()),
+        )
+        .header("x-api-key", bearer.expose_secret().to_string())
+}
+
+/// Catalog default headers for this entry (auth excluded: the bearer above
+/// is the credential), skipping any header in `skip` (case-insensitive).
+/// The Anthropic paths handle `anthropic-beta` themselves (client/catalog
+/// merge in the forward, client-only in the count_tokens proxy) and skip it
+/// here; the translated forwards pass no skips.
+fn with_entry_headers_except(
+    req: reqwest::RequestBuilder,
+    entry: &CatalogEntry,
+    skip: &[&str],
+) -> reqwest::RequestBuilder {
+    let mut req = req;
+    for (k, v) in entry_headers(entry) {
+        if skip.iter().any(|s| k.eq_ignore_ascii_case(s)) {
+            continue;
+        }
+        req = req.header(k, v);
+    }
+    req
+}
+
+/// Catalog default headers for this entry (auth excluded: the bearer above
+/// is the credential).
+fn with_entry_headers(
+    req: reqwest::RequestBuilder,
+    entry: &CatalogEntry,
+) -> reqwest::RequestBuilder {
+    with_entry_headers_except(req, entry, &[])
+}
+
+/// Session routing headers for this client (always sent).
+fn with_session_headers(
+    req: reqwest::RequestBuilder,
+    headers: &HeaderMap,
+) -> reqwest::RequestBuilder {
+    let mut req = req;
+    for (k, v) in session_headers(headers) {
+        req = req.header(k, v);
+    }
+    req
+}
+
+/// POST a JSON body; a transport failure is already the gateway error
+/// response (`upstream unreachable`), so callers just early-return it.
+/// The error is boxed: an inline `Response` would trip
+/// `clippy::result_large_err` (a `Response<Body>` is a large variant).
+async fn send_json(
+    req: reqwest::RequestBuilder,
+    body: &Value,
+) -> Result<reqwest::Response, Box<Response>> {
+    match req.json(body).send().await {
+        Ok(r) => Ok(r),
+        Err(e) => Err(Box::new(anthropic_error(
+            StatusCode::BAD_GATEWAY,
+            "api_error",
+            &format!("upstream unreachable: {e}"),
+        ))),
+    }
+}
+
+/// A non-2xx upstream status: log the privacy-safe summary and return the
+/// normalized Anthropic error shape. `summary_body` is whatever the caller
+/// logged before (the Anthropic forward logs its mutated body, the translated
+/// forwards log the original client body).
+fn log_and_map_upstream_error(
+    entry: &CatalogEntry,
+    gateway_model: &str,
+    base: &str,
+    status: StatusCode,
+    text: String,
+    summary_body: &Value,
+    headers: &HeaderMap,
+) -> Response {
+    let summary = request_summary(summary_body);
+    log_upstream_error(entry, gateway_model, base, status, &text, &summary, headers);
+    upstream_error_response(status, &text)
+}
+
+/// Read an upstream JSON body; invalid JSON is already the gateway error.
+/// The error is boxed, same as `send_json` above.
+async fn read_upstream_json(resp: reqwest::Response) -> Result<Value, Box<Response>> {
+    match resp.json().await {
+        Ok(v) => Ok(v),
+        Err(e) => Err(Box::new(anthropic_error(
+            StatusCode::BAD_GATEWAY,
+            "api_error",
+            &format!("invalid upstream JSON: {e}"),
+        ))),
+    }
+}
+
+/// Drain complete lines from the SSE byte buffer, returning the `data:`
+/// payloads. Empty lines, non-`data:` lines and `[DONE]` are skipped, exactly
+/// as each forward did inline before.
+fn drain_sse_payloads(buf: &mut Vec<u8>) -> Vec<String> {
+    let mut out = vec![];
+    while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+        let line: Vec<u8> = buf.drain(..=pos).collect();
+        let text = String::from_utf8_lossy(&line);
+        let t = text.trim();
+        let payload = t.strip_prefix("data:").map(|x| x.trim()).unwrap_or("");
+        if payload.is_empty() || payload == "[DONE]" {
+            continue;
+        }
+        out.push(payload.to_string());
+    }
+    out
+}
+
+/// The empty text-block start both translated streams emit when the upstream
+/// never opened any content, so the stream stays well-formed.
+fn empty_text_block_event() -> String {
+    sse(
+        &serde_json::json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+    )
+}
+
+/// Terminal error event both translated streams emit when the upstream fails
+/// after the stream opened, instead of ending 200 with no explanation.
+fn terminal_error_event(msg: &str) -> String {
+    sse_error("api_error", msg)
+}
+
+/// Final SSE response every streaming forward returns: 200 with heartbeat
+/// pings feeding the client's stream watchdog.
+fn sse_stream_response<S>(out: S) -> Response
+where
+    S: futures::Stream<Item = Result<Vec<u8>, std::io::Error>> + Send + 'static,
+{
+    Response::builder()
+        .status(200)
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
+        .body(Body::from_stream(with_heartbeat(out, HEARTBEAT_IDLE)))
+        .unwrap()
+}
+
 /// Shared context for the three protocol `forward_*` functions: everything
 /// `messages()` resolved that a forward needs. A struct (not 9 positional
 /// args) so a new field doesn't become a tenth parameter.
@@ -1130,25 +1278,16 @@ async fn forward_anthropic(ctx: ForwardCtx<'_>) -> Response {
     apply_entry_body(body, entry);
     // `stream` passthrough stays as the client sent it.
     let url = join_url(base, "messages");
-    let mut req = s
-        .http
-        .post(&url)
-        .header("content-type", "application/json")
-        .header(
-            "authorization",
-            format!("Bearer {}", bearer.expose_secret()),
-        )
-        .header("x-api-key", bearer.expose_secret().to_string())
-        .header(
-            "anthropic-version",
-            headers
-                .get("anthropic-version")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("2023-06-01"),
-        );
+    // Only the Messages API merges catalog betas into the client's
+    // `anthropic-beta` (fast-mode): both are comma-separated lists.
+    let mut req = upstream_post(s, &url, bearer).header(
+        "anthropic-version",
+        headers
+            .get("anthropic-version")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("2023-06-01"),
+    );
     if let Some(beta) = headers.get("anthropic-beta").and_then(|v| v.to_str().ok()) {
-        // Merge client betas with catalog defaults (fast-mode): both are
-        // comma-separated lists.
         let merged = match entry_beta_header(entry) {
             Some(catalog) if !catalog.is_empty() && !beta.contains(&catalog) => {
                 format!("{beta}, {catalog}")
@@ -1159,31 +1298,18 @@ async fn forward_anthropic(ctx: ForwardCtx<'_>) -> Response {
     } else if let Some(catalog) = entry_beta_header(entry) {
         req = req.header("anthropic-beta", catalog);
     }
-    for (k, v) in entry_headers(entry) {
-        if k.eq_ignore_ascii_case("anthropic-beta") {
-            continue; // handled above (merged).
-        }
-        req = req.header(k, v);
-    }
-    for (k, v) in session_headers(headers) {
-        req = req.header(k, v);
-    }
-    let resp = match req.json(&body).send().await {
+    let req = with_session_headers(
+        with_entry_headers_except(req, entry, &["anthropic-beta"]),
+        headers,
+    );
+    let resp = match send_json(req, body).await {
         Ok(r) => r,
-        Err(e) => {
-            return anthropic_error(
-                StatusCode::BAD_GATEWAY,
-                "api_error",
-                &format!("upstream unreachable: {e}"),
-            )
-        }
+        Err(e) => return *e,
     };
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     if !status.is_success() {
         let text = resp.text().await.unwrap_or_default();
-        let summary = request_summary(body);
-        log_upstream_error(entry, gateway_model, base, status, &text, &summary, headers);
-        return upstream_error_response(status, &text);
+        return log_and_map_upstream_error(entry, gateway_model, base, status, text, body, headers);
     }
     if stream {
         // Byte passthrough, but inject `ping` during upstream silence so the
@@ -1193,23 +1319,12 @@ async fn forward_anthropic(ctx: ForwardCtx<'_>) -> Response {
                 .map(|c| c.map(|b| b.to_vec()).map_err(std::io::Error::other)),
             HEARTBEAT_IDLE,
         );
-        Response::builder()
-            .status(200)
-            .header("content-type", "text/event-stream")
-            .header("cache-control", "no-cache")
-            .body(Body::from_stream(stream))
-            .unwrap()
+        sse_stream_response(stream)
     } else {
         // Rewrite `model` to the gateway id for a consistent client view.
-        let mut v: Value = match resp.json().await {
+        let mut v: Value = match read_upstream_json(resp).await {
             Ok(v) => v,
-            Err(e) => {
-                return anthropic_error(
-                    StatusCode::BAD_GATEWAY,
-                    "api_error",
-                    &format!("invalid upstream JSON: {e}"),
-                )
-            }
+            Err(e) => return *e,
         };
         if v.get("model").is_some() {
             v["model"] = Value::String(gateway_model.to_string());
@@ -1242,48 +1357,23 @@ async fn forward_responses(ctx: ForwardCtx<'_>) -> Response {
     };
     apply_entry_body(&mut resp_body, entry);
     let url = join_url(base, "responses");
-    let mut req = s
-        .http
-        .post(&url)
-        .header("content-type", "application/json")
-        .header(
-            "authorization",
-            format!("Bearer {}", bearer.expose_secret()),
-        )
-        .header("x-api-key", bearer.expose_secret().to_string());
-    for (k, v) in entry_headers(entry) {
-        req = req.header(k, v);
-    }
-    for (k, v) in session_headers(headers) {
-        req = req.header(k, v);
-    }
-    let resp = match req.json(&resp_body).send().await {
+    let req = with_session_headers(
+        with_entry_headers(upstream_post(s, &url, bearer), entry),
+        headers,
+    );
+    let resp = match send_json(req, &resp_body).await {
         Ok(r) => r,
-        Err(e) => {
-            return anthropic_error(
-                StatusCode::BAD_GATEWAY,
-                "api_error",
-                &format!("upstream unreachable: {e}"),
-            )
-        }
+        Err(e) => return *e,
     };
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     if !status.is_success() {
         let text = resp.text().await.unwrap_or_default();
-        let summary = request_summary(body);
-        log_upstream_error(entry, gateway_model, base, status, &text, &summary, headers);
-        return upstream_error_response(status, &text);
+        return log_and_map_upstream_error(entry, gateway_model, base, status, text, body, headers);
     }
     if !stream {
-        let v: Value = match resp.json().await {
+        let v: Value = match read_upstream_json(resp).await {
             Ok(v) => v,
-            Err(e) => {
-                return anthropic_error(
-                    StatusCode::BAD_GATEWAY,
-                    "api_error",
-                    &format!("invalid upstream JSON: {e}"),
-                )
-            }
+            Err(e) => return *e,
         };
         if let Some(uid) = v.get("id").and_then(|x| x.as_str()) {
             tracing::debug!(upstream_id = uid, model = gateway_model, "upstream ok");
@@ -1311,13 +1401,8 @@ async fn forward_responses(ctx: ForwardCtx<'_>) -> Response {
                 }
             };
             buf.extend_from_slice(&bytes);
-            while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
-                let line: Vec<u8> = buf.drain(..=pos).collect();
-                let text = String::from_utf8_lossy(&line);
-                let t = text.trim();
-                let payload = t.strip_prefix("data:").map(|x| x.trim()).unwrap_or("");
-                if payload.is_empty() || payload == "[DONE]" { continue; }
-                let Ok(v) = serde_json::from_str::<Value>(payload) else { continue; };
+            for payload in drain_sse_payloads(&mut buf) {
+                let Ok(v) = serde_json::from_str::<Value>(&payload) else { continue; };
                 // Usage + status arrive on response.completed.
                 if let Some(r) = v.get("response") {
                     if let Some(u) = r.get("usage") {
@@ -1345,8 +1430,7 @@ async fn forward_responses(ctx: ForwardCtx<'_>) -> Response {
             }
         }
         if !tr.text_open && !tr.has_tools() {
-            let start = sse(&serde_json::json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}));
-            yield Ok(start.into_bytes());
+            yield Ok(empty_text_block_event().into_bytes());
             tr.text_open = true;
         }
         let reason = if tr.has_tools() {
@@ -1360,16 +1444,10 @@ async fn forward_responses(ctx: ForwardCtx<'_>) -> Response {
             yield Ok::<_, std::io::Error>(line.into_bytes());
         }
         if let Some(msg) = upstream_error {
-            let err = sse_error("api_error", &msg);
-            yield Ok::<_, std::io::Error>(err.into_bytes());
+            yield Ok::<_, std::io::Error>(terminal_error_event(&msg).into_bytes());
         }
     };
-    Response::builder()
-        .status(200)
-        .header("content-type", "text/event-stream")
-        .header("cache-control", "no-cache")
-        .body(Body::from_stream(with_heartbeat(out, HEARTBEAT_IDLE)))
-        .unwrap()
+    sse_stream_response(out)
 }
 
 async fn forward_openai(ctx: ForwardCtx<'_>) -> Response {
@@ -1393,49 +1471,24 @@ async fn forward_openai(ctx: ForwardCtx<'_>) -> Response {
     };
     apply_entry_body(&mut oai_body, entry);
     let url = join_url(base, "chat/completions");
-    let mut req = s
-        .http
-        .post(&url)
-        .header("content-type", "application/json")
-        .header(
-            "authorization",
-            format!("Bearer {}", bearer.expose_secret()),
-        );
     // Some OpenAI-compatible gateways also accept api-key header; harmless to send.
-    req = req.header("x-api-key", bearer.expose_secret().to_string());
-    for (k, v) in entry_headers(entry) {
-        req = req.header(k, v);
-    }
-    for (k, v) in session_headers(headers) {
-        req = req.header(k, v);
-    }
-    let resp = match req.json(&oai_body).send().await {
+    let req = with_session_headers(
+        with_entry_headers(upstream_post(s, &url, bearer), entry),
+        headers,
+    );
+    let resp = match send_json(req, &oai_body).await {
         Ok(r) => r,
-        Err(e) => {
-            return anthropic_error(
-                StatusCode::BAD_GATEWAY,
-                "api_error",
-                &format!("upstream unreachable: {e}"),
-            )
-        }
+        Err(e) => return *e,
     };
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     if !status.is_success() {
         let text = resp.text().await.unwrap_or_default();
-        let summary = request_summary(body);
-        log_upstream_error(entry, gateway_model, base, status, &text, &summary, headers);
-        return upstream_error_response(status, &text);
+        return log_and_map_upstream_error(entry, gateway_model, base, status, text, body, headers);
     }
     if !stream {
-        let v: Value = match resp.json().await {
+        let v: Value = match read_upstream_json(resp).await {
             Ok(v) => v,
-            Err(e) => {
-                return anthropic_error(
-                    StatusCode::BAD_GATEWAY,
-                    "api_error",
-                    &format!("invalid upstream JSON: {e}"),
-                )
-            }
+            Err(e) => return *e,
         };
         if let Some(uid) = v
             .get("choices")
@@ -1471,15 +1524,8 @@ async fn forward_openai(ctx: ForwardCtx<'_>) -> Response {
                 }
             };
             buf.extend_from_slice(&bytes);
-            // Process complete lines.
-            while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
-                let line: Vec<u8> = buf.drain(..=pos).collect();
-                let text = String::from_utf8_lossy(&line);
-                let t = text.trim();
-                let payload = t.strip_prefix("data:").map(|x| x.trim()).unwrap_or("");
-                if payload.is_empty() { continue; }
-                if payload == "[DONE]" { continue; }
-                let Ok(v) = serde_json::from_str::<Value>(payload) else { continue; };
+            for payload in drain_sse_payloads(&mut buf) {
+                let Ok(v) = serde_json::from_str::<Value>(&payload) else { continue; };
                 if let Some(u) = v.get("usage") {
                     if let Some(n) = u.get("prompt_tokens").and_then(Value::as_u64) {
                         input_tokens = n;
@@ -1506,8 +1552,7 @@ async fn forward_openai(ctx: ForwardCtx<'_>) -> Response {
         // open/close an empty one so the stream is well-formed.
         if !tr.text_open && tr.tool_blocks.iter().all(|b| !b.started) {
             // Emit empty text block so Claude Code doesn't see an empty stream.
-            let start = sse(&serde_json::json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}));
-            yield Ok(start.into_bytes());
+            yield Ok(empty_text_block_event().into_bytes());
             tr.text_open = true;
         }
         if tr.tool_blocks.iter().any(|b| b.started) {
@@ -1517,16 +1562,10 @@ async fn forward_openai(ctx: ForwardCtx<'_>) -> Response {
             yield Ok::<_, std::io::Error>(line.into_bytes());
         }
         if let Some(msg) = upstream_error {
-            let err = sse_error("api_error", &msg);
-            yield Ok::<_, std::io::Error>(err.into_bytes());
+            yield Ok::<_, std::io::Error>(terminal_error_event(&msg).into_bytes());
         }
     };
-    Response::builder()
-        .status(200)
-        .header("content-type", "text/event-stream")
-        .header("cache-control", "no-cache")
-        .body(Body::from_stream(with_heartbeat(out, HEARTBEAT_IDLE)))
-        .unwrap()
+    sse_stream_response(out)
 }
 
 #[cfg(test)]
