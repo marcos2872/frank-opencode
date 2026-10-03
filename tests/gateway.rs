@@ -274,6 +274,12 @@ struct MockUpstream {
     /// Emit a streaming Chat response that ends after a partial frame,
     /// mid-SSE. Exercises the stream-failure path.
     chat_stream_truncated: bool,
+    /// Emit a streaming Responses response (SSE text deltas + completed).
+    responses_streaming: bool,
+    /// Answer /chat/completions with this status + raw body instead of 200.
+    chat_error: Option<(u16, String)>,
+    /// Upstream ids seen on `x-claude-code-session-id`.
+    claude_sessions: Arc<Mutex<Vec<String>>>,
 }
 
 async fn note(st: &MockUpstream, headers: &axum::http::HeaderMap, path: &str, body: Value) {
@@ -283,6 +289,12 @@ async fn note(st: &MockUpstream, headers: &axum::http::HeaderMap, path: &str, bo
         .and_then(|v| v.to_str().ok())
     {
         st.sessions.lock().await.push(s.to_string());
+    }
+    if let Some(s) = headers
+        .get("x-claude-code-session-id")
+        .and_then(|v| v.to_str().ok())
+    {
+        st.claude_sessions.lock().await.push(s.to_string());
     }
     st.betas.lock().await.push(
         headers
@@ -304,6 +316,13 @@ async fn mock_chat(
     Json(body): Json<Value>,
 ) -> Response {
     note(&st, &headers, "chat/completions", body).await;
+    if let Some((status, text)) = &st.chat_error {
+        return Response::builder()
+            .status(*status)
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(text.clone()))
+            .unwrap();
+    }
     if st.chat_stream_truncated {
         // A partial SSE frame, a pause so the response headers flush, then a
         // body error: the gateway must surface an error event instead of
@@ -347,6 +366,18 @@ async fn mock_responses(
     Json(body): Json<Value>,
 ) -> Response {
     note(&st, &headers, "responses", body).await;
+    if st.responses_streaming {
+        let sse = concat!(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hel\"}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"lo\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":",
+            "{\"usage\":{\"input_tokens\":3,\"output_tokens\":5}}}\n\n",
+        );
+        return Response::builder()
+            .header("content-type", "text/event-stream")
+            .body(axum::body::Body::from(sse))
+            .unwrap();
+    }
     Json(json!({
         "id": "resp-test",
         "status": "completed",
@@ -1349,4 +1380,297 @@ async fn e2e_mock_real_conversation_still_forwards() {
     let body: Value = resp.json();
     assert_eq!(body["content"][0]["text"], "mock anthropic reply");
     assert_eq!(calls_to(&mock, "messages").await.len(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Characterization (Fase 0): wire details the Fase 3-5 splits must preserve.
+// Do not weaken these without review — a failure here means an accidental
+// behavior change, not a stale test.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn e2e_responses_streaming_translated_to_anthropic_sse() {
+    let mock = MockUpstream {
+        responses_streaming: true,
+        ..MockUpstream::default()
+    };
+    let base = spawn_mock(mock.clone()).await;
+    let state = seeded_state(
+        test_config(),
+        vec![mock_entry(&base, RESPONSES_PKG, "mock-resp")],
+        vec![alias("claude-mock-resp", "opencode/mock-resp")],
+    )
+    .await;
+    let server = axum_test::TestServer::new(router(state)).unwrap();
+    let mut body = msg_body("claude-mock-resp");
+    body["stream"] = Value::Bool(true);
+    let resp = server
+        .post("/v1/messages")
+        .add_header("x-api-key", "test-secret")
+        .json(&body)
+        .await;
+    assert_eq!(resp.status_code(), 200);
+    assert_eq!(
+        resp.header("content-type").to_str().unwrap(),
+        "text/event-stream"
+    );
+    let text = resp.text();
+    assert!(text.contains("message_start"), "{text}");
+    assert!(text.contains("text_delta"), "{text}");
+    assert!(text.contains("hel"), "{text}");
+    assert!(text.contains("lo"), "{text}");
+    assert!(text.contains("message_delta"), "{text}");
+    assert!(text.contains("message_stop"), "{text}");
+    // The translated upstream request carries the stream flag.
+    let calls = calls_to(&mock, "responses").await;
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["stream"], true);
+}
+
+#[tokio::test]
+async fn e2e_anthropic_beta_merges_client_and_catalog() {
+    use std::collections::HashMap;
+    let mock = MockUpstream::default();
+    let base = spawn_mock(mock.clone()).await;
+    let mut e = mock_entry(&base, ANTHROPIC_PKG, "mock-anth");
+    e.headers = Some(HashMap::from([
+        (
+            "anthropic-beta".to_string(),
+            "fast-mode-2026-02-01".to_string(),
+        ),
+        ("x-opencode-org-id".to_string(), "org-123".to_string()),
+    ]));
+    let state = seeded_state(
+        test_config(),
+        vec![e],
+        vec![alias("claude-mock-anth", "opencode/mock-anth")],
+    )
+    .await;
+    let server = axum_test::TestServer::new(router(state)).unwrap();
+    // Client beta + catalog beta merge into one comma-separated header.
+    let resp = server
+        .post("/v1/messages")
+        .add_header("x-api-key", "test-secret")
+        .add_header("anthropic-beta", "client-beta")
+        .json(&msg_body("claude-mock-anth"))
+        .await;
+    assert_eq!(resp.status_code(), 200);
+    // Without a client beta the catalog default still reaches the upstream.
+    let resp = server
+        .post("/v1/messages")
+        .add_header("x-api-key", "test-secret")
+        .json(&msg_body("claude-mock-anth"))
+        .await;
+    assert_eq!(resp.status_code(), 200);
+    let betas = mock.betas.lock().await;
+    assert_eq!(
+        betas.clone(),
+        vec![
+            Some("client-beta, fast-mode-2026-02-01".to_string()),
+            Some("fast-mode-2026-02-01".to_string()),
+        ],
+        "{betas:?}"
+    );
+    // Non-auth catalog headers (e.g. org routing) are forwarded verbatim.
+    let orgs = mock.org_ids.lock().await;
+    assert_eq!(
+        orgs.clone(),
+        vec![Some("org-123".to_string()), Some("org-123".to_string())],
+        "{orgs:?}"
+    );
+}
+
+#[tokio::test]
+async fn e2e_session_headers_forward_claude_and_direct() {
+    let mock = MockUpstream::default();
+    let base = spawn_mock(mock.clone()).await;
+    let state = seeded_state(
+        test_config(),
+        vec![mock_entry(&base, CHAT_PKG, "mock-chat")],
+        vec![alias("claude-mock-chat", "opencode/mock-chat")],
+    )
+    .await;
+    let server = axum_test::TestServer::new(router(state)).unwrap();
+    // Claude Code's native session header is forwarded as-is and reused for
+    // the Go routing header.
+    let resp = server
+        .post("/v1/messages")
+        .add_header("x-api-key", "test-secret")
+        .add_header("x-claude-code-session-id", "sess-abc")
+        .json(&msg_body("claude-mock-chat"))
+        .await;
+    assert_eq!(resp.status_code(), 200);
+    // An explicit Go header wins for routing; the Claude header still passes
+    // through untouched.
+    let resp = server
+        .post("/v1/messages")
+        .add_header("x-api-key", "test-secret")
+        .add_header("x-claude-code-session-id", "sess-claude")
+        .add_header("x-opencode-session", "sess-direct")
+        .json(&msg_body("claude-mock-chat"))
+        .await;
+    assert_eq!(resp.status_code(), 200);
+    assert_eq!(
+        mock.sessions.lock().await.clone(),
+        vec!["sess-abc".to_string(), "sess-direct".to_string()]
+    );
+    assert_eq!(
+        mock.claude_sessions.lock().await.clone(),
+        vec!["sess-abc".to_string(), "sess-claude".to_string()]
+    );
+    // Non-streaming requests carry no stream keys upstream.
+    let calls = calls_to(&mock, "chat/completions").await;
+    assert_eq!(calls.len(), 2);
+    assert!(calls[0].get("stream").is_none());
+}
+
+#[tokio::test]
+async fn e2e_count_tokens_non_anthropic_estimates_locally() {
+    let mock = MockUpstream::default();
+    let base = spawn_mock(mock.clone()).await;
+    let state = seeded_state(
+        test_config(),
+        vec![mock_entry(&base, CHAT_PKG, "mock-chat")],
+        vec![alias("claude-mock-chat", "opencode/mock-chat")],
+    )
+    .await;
+    let server = axum_test::TestServer::new(router(state)).unwrap();
+    // "hello world" = 11 chars -> 2 tokens + 3 per-message overhead.
+    let resp = server
+        .post("/v1/messages/count_tokens")
+        .add_header("x-api-key", "test-secret")
+        .json(&json!({
+            "model": "claude-mock-chat",
+            "messages": [{"role": "user", "content": "hello world"}]
+        }))
+        .await;
+    assert_eq!(resp.status_code(), 200);
+    let body: Value = resp.json();
+    assert_eq!(body["input_tokens"], 5);
+    // The estimate never touches the upstream on translated protocols.
+    assert!(calls_to(&mock, "chat/completions").await.is_empty());
+}
+
+#[tokio::test]
+async fn e2e_upstream_error_shape_preserved() {
+    let mock = MockUpstream {
+        chat_error: Some((
+            400,
+            "{\"error\":{\"message\":\"bad prompt\"}}".to_string(),
+        )),
+        ..MockUpstream::default()
+    };
+    let base = spawn_mock(mock.clone()).await;
+    let state = seeded_state(
+        test_config(),
+        vec![mock_entry(&base, CHAT_PKG, "mock-chat")],
+        vec![alias("claude-mock-chat", "opencode/mock-chat")],
+    )
+    .await;
+    let server = axum_test::TestServer::new(router(state)).unwrap();
+    let resp = server
+        .post("/v1/messages")
+        .add_header("x-api-key", "test-secret")
+        .json(&msg_body("claude-mock-chat"))
+        .await;
+    assert_eq!(resp.status_code(), 400);
+    let body: Value = resp.json();
+    assert_eq!(body["type"], "error");
+    assert_eq!(body["error"]["type"], "invalid_request_error");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("bad prompt"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn e2e_unknown_model_404_shape() {
+    let server =
+        axum_test::TestServer::new(router(seeded_state(test_config(), vec![], vec![]).await))
+            .unwrap();
+    let resp = server
+        .post("/v1/messages")
+        .add_header("x-api-key", "test-secret")
+        .json(&msg_body("nope"))
+        .await;
+    assert_eq!(resp.status_code(), 404);
+    let body: Value = resp.json();
+    assert_eq!(body["type"], "error");
+    assert_eq!(body["error"]["type"], "not_found_error");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("unknown model"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn e2e_anthropic_variant_off_disables_thinking() {
+    let mock = MockUpstream::default();
+    let base = spawn_mock(mock.clone()).await;
+    let mut e = mock_entry(&base, ANTHROPIC_PKG, "mock-anth");
+    e.variants.push(frank_opencode::domain::ModelVariant {
+        id: "off".to_string(),
+        settings: frank_opencode::domain::ModelVariantSettings {
+            thinking: Some(frank_opencode::domain::ThinkingConfig::Typed {
+                kind: "disabled".to_string(),
+                display: None,
+            }),
+            ..Default::default()
+        },
+    });
+    let state = seeded_state(
+        test_config(),
+        vec![e],
+        vec![alias("claude-mock-anth", "opencode/mock-anth")],
+    )
+    .await;
+    let server = axum_test::TestServer::new(router(state)).unwrap();
+    let resp = server
+        .post("/v1/messages")
+        .add_header("x-api-key", "test-secret")
+        .json(&msg_body("claude-mock-anth#off"))
+        .await;
+    assert_eq!(resp.status_code(), 200);
+    let calls = calls_to(&mock, "messages").await;
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["thinking"], json!({"type": "disabled"}));
+}
+
+#[tokio::test]
+async fn e2e_responses_variant_sets_reasoning_and_include() {
+    let mock = MockUpstream::default();
+    let base = spawn_mock(mock.clone()).await;
+    let mut e = mock_entry(&base, RESPONSES_PKG, "mock-resp");
+    e.variants.push(frank_opencode::domain::ModelVariant {
+        id: "high".to_string(),
+        settings: frank_opencode::domain::ModelVariantSettings {
+            reasoning_effort: Some("high".to_string()),
+            include: Some(vec!["reasoning.encrypted_content".to_string()]),
+            ..Default::default()
+        },
+    });
+    let state = seeded_state(
+        test_config(),
+        vec![e],
+        vec![alias("claude-mock-resp", "opencode/mock-resp")],
+    )
+    .await;
+    let server = axum_test::TestServer::new(router(state)).unwrap();
+    let resp = server
+        .post("/v1/messages")
+        .add_header("x-api-key", "test-secret")
+        .json(&msg_body("claude-mock-resp#high"))
+        .await;
+    assert_eq!(resp.status_code(), 200);
+    // The variant lands on the *translated* body, not the raw client body.
+    let calls = calls_to(&mock, "responses").await;
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["reasoning"], json!({"effort": "high"}));
+    assert_eq!(calls[0]["include"], json!(["reasoning.encrypted_content"]));
 }
