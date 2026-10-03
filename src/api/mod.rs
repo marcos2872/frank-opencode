@@ -1,2 +1,9 @@
 //! API module.
+pub mod catalog;
+pub mod errors;
+pub mod headers;
+pub mod mock;
+pub mod resolve;
+pub mod routes;
 pub mod server;
+pub mod state;
