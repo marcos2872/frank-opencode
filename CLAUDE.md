@@ -81,7 +81,9 @@ Layers:
   `connect_timeout` and a generous total `timeout` (`connect_timeout_secs` /
   `request_timeout_secs`), because the total also bounds streaming responses.
   Non-2xx upstream bodies are normalized to the Anthropic error shape
-  (`upstream_error_response`), keeping the raw body only in the log.
+  (`upstream_error_response`), keeping the raw body only in the log — the
+  `upstream rejected request` WARN also records `user_agent` and `session`
+  (`x-claude-code-session-id`) so background callers can be attributed.
 
 ## Conventions & gotchas
 
@@ -99,6 +101,11 @@ Layers:
   on `/v1/models` (`anthropic_family_tier` + `is_family_default`). Key = gateway
   id or `provider/model` ref. Desktop's `small_fast` background class picks the
   first `haiku`, then `sonnet`, then `opus` — unmapped aliases announce no tier.
+  **Claude Code CLI ignores these**: its discovery cache schema strips to
+  `{id, display_name, description}` + window, so it resolves background models
+  by id-substring family spelling (which lands on the Copilot rows). Cover the
+  CLI with renamed `[aliases]` ids instead (README "Blindando o Copilot",
+  `cs-`/`co-` ids) plus `ANTHROPIC_SMALL_FAST_MODEL` in `~/.claude/settings.json`.
 - **Free-tier**: `opencode/*` models 403 outside OpenCode, so they are hidden
   from `/v1/models` unless `include_free_tier = true`. They use the public key
   from `settings.apiKey` (`upstream_bearer`).

@@ -196,6 +196,105 @@ Com o muse-spark como `haiku` + `family_default`, os títulos do Desktop passam
 a ir para ele em vez do Copilot — que continua selecionável no picker para o
 chat intencional.
 
+> **Atenção — tiers valem só para o Desktop.** O CLI do Claude Code
+> **descarta** `anthropic_family_tier` do `/v1/models` (o schema de cache dele
+> guarda só `{id, display_name, description}` e janela; o campo camelCase
+> `anthropicFamilyTier` que ele conhece é da config `models` do
+> managed-settings, não do discovery). Chamadas de fundo do CLI que caem no
+> Copilot não são cobertas por `[tiers]` — veja a seção abaixo.
+
+### Blindando o Copilot contra chamadas de fundo (ids renomeados)
+
+**Sintoma:** `WARN upstream rejected request … status=429 body=quota exceeded`
+com `gateway_model=claude-github-copilot-claude-sonnet-5`, `stream=true`,
+`max_tokens: 64000` e `tools: []`, sem você ter selecionado o Copilot.
+
+**Causa:** o CLI do Claude Code (ao contrário do Desktop) resolve os modelos
+de fundo (small-fast e fallbacks de família haiku→sonnet→opus) **canonicando
+os ids descobertos por substring** — `claude-sonnet-5` / `claude-opus-*`
+dentro do id. As linhas do Copilot são as primeiras em ordem alfabética e
+casam; os tiers não entram nessa conta (o CLI os descarta, ver nota acima). O
+`max_tokens: 64000` é o `max_output_tokens` default do `claude-sonnet-5` no
+catálogo embutido do CLI; `stream=true` + `tools: []` identifica uma *side
+query* (title-gen etc.), não o seu turno principal — esse continua indo para o
+`default_model` com tools e funciona normalmente.
+
+**Correção (opção B):** renomeie os 6 ids do Copilot para que não casem a
+família no spelling. Os ids novos usam `cs` (copilot-sonnet) / `co`
+(copilot-opus); `display_name` e ref ficam iguais, então o picker continua
+legível e a seleção intencional continua funcionando:
+
+```toml
+[aliases."claude-github-copilot-cs-5"]
+opencode = "github-copilot/claude-sonnet-5"
+display_name = "Claude Sonnet 5 (github-copilot)"
+
+[aliases."claude-github-copilot-cs-5-5"]
+opencode = "github-copilot/claude-sonnet-5.5"
+display_name = "Claude Sonnet 5.5 (github-copilot)"
+
+[aliases."claude-github-copilot-co-4-8"]
+opencode = "github-copilot/claude-opus-4.8"
+display_name = "Claude Opus 4.8 (github-copilot)"
+
+[aliases."claude-github-copilot-co-4-8-fast"]
+opencode = "github-copilot/claude-opus-4.8-fast"
+display_name = "Claude Opus 4.8 Fast (github-copilot)"
+
+[aliases."claude-github-copilot-co-5"]
+opencode = "github-copilot/claude-opus-5"
+display_name = "Claude Opus 5 (github-copilot)"
+
+[aliases."claude-github-copilot-co-5-5"]
+opencode = "github-copilot/claude-opus-5.5"
+display_name = "Claude Opus 5.5 (github-copilot)"
+```
+
+Mapeamento antigo → novo:
+
+| id antigo (some do `/v1/models`) | id novo | ref (continua resolvendo) |
+|---|---|---|
+| `claude-github-copilot-claude-sonnet-5` | `claude-github-copilot-cs-5` | `github-copilot/claude-sonnet-5` |
+| `claude-github-copilot-claude-sonnet-5-5` | `claude-github-copilot-cs-5-5` | `github-copilot/claude-sonnet-5.5` |
+| `claude-github-copilot-claude-opus-4-8` | `claude-github-copilot-co-4-8` | `github-copilot/claude-opus-4.8` |
+| `claude-github-copilot-claude-opus-4-8-fast` | `claude-github-copilot-co-4-8-fast` | `github-copilot/claude-opus-4.8-fast` |
+| `claude-github-copilot-claude-opus-5` | `claude-github-copilot-co-5` | `github-copilot/claude-opus-5` |
+| `claude-github-copilot-claude-opus-5-5` | `claude-github-copilot-co-5-5` | `github-copilot/claude-opus-5.5` |
+
+Efeitos:
+
+- os ids antigos somem do `/v1/models` (se um `settings.json: model` antigo
+  referenciar um deles, vira 404 — atualize para o id novo ou para a ref);
+- a **ref direta continua resolvendo** em `POST /v1/messages`
+  (`"model": "github-copilot/claude-sonnet-5"`) — dá para usar o Copilot de
+  propósito sem mudar nada quando a quota voltar;
+- nenhum id descoberto casa mais `claude-sonnet-*`/`claude-opus-*`, então as
+  chamadas de fundo do CLI param de parar no Copilot.
+
+**Complemento (opção C):** fixe o small-fast do CLI no modelo barato, para
+title-gen e afins nunca consultarem a família por fallback. No bloco `env` do
+`~/.claude/settings.json`:
+
+```json
+"ANTHROPIC_SMALL_FAST_MODEL": "claude-opencode-go-muse-spark-1-3-contributor[1m]"
+```
+
+**Observabilidade:** o `WARN upstream rejected request` do gateway loga
+também `user_agent=` e `session=` (`x-claude-code-session-id`). Depois de
+reiniciar, qualquer WARN novo identifica o cliente/fluxo na hora — se ainda
+sobrar chamada indesejada, esses dois campos dizem de onde ela veio.
+
+Verificação depois do restart:
+
+```bash
+curl -s http://127.0.0.1:3737/v1/models | jq -r '.data[].id' | grep copilot
+# deve listar só ...-cs-* / ...-co-* e os gpt/grok/gemini (evadidos), nenhum claude-sonnet/claude-opus
+```
+
+Para reverter: apague o bloco `[aliases]` do config e o
+`ANTHROPIC_SMALL_FAST_MODEL` do settings (backups em `*.bak` ao lado dos
+arquivos) e reinicie.
+
 ## Rodando o Claude Code
 
 ```bash
@@ -374,7 +473,7 @@ checagem de janela para ids desconhecidos, perdendo a conta real de tokens).
 | `Waiting for API response · will retry` (travamentos) | Pausas longas de reasoning sem bytes no stream. O gateway injeta frames `ping` durante o silêncio do upstream; se persistir, cheque `frank.log` por erros do upstream e considere aumentar `API_TIMEOUT_MS`. |
 | Modelo aparece como `Custom model` no `/model` | O picker do Claude Code faz match exato do `id`. Para janelas >= 1M o gateway anuncia `claude-...[1m]`; se seu `settings.json: model` tem a forma sem sufixo (ou vice-versa), funciona na API (o gateway remove o sufixo ao resolver) mas aparece como custom. Reseleciona a forma com `[1m]` no `/model`. |
 | `400 {"model":"X"}` intermitente | Passthrough do upstream Go (ex. indisponibilidade pontual, limite, modelo em rolagem). O gateway agora loga em `frank.log` com `gateway_model/opencode_ref/base_url/status/body` para diagnóstico. Trocar de modelo e voltar costuma resolver; se persistir, reinicie o gateway. |
-| WARN `upstream rejected request` `429 quota exceeded` em `claude-sonnet-5` sem você selecionar esse modelo | Chamadas auxiliares do auto-mode do Claude Code (classificador de segurança com ids hardcoded e probes de disponibilidade) resolvem na linha do Copilot e esbarram na quota. Ligue `mock_classifier = true` no config: o gateway responde as verificações localmente, sem upstream (ver "Mock do classificador do auto-mode"). **No Claude Desktop**, o gerador de títulos (`small_fast`, `max_tokens: 200`, sem `tools`) não é coberto pelo mock — use `[tiers]` com o seu modelo barato como `haiku` + `family_default` (ver "Tiers da família Anthropic"). |
+| WARN `upstream rejected request` `429 quota exceeded` em `claude-sonnet-5` sem você selecionar esse modelo | Três origens distintas, pelo shape do `req` no log: (1) probes/classificador do auto-mode — sem `stream`, `max_tokens` ≤ 4 ou system com `<block>`/`<severity>` — ligue `mock_classifier = true` (ver "Mock do classificador do auto-mode"); (2) títulos do **Claude Desktop** — `stream` ausente, `max_tokens: 200`, sem `tools` — use `[tiers]` com o seu modelo barato como `haiku` + `family_default` (ver "Tiers da família Anthropic"); (3) side queries do **CLI do Claude Code** — `stream=true`, `max_tokens: 64000`, `tools: []` — o CLI ignora os tiers e casa a família por substring no id: renomeie os ids do Copilot (ver "Blindando o Copilot contra chamadas de fundo"). O WARN loga `user_agent=`/`session=` para distinguir as origens. |
 | WARN `upstream rejected request` `400 model_not_supported` num modelo (ex. Copilot) que você não selecionou | Chamada auxiliar sem `"model"` caiu no fallback = primeiro alias alfabético. O `gateway_model` no log é sempre o id que o cliente pediu — o gateway nunca "traduz" um modelo em outro. Fixe `default_model` no config (ver "Modelo padrão"). |
 | `400` "`max_output_tokens` The number must be `>= 16`" ao trocar de modelo no meio do chat | O Claude Code verifica o modelo antes de trocar com um probe `max_tokens: 1`; o backend zen rejeita limites de saída abaixo de 16 em alguns modelos (ex. muse-spark). O gateway agora eleva `max_tokens` < 16 para 16 na tradução — só afeta sondagens (requisições reais usam milhares de tokens). Em sessão vazia não há probe, por isso a troca ali sempre funcionou. |
 | Modelo removido/renomeado no `opencode-go` continua listado | Catálogo é lido só no boot: após `opencode auth` novo ou rolagem de modelos (`opus-4.7` → `opus-4.8`), rode `frank-opencode --disable && frank-opencode --enable`. |

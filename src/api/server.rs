@@ -130,9 +130,13 @@ impl AppState {
             .aliases
             .iter()
             .map(|(gw, a)| {
+                // Window lookup: manual `opencode` may be `qualified()`
+                // (`provider/modelID`) or the preferred ref of an id-distinct
+                // row (`provider/id`, e.g. `.../claude-opus-4.8-fast`) — match
+                // both so fast flavors keep the catalog window (`[1m]`).
                 let window = entries
                     .iter()
-                    .find(|e| e.qualified() == a.opencode)
+                    .find(|e| e.qualified() == a.opencode || e.preferred_ref() == a.opencode)
                     .and_then(|e| e.context_window());
                 let mut alias = AliasEntry {
                     gateway_id: gw.clone(),
@@ -857,7 +861,18 @@ fn log_upstream_error(
     status: StatusCode,
     text: &str,
     req_summary: &serde_json::Value,
+    headers: &HeaderMap,
 ) {
+    // Client identification (no prompt content): which app/CLI sent the
+    // request and from which session — enough to attribute background flows
+    // (title-gen, classifier, probes) that pick a model on their own.
+    let header = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("-")
+            .to_string()
+    };
     tracing::warn!(
         gateway_model = %gateway_model,
         opencode_ref = %entry.qualified(),
@@ -866,6 +881,8 @@ fn log_upstream_error(
         base_url = %base,
         status = status.as_u16(),
         body = %body_preview(text),
+        user_agent = %header("user-agent"),
+        session = %header("x-claude-code-session-id"),
         req = %req_summary,
         "upstream rejected request"
     );
@@ -1140,7 +1157,7 @@ async fn forward_anthropic(
     if !status.is_success() {
         let text = resp.text().await.unwrap_or_default();
         let summary = request_summary(body);
-        log_upstream_error(entry, gateway_model, base, status, &text, &summary);
+        log_upstream_error(entry, gateway_model, base, status, &text, &summary, headers);
         return upstream_error_response(status, &text);
     }
     if stream {
@@ -1229,7 +1246,7 @@ async fn forward_responses(
     if !status.is_success() {
         let text = resp.text().await.unwrap_or_default();
         let summary = request_summary(body);
-        log_upstream_error(entry, gateway_model, base, status, &text, &summary);
+        log_upstream_error(entry, gateway_model, base, status, &text, &summary, headers);
         return upstream_error_response(status, &text);
     }
     if !stream {
@@ -1381,7 +1398,7 @@ async fn forward_openai(
     if !status.is_success() {
         let text = resp.text().await.unwrap_or_default();
         let summary = request_summary(body);
-        log_upstream_error(entry, gateway_model, base, status, &text, &summary);
+        log_upstream_error(entry, gateway_model, base, status, &text, &summary, headers);
         return upstream_error_response(status, &text);
     }
     if !stream {

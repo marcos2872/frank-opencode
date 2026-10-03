@@ -100,6 +100,7 @@ RUST_LOG=trace cargo run -- --serve --port 3737   # tudo, incluindo hyper/reqwes
 RUST_LOG=debug cargo run -- --serve --port 3737   # meio-termo, menos spam que trace
 # só o projeto, sem o barulho das dependências:
 RUST_LOG=frank_opencode=trace cargo run -- --serve --port 3737
+RUST_LOG=frank_opencode=trace cargo run -- --serve --port 3737 2>&1 | tee ./frank-dev.log
 # projeto em trace, dependências em warn:
 RUST_LOG=trace,hyper=warn,reqwest=warn,tokio=warn cargo run -- --serve --port 3737
 ```
