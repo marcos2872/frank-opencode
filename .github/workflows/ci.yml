@@ -13,6 +13,8 @@ concurrency:
 
 permissions:
   contents: read
+  # Publica o resumo do job `test` como comentário na PR.
+  pull-requests: write
 
 env:
   CARGO_INCREMENTAL: "0"
@@ -34,30 +36,41 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
+      # Steps com continue-on-error: todos rodam mesmo quando um falha, para
+      # que o resumo (painel + comentário na PR) saia completo. A falha real é
+      # propagada no step "Propagar falha" lá embaixo — sem ele o job ficaria
+      # verde com tests vermelhos.
       - name: Check formatting
         id: fmt
+        continue-on-error: true
         run: cargo fmt --all --check
 
       - name: Clippy (deny warnings)
         id: clippy
+        continue-on-error: true
         run: cargo clippy --all-targets --locked -- -D warnings
 
       - name: Run full test suite
         id: tests
+        continue-on-error: true
         # `set -o pipefail` so a failing `cargo test` is not masked by the
         # `tee` exit status; the output file feeds the job summary below.
         run: |
           set -o pipefail
           cargo test --locked --all-targets 2>&1 | tee /tmp/test-output.txt
 
-      - name: Job summary
+      - name: Job summary (painel + comentário na PR)
+        # `always()` para o resumo sair mesmo quando algo falha.
         if: always()
         env:
+          GH_TOKEN: ${{ github.token }}
           FMT: ${{ steps.fmt.outcome }}
           CLIPPY: ${{ steps.clippy.outcome }}
           TESTS: ${{ steps.tests.outcome }}
           REF: ${{ github.ref_name }}
           SHA: ${{ github.sha }}
+          # Vazio em push (sem PR) — o comentário só sai quando existir PR.
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           status() {
             case "$1" in
@@ -68,6 +81,7 @@ jobs:
               *) echo "⏭️ ${1:-unknown}" ;;
             esac
           }
+          summary=$(mktemp)
           {
             echo "## Resumo do CI — \`test\`"
             echo ""
@@ -90,7 +104,39 @@ jobs:
               echo "**Testes:** ${passed:-0} passaram · ${failed:-0} falharam · ${ignored:-0} ignorados"
             fi
             echo ""
-          } >> "$GITHUB_STEP_SUMMARY"
+          } > "$summary"
+          cat "$summary" >> "$GITHUB_STEP_SUMMARY"
+
+          # No PR, publica o mesmo resumo como comentário sticky: atualiza o
+          # comentário marcado em vez de acumular um por push. Em PR de fork o
+          # token é read-only e o `gh` falha — warning, não derruba o job.
+          if [ -n "$PR_NUMBER" ]; then
+            marker='<!-- frank-ci-summary -->'
+            comment=$(mktemp)
+            {
+              echo "$marker"
+              cat "$summary"
+              echo "📊 [Ver run completo](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})"
+              echo ""
+            } > "$comment"
+            existing=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
+              --jq '.[] | select(.body | contains("<!-- frank-ci-summary -->")) | .id' 2>/dev/null | head -n1 || true)
+            if [ -n "$existing" ]; then
+              gh api -X PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${existing}" \
+                -F "body=@${comment}" \
+                || echo "::warning::não atualizou o comentário de resumo no PR #${PR_NUMBER}"
+            else
+              gh api -X POST "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
+                -F "body=@${comment}" \
+                || echo "::warning::não criou o comentário de resumo no PR #${PR_NUMBER}"
+            fi
+          fi
+
+      # Só aqui o job falha — os steps acima rodam com continue-on-error para
+      # que o resumo sempre seja publicado (e fmt/clippy/testes todos executem).
+      - name: Propagar falha
+        if: ${{ steps.fmt.outcome == 'failure' || steps.clippy.outcome == 'failure' || steps.tests.outcome == 'failure' }}
+        run: exit 1
 
   # Separate, blocking perf gate. The perf tests also run (report-only) inside
   # `test`; here the release profile enforces the p95 budget. `--test-threads=1`
