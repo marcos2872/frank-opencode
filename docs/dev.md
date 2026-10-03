@@ -76,8 +76,23 @@ Para encarecer o cenário, aumente `FILLER_LINES` em `realistic_body`.
 
 ```bash
 cargo run -- --refresh        # imprime catálogo: N modelos habilitados + aliases do gateway
-RUST_LOG=warn cargo run -- --serve          # servidor em foreground na :3737 (RUST_LOG=debug p/ logs)
+RUST_LOG=warn cargo run -- --serve          # servidor em foreground na :3737
 cargo run -- --serve --port 3739
+```
+
+O `--port` sobrescreve só a porta; o resto (`default_model`, aliases,
+`[disabled]`, ...) continua vindo do `config.toml`, lido no boot.
+
+Níveis de log — `trace` é o "all", do mais ao menos verboso:
+`trace > debug > info > warn > error`:
+
+```bash
+RUST_LOG=trace cargo run -- --serve --port 3737   # tudo, incluindo hyper/reqwest/tokio
+RUST_LOG=debug cargo run -- --serve --port 3737   # meio-termo, menos spam que trace
+# só o projeto, sem o barulho das dependências:
+RUST_LOG=frank_opencode=trace cargo run -- --serve --port 3737
+# projeto em trace, dependências em warn:
+RUST_LOG=trace,hyper=warn,reqwest=warn,tokio=warn cargo run -- --serve --port 3737
 ```
 
 Verificando o servidor:
@@ -85,6 +100,9 @@ Verificando o servidor:
 ```bash
 curl -s http://127.0.0.1:3737/health
 curl -s "http://127.0.0.1:3737/v1/models?limit=1000" | head -c 500
+# fallback de requisição sem "model" (ver README "Modelo padrão"):
+curl -s http://127.0.0.1:3737/health | jq '{default_model, models}'
+curl -s http://127.0.0.1:3737/v1/models | jq -r '.data[0].id'
 ```
 
 ## Resetando o cache do Claude Code (dev)

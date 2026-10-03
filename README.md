@@ -97,6 +97,31 @@ Regras:
 - Trocar o token exige reiniciar (`--disable` + `--enable`); só editar o
   arquivo não afeta o daemon já rodando.
 
+### Modelo padrão (`default_model`)
+
+Quando o cliente POSTa sem `"model"`, o gateway usa o `default_model` do
+`~/.config/frank-opencode/config.toml` — **não** o `model` do
+`~/.claude/settings.json` (um diz o que o gateway usa no fallback, o outro
+o que o Claude pede). Vazio = primeiro alias em ordem alfabética, que hoje
+costuma ser um `claude-github-copilot-...` (`g` < `o`), não o seu modelo de
+chat. Fixe um que funciona:
+
+```toml
+default_model = "claude-opencode-go-muse-spark-1-3-contributor"
+```
+
+Reinicie o gateway (o config é lido no boot) e confira:
+
+```bash
+curl -s http://127.0.0.1:3737/health | jq '{default_model, models}'
+curl -s http://127.0.0.1:3737/v1/models | jq -r '.data[0].id'
+```
+
+Se o `data[0].id` for um modelo do Copilot e o `default_model` estiver
+vazio, qualquer chamada auxiliar sem `model` (probes do Claude, sem `tools`)
+cai nele — é a origem dos `WARN upstream rejected request … 400
+model_not_supported` "fantasmas" mesmo sem você selecionar o Copilot.
+
 ### Timeouts do upstream
 
 O cliente HTTP do gateway separa dois orçamentos (segundos):
@@ -231,9 +256,16 @@ Você escolhe modelos dentro do Claude Code via `/model`, alimentado por `GET /v
   `desktop_aliases = true` — só o id anunciado muda
   (`...-deepseek-...` vira `...-d-eepseek-...`), refs e resolução intactos.
 - **Manual:** `[aliases."<gateway-id>"]` no `config.toml` tem precedência sobre os automáticos;
-  `[disabled]` esconde refs do picker.
+  `[disabled]` esconde refs do picker **sem apagar a linha do catálogo** —
+  o alias some do `/v1/models` e nunca é escolhido como default, mas a ref
+  direta (`provider/model`) continua resolvendo, então dá para usar no chat
+  explicitamente mesmo desabilitado. Com alias desabilitado, use a ref direta
+  (`"model": "github-copilot/claude-haiku-4.5"`), não o alias antigo (vira 404).
 - `POST /v1/messages` também aceita refs diretas (`opencode-go/kimi-k2.7-code`) e
   model ids simples, mesmo fora da lista.
+- **Sem `"model"` na requisição** (probes/chamadas auxiliares): o gateway usa o
+  `default_model` do config (ver "Modelo padrão"), nunca "traduz" um modelo em
+  outro — o `gateway_model` no log é sempre o id que o cliente pediu.
 
 #### Variantes (`#variant`)
 
@@ -302,6 +334,7 @@ checagem de janela para ids desconhecidos, perdendo a conta real de tokens).
 | Modelo aparece como `Custom model` no `/model` | O picker do Claude Code faz match exato do `id`. Para janelas >= 1M o gateway anuncia `claude-...[1m]`; se seu `settings.json: model` tem a forma sem sufixo (ou vice-versa), funciona na API (o gateway remove o sufixo ao resolver) mas aparece como custom. Reseleciona a forma com `[1m]` no `/model`. |
 | `400 {"model":"X"}` intermitente | Passthrough do upstream Go (ex. indisponibilidade pontual, limite, modelo em rolagem). O gateway agora loga em `frank.log` com `gateway_model/opencode_ref/base_url/status/body` para diagnóstico. Trocar de modelo e voltar costuma resolver; se persistir, reinicie o gateway. |
 | WARN `upstream rejected request` `429 quota exceeded` em `claude-sonnet-5` sem você selecionar esse modelo | Chamadas auxiliares do auto-mode do Claude Code (classificador de segurança com ids hardcoded e probes de disponibilidade) resolvem na linha do Copilot e esbarram na quota. Ligue `mock_classifier = true` no config: o gateway responde as verificações localmente, sem upstream (ver "Mock do classificador do auto-mode"). |
+| WARN `upstream rejected request` `400 model_not_supported` num modelo (ex. Copilot) que você não selecionou | Chamada auxiliar sem `"model"` caiu no fallback = primeiro alias alfabético. O `gateway_model` no log é sempre o id que o cliente pediu — o gateway nunca "traduz" um modelo em outro. Fixe `default_model` no config (ver "Modelo padrão"). |
 | `400` "`max_output_tokens` The number must be `>= 16`" ao trocar de modelo no meio do chat | O Claude Code verifica o modelo antes de trocar com um probe `max_tokens: 1`; o backend zen rejeita limites de saída abaixo de 16 em alguns modelos (ex. muse-spark). O gateway agora eleva `max_tokens` < 16 para 16 na tradução — só afeta sondagens (requisições reais usam milhares de tokens). Em sessão vazia não há probe, por isso a troca ali sempre funcionou. |
 | Modelo removido/renomeado no `opencode-go` continua listado | Catálogo é lido só no boot: após `opencode auth` novo ou rolagem de modelos (`opus-4.7` → `opus-4.8`), rode `frank-opencode --disable && frank-opencode --enable`. |
 | `Claude Opus 4.8` vs `Claude Opus 4.8 Fast` | Mesmo `modelID`, `id`/`headers` diferentes (`fast-mode-2026-02-01` + `{"speed":"fast"}`). O gateway agora gera 2 aliases distintos (`...-opus-4-8` e `...-opus-4-8-fast`) e repassa `anthropic-beta`/`speed` do catálogo. |
