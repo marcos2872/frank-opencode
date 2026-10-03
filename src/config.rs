@@ -48,6 +48,18 @@ pub struct AppConfig {
     /// Off by default (Claude Code lists every `claude-*` id already).
     #[serde(default)]
     pub desktop_aliases: bool,
+    /// Answer Claude Code's auto-mode safety-classifier calls (and its
+    /// tiny liveness probes) locally instead of forwarding upstream.
+    /// Those auxiliary requests use hardcoded first-party ids
+    /// (`claude-sonnet-5`, `claude-opus-4-8`) that resolve to whichever
+    /// catalog row carries that model id — out of quota, they log a 429
+    /// WARN on every auto-mode check. When on, the gateway replies the
+    /// "allow" verdict itself and never touches the provider.
+    /// Tradeoff: with the mock on, auto mode's LLM safety review always
+    /// passes; real conversations (tools + a real system prompt) are
+    /// still forwarded normally.
+    #[serde(default)]
+    pub mock_classifier: bool,
     /// TCP/TLS connect timeout for the upstream request, in seconds.
     /// Short so an unreachable provider fails fast.
     #[serde(default = "default_connect_timeout_secs")]
@@ -82,6 +94,7 @@ impl Default for AppConfig {
             disabled: DisabledConfig::default(),
             include_free_tier: false,
             desktop_aliases: false,
+            mock_classifier: false,
             connect_timeout_secs: default_connect_timeout_secs(),
             request_timeout_secs: default_request_timeout_secs(),
         }
@@ -181,5 +194,14 @@ opencode = "opencode-go/kimi-k2.7-code"
             cfg.aliases["claude-sonnet-4-6-frank"].opencode,
             "opencode-go/kimi-k2.7-code"
         );
+    }
+
+    #[test]
+    fn mock_classifier_defaults_off_and_parses() {
+        assert!(!AppConfig::default().mock_classifier);
+        let off: AppConfig = toml::from_str("port = 4000\n").unwrap();
+        assert!(!off.mock_classifier);
+        let on: AppConfig = toml::from_str("mock_classifier = true\n").unwrap();
+        assert!(on.mock_classifier);
     }
 }

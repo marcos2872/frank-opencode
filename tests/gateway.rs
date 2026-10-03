@@ -1220,3 +1220,133 @@ async fn boot_retry_recovers_after_failures() {
         .iter()
         .any(|a| a.gateway_id == "claude-opencode-recovered-model"));
 }
+
+// ---------------------------------------------------------------------------
+// mock_classifier: auto-mode safety checks answered locally, upstream
+// untouched; real conversations still forwarded.
+// ---------------------------------------------------------------------------
+
+fn classifier_config() -> AppConfig {
+    AppConfig {
+        mock_classifier: true,
+        ..test_config()
+    }
+}
+
+/// Stage-1-shaped auto-mode classifier body (observed on the wire:
+/// max_tokens 64, tools [], system as content blocks, no stream).
+fn classifier_body(model: &str) -> Value {
+    json!({
+        "model": model,
+        "max_tokens": 64,
+        "system": [{"type": "text", "text": "Respond with <severity>N</severity> ONLY."}],
+        "messages": [
+            {"role": "user", "content": "action context"},
+            {"role": "user", "content": "more context"},
+        ],
+        "tools": [],
+        "tool_choice": null,
+    })
+}
+
+#[tokio::test]
+async fn e2e_mock_classifier_answered_locally_without_upstream() {
+    let mock = MockUpstream::default();
+    let base = spawn_mock(mock.clone()).await;
+    let state = seeded_state(
+        classifier_config(),
+        vec![mock_entry(&base, ANTHROPIC_PKG, "claude-sonnet-5")],
+        vec![],
+    )
+    .await;
+    let server = axum_test::TestServer::new(router(state)).unwrap();
+    let resp = server
+        .post("/v1/messages")
+        .add_header("x-api-key", "test-secret")
+        .json(&classifier_body("claude-sonnet-5"))
+        .await;
+    assert_eq!(resp.status_code(), 200);
+    let body: Value = resp.json();
+    assert_eq!(body["type"], "message");
+    assert_eq!(body["model"], "claude-sonnet-5");
+    assert_eq!(body["content"][0]["text"], "<severity>0</severity>");
+    assert!(
+        calls_to(&mock, "messages").await.is_empty(),
+        "classifier call must never reach upstream"
+    );
+}
+
+#[tokio::test]
+async fn e2e_mock_probe_answered_locally() {
+    let mock = MockUpstream::default();
+    let base = spawn_mock(mock.clone()).await;
+    // The probe carries the alias id; interception runs before resolve, so
+    // it answers even though no entry/alias exists for it.
+    let state = seeded_state(
+        classifier_config(),
+        vec![mock_entry(&base, ANTHROPIC_PKG, "claude-sonnet-5")],
+        vec![],
+    )
+    .await;
+    let server = axum_test::TestServer::new(router(state)).unwrap();
+    let probe = json!({
+        "model": "claude-github-copilot-claude-sonnet-5",
+        "max_tokens": 1,
+        "messages": [{"role": "user", "content": "x"}],
+    });
+    let resp = server
+        .post("/v1/messages")
+        .add_header("x-api-key", "test-secret")
+        .json(&probe)
+        .await;
+    assert_eq!(resp.status_code(), 200);
+    let body: Value = resp.json();
+    assert_eq!(body["content"][0]["text"], "ok");
+    assert_eq!(body["model"], "claude-github-copilot-claude-sonnet-5");
+    assert!(calls_to(&mock, "messages").await.is_empty());
+}
+
+#[tokio::test]
+async fn e2e_mock_disabled_still_forwards_classifier_body() {
+    let mock = MockUpstream::default();
+    let base = spawn_mock(mock.clone()).await;
+    let state = seeded_state(
+        test_config(), // mock_classifier defaults to false
+        vec![mock_entry(&base, ANTHROPIC_PKG, "claude-sonnet-5")],
+        vec![],
+    )
+    .await;
+    let server = axum_test::TestServer::new(router(state)).unwrap();
+    let resp = server
+        .post("/v1/messages")
+        .add_header("x-api-key", "test-secret")
+        .json(&classifier_body("claude-sonnet-5"))
+        .await;
+    assert_eq!(resp.status_code(), 200);
+    let body: Value = resp.json();
+    assert_eq!(body["content"][0]["text"], "mock anthropic reply");
+    assert_eq!(calls_to(&mock, "messages").await.len(), 1);
+}
+
+#[tokio::test]
+async fn e2e_mock_real_conversation_still_forwards() {
+    let mock = MockUpstream::default();
+    let base = spawn_mock(mock.clone()).await;
+    let state = seeded_state(
+        classifier_config(),
+        vec![mock_entry(&base, ANTHROPIC_PKG, "claude-sonnet-5")],
+        vec![],
+    )
+    .await;
+    let server = axum_test::TestServer::new(router(state)).unwrap();
+    // Real agent turn: tools present → never mocked, even with mock on.
+    let resp = server
+        .post("/v1/messages")
+        .add_header("x-api-key", "test-secret")
+        .json(&msg_body_tools("claude-sonnet-5"))
+        .await;
+    assert_eq!(resp.status_code(), 200);
+    let body: Value = resp.json();
+    assert_eq!(body["content"][0]["text"], "mock anthropic reply");
+    assert_eq!(calls_to(&mock, "messages").await.len(), 1);
+}

@@ -107,6 +107,29 @@ O cliente HTTP do gateway separa dois orçamentos (segundos):
   streaming**. É generoso de propósito: um turno longo com reasoning pode ficar
   aberto vários minutos. Reduza só se quiser cortar sessões presas.
 
+### Mock do classificador do auto-mode (`mock_classifier`)
+
+O Claude Code roda um classificador de segurança de dois estágios no auto-mode,
+com ids auxiliares hardcoded (`claude-sonnet-5`, `claude-opus-4-8`) — além de
+probes de disponibilidade de `max_tokens: 1`. Essas chamadas resolvem no catálogo
+(e.g. a linha do GitHub Copilot) e, sem quota, geram WARN `upstream rejected
+request … 429 quota exceeded` a cada verificação, gastando quota à toa.
+
+Com `mock_classifier = true` o gateway responde essas verificações **localmente**
+(nunca toca o upstream):
+
+- estágio 1 → `<severity>0</severity>` (abaixo do limiar ⇒ libera sem estágio 2);
+- estágio 2 → `<block>no</block>` (resposta começa com `<block>`, como o parser exige);
+- probe de 1 token → `ok`.
+
+A detecção lê só o `system` (marcadores `<severity>`/`<block>`) e exige `tools`
+vazio — conversas reais (que carregam tools e o system prompt do Claude Code)
+continuam encaminhadas normalmente, inclusive no modelo do Copilot selecionado.
+
+> **Tradeoff:** com o mock ativo, a revisão de segurança do auto-mode sempre
+> responde "allow" — equivalente a rodar o auto-mode sem o classificador LLM.
+> As regras de permissão/hooks continuam valendo. Off por padrão.
+
 ## Rodando o Claude Code
 
 ```bash
@@ -278,6 +301,7 @@ checagem de janela para ids desconhecidos, perdendo a conta real de tokens).
 | `Waiting for API response · will retry` (travamentos) | Pausas longas de reasoning sem bytes no stream. O gateway injeta frames `ping` durante o silêncio do upstream; se persistir, cheque `frank.log` por erros do upstream e considere aumentar `API_TIMEOUT_MS`. |
 | Modelo aparece como `Custom model` no `/model` | O picker do Claude Code faz match exato do `id`. Para janelas >= 1M o gateway anuncia `claude-...[1m]`; se seu `settings.json: model` tem a forma sem sufixo (ou vice-versa), funciona na API (o gateway remove o sufixo ao resolver) mas aparece como custom. Reseleciona a forma com `[1m]` no `/model`. |
 | `400 {"model":"X"}` intermitente | Passthrough do upstream Go (ex. indisponibilidade pontual, limite, modelo em rolagem). O gateway agora loga em `frank.log` com `gateway_model/opencode_ref/base_url/status/body` para diagnóstico. Trocar de modelo e voltar costuma resolver; se persistir, reinicie o gateway. |
+| WARN `upstream rejected request` `429 quota exceeded` em `claude-sonnet-5` sem você selecionar esse modelo | Chamadas auxiliares do auto-mode do Claude Code (classificador de segurança com ids hardcoded e probes de disponibilidade) resolvem na linha do Copilot e esbarram na quota. Ligue `mock_classifier = true` no config: o gateway responde as verificações localmente, sem upstream (ver "Mock do classificador do auto-mode"). |
 | `400` "`max_output_tokens` The number must be `>= 16`" ao trocar de modelo no meio do chat | O Claude Code verifica o modelo antes de trocar com um probe `max_tokens: 1`; o backend zen rejeita limites de saída abaixo de 16 em alguns modelos (ex. muse-spark). O gateway agora eleva `max_tokens` < 16 para 16 na tradução — só afeta sondagens (requisições reais usam milhares de tokens). Em sessão vazia não há probe, por isso a troca ali sempre funcionou. |
 | Modelo removido/renomeado no `opencode-go` continua listado | Catálogo é lido só no boot: após `opencode auth` novo ou rolagem de modelos (`opus-4.7` → `opus-4.8`), rode `frank-opencode --disable && frank-opencode --enable`. |
 | `Claude Opus 4.8` vs `Claude Opus 4.8 Fast` | Mesmo `modelID`, `id`/`headers` diferentes (`fast-mode-2026-02-01` + `{"speed":"fast"}`). O gateway agora gera 2 aliases distintos (`...-opus-4-8` e `...-opus-4-8-fast`) e repassa `anthropic-beta`/`speed` do catálogo. |
