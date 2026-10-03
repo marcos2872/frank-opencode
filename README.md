@@ -155,6 +155,47 @@ continuam encaminhadas normalmente, inclusive no modelo do Copilot selecionado.
 > responde "allow" — equivalente a rodar o auto-mode sem o classificador LLM.
 > As regras de permissão/hooks continuam valendo. Off por padrão.
 
+> **Limite conhecido:** o mock só casa o classificador do Claude Code e seus
+> probes. As chamadas de fundo do **Claude Desktop** (título da sessão, `max_tokens: 200`,
+> sem `tools`) usam outro prompt e passam direto — para essas, use os tiers
+> abaixo (`[tiers]`), não o mock.
+
+### Tiers da família Anthropic (`[tiers]`)
+
+O Claude Desktop gera o título de cada conversa em background com a classe
+`small_fast`: ele escolhe o primeiro modelo descoberto com tier `haiku`, senão
+`sonnet`, senão `opus` — e ignora o modelo da sua sessão. Sem tier anunciado,
+o Desktop cai num match por substring no id e resolve no primeiro `*sonnet*`
+alfabético (hoje a linha do Copilot), queimando a quota dele a cada título
+(`WARN upstream rejected request … 429 quota exceeded` com `max_tokens: 200`,
+sem `tools`, sem `stream`).
+
+A tabela `[tiers]` anuncia `anthropic_family_tier` (e `is_family_default` para
+o vencedor do tier) nos itens do `/v1/models`. A chave casa gateway id ou ref
+`provider/model`, como o `[disabled]`:
+
+```toml
+[tiers."claude-opencode-go-muse-spark-1-3-contributor"]
+tier = "haiku"
+family_default = true
+
+[tiers."github-copilot/claude-sonnet-5"]
+tier = "sonnet"
+```
+
+Tiers válidos: `haiku`, `sonnet`, `opus`, `fable`, `mythos` (qualquer outro
+valor é erro de config, como o resto do arquivo). Aliases sem mapeamento não
+anunciam tier — comportamento atual, nada quebra. Reinicie o gateway (config
+lido no boot) e confira:
+
+```bash
+curl -s http://127.0.0.1:3737/v1/models | jq '.data[] | select(.anthropic_family_tier != null) | {id, anthropic_family_tier, is_family_default}'
+```
+
+Com o muse-spark como `haiku` + `family_default`, os títulos do Desktop passam
+a ir para ele em vez do Copilot — que continua selecionável no picker para o
+chat intencional.
+
 ## Rodando o Claude Code
 
 ```bash
@@ -333,7 +374,7 @@ checagem de janela para ids desconhecidos, perdendo a conta real de tokens).
 | `Waiting for API response · will retry` (travamentos) | Pausas longas de reasoning sem bytes no stream. O gateway injeta frames `ping` durante o silêncio do upstream; se persistir, cheque `frank.log` por erros do upstream e considere aumentar `API_TIMEOUT_MS`. |
 | Modelo aparece como `Custom model` no `/model` | O picker do Claude Code faz match exato do `id`. Para janelas >= 1M o gateway anuncia `claude-...[1m]`; se seu `settings.json: model` tem a forma sem sufixo (ou vice-versa), funciona na API (o gateway remove o sufixo ao resolver) mas aparece como custom. Reseleciona a forma com `[1m]` no `/model`. |
 | `400 {"model":"X"}` intermitente | Passthrough do upstream Go (ex. indisponibilidade pontual, limite, modelo em rolagem). O gateway agora loga em `frank.log` com `gateway_model/opencode_ref/base_url/status/body` para diagnóstico. Trocar de modelo e voltar costuma resolver; se persistir, reinicie o gateway. |
-| WARN `upstream rejected request` `429 quota exceeded` em `claude-sonnet-5` sem você selecionar esse modelo | Chamadas auxiliares do auto-mode do Claude Code (classificador de segurança com ids hardcoded e probes de disponibilidade) resolvem na linha do Copilot e esbarram na quota. Ligue `mock_classifier = true` no config: o gateway responde as verificações localmente, sem upstream (ver "Mock do classificador do auto-mode"). |
+| WARN `upstream rejected request` `429 quota exceeded` em `claude-sonnet-5` sem você selecionar esse modelo | Chamadas auxiliares do auto-mode do Claude Code (classificador de segurança com ids hardcoded e probes de disponibilidade) resolvem na linha do Copilot e esbarram na quota. Ligue `mock_classifier = true` no config: o gateway responde as verificações localmente, sem upstream (ver "Mock do classificador do auto-mode"). **No Claude Desktop**, o gerador de títulos (`small_fast`, `max_tokens: 200`, sem `tools`) não é coberto pelo mock — use `[tiers]` com o seu modelo barato como `haiku` + `family_default` (ver "Tiers da família Anthropic"). |
 | WARN `upstream rejected request` `400 model_not_supported` num modelo (ex. Copilot) que você não selecionou | Chamada auxiliar sem `"model"` caiu no fallback = primeiro alias alfabético. O `gateway_model` no log é sempre o id que o cliente pediu — o gateway nunca "traduz" um modelo em outro. Fixe `default_model` no config (ver "Modelo padrão"). |
 | `400` "`max_output_tokens` The number must be `>= 16`" ao trocar de modelo no meio do chat | O Claude Code verifica o modelo antes de trocar com um probe `max_tokens: 1`; o backend zen rejeita limites de saída abaixo de 16 em alguns modelos (ex. muse-spark). O gateway agora eleva `max_tokens` < 16 para 16 na tradução — só afeta sondagens (requisições reais usam milhares de tokens). Em sessão vazia não há probe, por isso a troca ali sempre funcionou. |
 | Modelo removido/renomeado no `opencode-go` continua listado | Catálogo é lido só no boot: após `opencode auth` novo ou rolagem de modelos (`opus-4.7` → `opus-4.8`), rode `frank-opencode --disable && frank-opencode --enable`. |

@@ -335,6 +335,8 @@ fn alias(gateway: &str, opencode_ref: &str) -> AliasEntry {
         display_name: gateway.to_string(),
         description: "perf".to_string(),
         context_window: None,
+        family_tier: None,
+        family_default: false,
     }
 }
 

@@ -227,6 +227,19 @@ pub struct AliasEntry {
     /// is then omitted from the JSON, so clients fall back to their default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u64>,
+    /// Anthropic family tier advertised as `anthropic_family_tier`
+    /// (`haiku`/`sonnet`/`opus`/`fable`/`mythos`), from `[tiers]` config.
+    /// `None` announces no tier (Desktop falls back to id substring match).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub family_tier: Option<String>,
+    /// Winner when several aliases share the tier, advertised as
+    /// `is_family_default` (the Desktop only honors it together with a tier).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub family_default: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !b
 }
 
 /// Upstream wire protocol for a provider package.
@@ -437,6 +450,8 @@ pub fn auto_alias(entry: &CatalogEntry) -> AliasEntry {
         display_name: format!("{} ({})", entry.name, entry.provider_id),
         description: format!("via frank-opencode · {opencode_ref}"),
         context_window: entry.context_window(),
+        family_tier: None,
+        family_default: false,
     }
 }
 
@@ -520,6 +535,8 @@ pub fn auto_aliases_for(entries: &[CatalogEntry], evade: bool) -> Vec<AliasEntry
             display_name: format!("{} ({})", e.name, e.provider_id),
             description: format!("via frank-opencode · {opencode_ref}"),
             context_window: e.context_window(),
+            family_tier: None,
+            family_default: false,
         });
     }
     out.sort_by(|a, b| a.gateway_id.cmp(&b.gateway_id));
@@ -619,6 +636,8 @@ mod tests {
             display_name: "X".into(),
             description: "d".into(),
             context_window: None,
+            family_tier: None,
+            family_default: false,
         };
         assert_eq!(
             serde_json::to_string(&a).unwrap(),

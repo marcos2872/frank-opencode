@@ -93,7 +93,12 @@ Layers:
 - **mock_classifier** (`config.toml`, default `false`): answers Claude Code's
   auto-mode safety-classifier checks and liveness probes locally, before
   `resolve` and only when `!stream` — real conversations (which carry tools)
-  are never matched and still forward.
+  are never matched and still forward. Does NOT cover Claude Desktop's
+  background title calls (different prompt, no `<block>`/`<severity>` tags).
+- **`[tiers]`** (`config.toml`, default empty): Anthropic family tiers announced
+  on `/v1/models` (`anthropic_family_tier` + `is_family_default`). Key = gateway
+  id or `provider/model` ref. Desktop's `small_fast` background class picks the
+  first `haiku`, then `sonnet`, then `opus` — unmapped aliases announce no tier.
 - **Free-tier**: `opencode/*` models 403 outside OpenCode, so they are hidden
   from `/v1/models` unless `include_free_tier = true`. They use the public key
   from `settings.apiKey` (`upstream_bearer`).

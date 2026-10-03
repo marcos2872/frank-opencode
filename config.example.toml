@@ -33,6 +33,21 @@ desktop_aliases = false
 # Tradeoff: with the mock on, auto mode's LLM safety review always passes.
 mock_classifier = false
 
+# Anthropic family tiers advertised on /v1/models (anthropic_family_tier +
+# is_family_default). Key = gateway id or opencode ref (provider/model),
+# matched like [disabled]. Claude Desktop's background calls (session
+# titles, small_fast class) pick the first discovered haiku, then sonnet,
+# then opus — ignoring your chat model. Without a tier it falls back to id
+# substring matching and lands on the first *sonnet* row (usually Copilot),
+# burning its quota on every title (max_tokens 200, no tools). Valid tiers:
+# haiku, sonnet, opus, fable, mythos. Unmapped aliases announce no tier.
+[tiers."claude-opencode-go-muse-spark-1-3-contributor"]
+tier = "haiku"
+family_default = true
+
+# [tiers."github-copilot/claude-sonnet-5"]
+# tier = "sonnet"
+
 # Upstream transport timeouts, in seconds.
 # connect_timeout_secs fails fast when a provider is unreachable.
 # request_timeout_secs bounds the whole request, streaming included, so it is
