@@ -1,4 +1,10 @@
-# frank-opencode no Claude Desktop
+# Configuração no Claude Desktop
+
+[← README](../README.md) · [Configuração](configuracao.md) · [CLI](config-cli.md) ·
+**Desktop** · [Erros](erros.md) · [Dev](dev.md) · [Arquitetura](arquitetura.md)
+
+Como apontar o app **Claude Desktop** para o gateway. As opções do lado do
+gateway (auth, aliases, variantes) estão em [Configuração](configuracao.md).
 
 Rota Linux validada em máquina real (Fedora, porte comunitário
 `claude-desktop-2.16120.0`): managed file + `desktop_aliases` listam os
@@ -65,15 +71,7 @@ mesmos valores acima (provider `Gateway`, `Static API key`, scheme
 `Bearer`). Em builds recentes o toggle pode estar em avatar → Settings →
 Developer Mode.
 
-## Diagnóstico
-
-```bash
-grep -E "managed-settings|gateway|discovery|3p" ~/.config/Claude/logs/main.log | tail -n 20
-# EACCES no managed-settings.json = permissão (precisa 0644 root:root);
-# rejeição de chave = nome/valor inválido (confere a referência oficial)
-```
-
-## Por que só alguns modelos aparecem no picker
+## Modelos visíveis no picker (`desktop_aliases`)
 
 O Desktop valida cada id descoberto no código (`Ro("gateway", id)`): o id
 precisa conter `claude`/`anthropic`/família **e** não conter nenhum token da
@@ -84,8 +82,9 @@ dessa lista caem — sobram os 11 cujos nomes escapam (`opus`, `sonnet`,
 `mai-code`, `hy4`, `muse-spark`, `space-bunny`). Listas explícitas
 (`inferenceModels`) passam pelo mesmo filtro, então não adianta listar lá.
 
-Para listar tudo, ative a evasão no frank. No `~/.config/frank-opencode/config.toml`
-(cria se não existir — o gateway lê no boot, então reinicie depois):
+Para listar tudo, ative a evasão no frank. No
+`~/.config/frank-opencode/config.toml` (cria se não existir — o gateway lê no
+boot, então reinicie depois):
 
 ```toml
 port = 3737
@@ -94,25 +93,21 @@ opencode_bin = "opencode"
 include_free_tier = false
 
 # Fallback de requisições sem "model" (sem ele vale o 1º alias alfabético,
-# hoje um claude-github-copilot-... — ver README "Modelo padrão").
+# hoje um claude-github-copilot-... — ver "Modelo padrão" em configuracao.md).
 default_model = "claude-opencode-go-muse-spark-1-3-contributor"
 
 # Lista todos os modelos no picker do Claude Desktop
 # (reescreve deepseek -> d-eepseek etc. só no id anunciado)
 desktop_aliases = true
-
-# Direciona as chamadas de fundo do Desktop (títulos de sessão, classe
-# small_fast) para o modelo barato em vez do primeiro *sonnet* alfabético
-# (hoje o Copilot). Ver README "Tiers da família Anthropic".
-[tiers."claude-opencode-go-muse-spark-1-3-contributor"]
-tier = "haiku"
-family_default = true
 ```
 
 e reinicie o gateway + o Desktop. Só o id anunciado muda
 (`deepseek` → `d-eepseek`); refs, display names e resolução intactos.
 Trade-off: se a Anthropic ampliar a denylist, novos tokens podem cair de
 novo — o log `Model discovery: N found; picker = M` denuncia na hora.
+
+Demais opções (auth, timeouts, `mock_classifier`, `[aliases]`, `[disabled]`,
+variantes) estão em [Configuração](configuracao.md).
 
 Sobre o fallback: se alguma chamada chegar sem `model`, o gateway usa esse
 `default_model` — sem ele, cai no primeiro alias em ordem alfabética (um
@@ -121,6 +116,50 @@ model_not_supported` no log sem você ter escolhido o Copilot). `[disabled]`
 tira refs do picker; no Desktop o picker é o único jeito de escolher modelo,
 então desabilitado = não selecionável ali (a ref direta `provider/model`
 continua resolvendo para clientes de API como o Claude Code).
+
+## Tiers da família Anthropic
+
+O Claude Desktop gera o título de cada conversa em background com a classe
+`small_fast`: ele escolhe o primeiro modelo descoberto com tier `haiku`, senão
+`sonnet`, senão `opus` — e ignora o modelo da sua sessão. Sem tier anunciado,
+o Desktop cai num match por substring no id e resolve no primeiro `*sonnet*`
+alfabético (hoje a linha do Copilot), queimando a quota dele a cada título
+(`WARN upstream rejected request … 429 quota exceeded` com `max_tokens: 200`,
+sem `tools`, sem `stream`).
+
+A tabela `[tiers]` anuncia `anthropic_family_tier` (e `is_family_default` para
+o vencedor do tier) nos itens do `/v1/models`. A chave casa gateway id ou ref
+`provider/model`, como o `[disabled]`:
+
+```toml
+[tiers."claude-opencode-go-muse-spark-1-3-contributor"]
+tier = "haiku"
+family_default = true
+
+[tiers."github-copilot/claude-sonnet-5"]
+tier = "sonnet"
+```
+
+Tiers válidos: `haiku`, `sonnet`, `opus`, `fable`, `mythos` (qualquer outro
+valor é erro de config, como o resto do arquivo). Aliases sem mapeamento não
+anunciam tier — comportamento atual, nada quebra. Reinicie o gateway (config
+lido no boot) e confira:
+
+```bash
+curl -s http://127.0.0.1:3737/v1/models | jq '.data[] | select(.anthropic_family_tier != null) | {id, anthropic_family_tier, is_family_default}'
+```
+
+Com o muse-spark como `haiku` + `family_default`, os títulos do Desktop passam
+a ir para ele em vez do Copilot — que continua selecionável no picker para o
+chat intencional.
+
+> **Atenção — tiers valem só para o Desktop.** O CLI do Claude Code
+> **descarta** `anthropic_family_tier` do `/v1/models` (o schema de cache dele
+> guarda só `{id, display_name, description}` e janela; o campo camelCase
+> `anthropicFamilyTier` que ele conhece é da config `models` do
+> managed-settings, não do discovery). Chamadas de fundo do CLI que caem no
+> Copilot não são cobertas por `[tiers]` — veja
+> [Blindando o Copilot](config-cli.md#blindando-o-copilot-contra-chamadas-de-fundo-ids-renomeados).
 
 ## Por que deve funcionar
 
@@ -132,6 +171,14 @@ continua resolvendo para clientes de API como o Claude Code).
   até os nomes bloqueados (`deepseek`, `kimi`, ...) listam (validados 51/51).
 - `ping` SSE a cada 20s no frank alimenta o watchdog do Desktop
   (`inferenceStreamIdleTimeoutSec`).
+
+## Diagnóstico
+
+```bash
+grep -E "managed-settings|gateway|discovery|3p" ~/.config/Claude/logs/main.log | tail -n 20
+# EACCES no managed-settings.json = permissão (precisa 0644 root:root);
+# rejeição de chave = nome/valor inválido (confere a referência oficial)
+```
 
 ## Pontos de atenção para o teste
 
@@ -157,3 +204,9 @@ curl -s -X POST http://127.0.0.1:3737/v1/messages \
 # 401 = credencial errada; erro de modelo desconhecido ainda prova
 # que URL + credencial estão OK.
 ```
+
+## Veja também
+
+- [Configuração do gateway](configuracao.md) — `config.toml`, auth, aliases.
+- [Configuração no Claude Code CLI](config-cli.md) — o CLI, que tem armadilhas próprias.
+- [Erros e diagnóstico](erros.md) — 429 de título, permissões do managed file.

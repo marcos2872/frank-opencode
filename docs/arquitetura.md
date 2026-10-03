@@ -1,5 +1,9 @@
 # Arquitetura
 
+[← README](../README.md) · [Configuração](configuracao.md) · [CLI](config-cli.md) ·
+[Desktop](config-desktop.md) · [Erros](erros.md) · [Dev](dev.md) ·
+**Arquitetura**
+
 `frank-opencode` é um gateway local compatível com Anthropic que expõe os
 modelos do OpenCode v2 ao Claude Code. Escuta apenas em `127.0.0.1` e **nunca**
 fala com a Anthropic — o upstream é o backend Go/Console do OpenCode, roteado
@@ -72,7 +76,19 @@ flowchart LR
 - `--disable` envia SIGTERM (drena os streams SSE em andamento) e limpa o estado.
 - `--status` reporta se o daemon está rodando, em qual porta e o session id.
 
+## Limites conhecidos
+
+- `count_tokens` é estimativa local por partes (sem tokenizer BPE): texto ≈ 1 token/4 chars,
+  +overhead por mensagem/tool, imagens base64 pelo tamanho real. Para pacotes Anthropic há proxy
+  para `{baseURL}/messages/count_tokens` (com fallback na estimativa se o upstream falhar).
+- Modelos free-tier `opencode/*` são bloqueados no upstream fora do OpenCode (ocultos por padrão).
+- `frank.log` é só-append: trunque de vez em quando (`: > frank.log`).
+- `--enable` recusa uma `--port` diferente com ele rodando; dê `--disable` antes.
+
 ## Documentação relacionada
 
 - [Desenvolvimento](dev.md) — building, testes, comandos.
-- [Setup no Claude Code](../README.md) — config e uso no dia a dia.
+- [Configuração](configuracao.md) — `config.toml`, aliases e variantes.
+- [Erros e diagnóstico](erros.md) — saúde, logs e sintomas.
+- [Setup no Claude Code CLI](config-cli.md) — config e uso no dia a dia.
+- [Setup no Claude Desktop](config-desktop.md) — o app Desktop.

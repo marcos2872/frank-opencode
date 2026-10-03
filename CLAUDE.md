@@ -125,5 +125,11 @@ Layers:
   load). `/health` stays `starting` until that first load, `degraded` after a
   failure, `ok` otherwise. Tests build a seeded `AppState` and never call the
   real binary.
-- **Docs live in README.md** (Portuguese): config, modelMap/aliases, setup in
-  Claude Code, troubleshooting. Keep it in sync when behavior changes.
+- **Docs are split by audience under `docs/`** (Portuguese): `README.md` is only
+  the project presentation + binary install + links; `docs/configuracao.md`
+  (gateway `config.toml`, auth, aliases, variants), `docs/config-cli.md` (Claude
+  Code CLI setup), `docs/config-desktop.md` (Claude Desktop + `[tiers]`),
+  `docs/erros.md` (health/logs/troubleshooting), `docs/dev.md` (dev, CI,
+  releases) and `docs/arquitetura.md` (layers, MVP limits). Keep them in sync
+  when behavior changes, and preserve the top-of-file nav line and the
+  "Veja também" cross-links between them.

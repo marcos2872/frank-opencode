@@ -1,5 +1,9 @@
 # Desenvolvimento
 
+[← README](../README.md) · [Configuração](configuracao.md) · [CLI](config-cli.md) ·
+[Desktop](config-desktop.md) · [Erros](erros.md) · **Dev** ·
+[Arquitetura](arquitetura.md)
+
 Pré-requisitos: Rust stable, `opencode` v2 logado (`opencode auth login`).
 
 ## Comandos
@@ -110,7 +114,7 @@ Verificando o servidor:
 ```bash
 curl -s http://127.0.0.1:3737/health
 curl -s "http://127.0.0.1:3737/v1/models?limit=1000" | head -c 500
-# fallback de requisição sem "model" (ver README "Modelo padrão"):
+# fallback de requisição sem "model" (ver configuracao.md "Modelo padrão"):
 curl -s http://127.0.0.1:3737/health | jq '{default_model, models}'
 curl -s http://127.0.0.1:3737/v1/models | jq -r '.data[0].id'
 ```
@@ -151,6 +155,16 @@ cargo install --path .
 # depois `frank-opencode` fica no PATH
 ```
 
+## Publicando releases
+
+As releases são publicadas automaticamente por uma **GitHub Action** sempre que
+uma tag `v*` é criada:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0   # a action builda e anexa o binário à release
+```
+
 ## Daemon
 
 ```bash
@@ -166,3 +180,9 @@ Logs: `~/.local/share/frank-opencode/frank.log`.
 - `cargo clippy -- -D warnings` e `cargo fmt --check` precisam ficar limpos (como no CI).
 - Os testes e2e (`tests/gateway.rs`) usam um upstream mock — nunca chamam o binário real nem a rede.
 - O model catalog vem de `opencode api get /api/model`; os testes de servidor usam um `AppState` semeados.
+
+## Veja também
+
+- [Arquitetura](arquitetura.md) — estrutura do código (domínio, infra, API).
+- [Configuração do gateway](configuracao.md) — opções de `config.toml`.
+- [Erros e diagnóstico](erros.md) — sintomas comuns e logs.
