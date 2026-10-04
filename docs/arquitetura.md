@@ -23,30 +23,40 @@ flowchart LR
 
 ## Camadas
 
-- **`domain/`** — tipos e regras puras, sem async. `ModelRef` (provider/model,
-  sufixo `#variant`), `CatalogEntry` (deserializa a saída de
-  `opencode api get /api/model`, incl. `variants`), `protocol_for(package)` →
-  protocolo de wire, `auto_alias` (o id do gateway precisa conter
-  `claude`/`anthropic` para a descoberta de `/v1/models` do Claude Code),
-  `shield_cli_family_match` (reescrita automática do spelling de família nos
+- **`domain/`** — tipos e regras puras, sem async (`mod.rs` só re-exporta).
+  `model.rs` (`ModelRef`: provider/model, sufixo `#variant`), `catalog.rs`
+  (`CatalogEntry` deserializa a saída de `opencode api get /api/model`, incl.
+  `variants`, headers/body por modelo, limites de contexto e linhas de `id`
+  distintas), `protocol.rs` (`protocol_for_entry` → protocolo de wire, incl.
+  `settings.endpoint` para catálogos mistos `github-copilot`), `alias.rs`
+  (`auto_aliases_for` — o id do gateway precisa conter `claude`/`anthropic`
+  para a descoberta de `/v1/models` do Claude Code;
+  `shield_cli_family_match` reescrita automática do spelling de família nos
   ids anunciados — `claude-sonnet` → `cs`, `claude-opus` → `co`, mais
   `haiku`/`fable`/`mythos` — via `cli_shield_aliases`, default on, para as
-  chamadas de fundo do CLI não caírem nessas linhas),
-  `strip_window_suffix` (`[1m]`/`[200k]` hints que o Claude Code anexa a ids desconhecidos).
+  chamadas de fundo do CLI não caírem nessas linhas; reescrita opt-in
+  `desktop_aliases` para a denylist do Desktop; `strip_window_suffix` para os
+  hints `[1m]`/`[200k]` que o Claude Code anexa a ids desconhecidos).
 - **`infra/opencode.rs`** — estado do OpenCode. Credenciais **somente** da tabela
   `credential` da SQLite (read-only; `auth.json` nunca é fonte de verdade; nunca
   parseia `opencode.jsonc`). Catálogo via `opencode api get /api/model`. Caminho
   do DB via `opencode debug paths db`.
-- **`infra/upstream.rs`** — tradutores puros (sem HTTP):
-  - `anthropic_to_openai` / `openai_to_anthropic` (Chat Completions)
-  - `anthropic_to_responses` / `responses_to_anthropic` (Responses API)
-  - `StreamTranslator` / `ResponsesTranslator` (SSE → Anthropic SSE)
-  - `apply_variant` — mescla o `reasoning_effort` da variante selecionada no
-    body **já traduzido** (os tradutores descartam campos desconhecidos). Chave
-    por protocolo: Chat = `reasoning_effort` (labels fora do enum da OpenAI
-    saturam para `high`), Responses = `reasoning`, Anthropic = no-op.
-  - `estimate_tokens` — contagem local por partes para `count_tokens` (sem tokenizer).
-  - `with_heartbeat` — injeta `event: ping` durante o silêncio do upstream.
+- **`infra/upstream/`** — tradutores puros (sem HTTP; `upstream.rs` re-exporta
+  a superfície pública mais `join_url`):
+  - `chat.rs`: `anthropic_to_openai` / `openai_to_anthropic` (Chat Completions)
+  - `responses.rs`: `anthropic_to_responses` / `responses_to_anthropic` (Responses API)
+  - `stream.rs`: `StreamTranslator` / `ResponsesTranslator` (SSE → Anthropic SSE)
+  - `variant.rs`: `apply_variant` — mescla o `reasoning_effort` da variante
+    selecionada no body **já traduzido** (os tradutores descartam campos
+    desconhecidos). Chave por protocolo: Chat = `reasoning_effort` (labels fora
+    do enum da OpenAI saturam para `high`), Responses = `reasoning`, Anthropic
+    = no-op.
+  - `shared.rs` (interno ao crate): `floor_output_tokens` + o shaping
+    compartilhado de imagem/tool-result/body dos dois conversores.
+  - `estimate.rs`: `estimate_tokens` — contagem local por partes para
+    `count_tokens` (sem tokenizer).
+  - `heartbeat.rs`: `with_heartbeat` — injeta `event: ping` durante o silêncio
+    do upstream; `sse` / `sse_error` — frames Anthropic mid-stream.
 - **`api/server.rs`** — handlers Axum. Fluxo do body: resolve model → escolhe o
   forward por `protocol_for` → traduz → aplica variante → forward com o
   `Bearer` da credencial + headers de sessão (`x-opencode-session`, sempre enviado).

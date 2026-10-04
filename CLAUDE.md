@@ -41,41 +41,48 @@ package.
 
 Layers:
 
-- **`domain/`** — pure types and rules, no async. `ModelRef` (provider/model,
-  `#variant` suffix), `CatalogEntry` (deserializes `opencode api get /api/model`
-  output, including `variants`, per-model headers/body defaults, context limits,
-  and distinct catalog `id` rows), `protocol_for_entry` → wire protocol (including
-  `settings.endpoint` for mixed `github-copilot` catalogs), `auto_alias` (gateway
-  id must contain `claude`/`anthropic` for Claude Code's `/v1/models` discovery),
-  `shield_cli_family_match` (automatic family-spelling rewrite on advertised ids —
+- **`domain/`** — pure types and rules, no async (`mod.rs` only re-exports).
+  `model.rs` (`ModelRef`: provider/model, `#variant` suffix), `catalog.rs`
+  (`CatalogEntry` deserializes `opencode api get /api/model` output, including
+  `variants`, per-model headers/body defaults, context limits, and distinct
+  catalog `id` rows), `protocol.rs` (`protocol_for_entry` → wire protocol,
+  including `settings.endpoint` for mixed `github-copilot` catalogs),
+  `alias.rs` (`auto_aliases_for` — gateway id must contain
+  `claude`/`anthropic` for Claude Code's `/v1/models` discovery;
+  `shield_cli_family_match` automatic family-spelling rewrite on advertised ids —
   `claude-sonnet`→`cs`, `claude-opus`→`co`, plus `haiku`/`fable`/`mythos` — via
   default-on `cli_shield_aliases`, so CLI background calls stop landing on those
-  rows), optional `desktop_aliases` rewriting for Claude Desktop's denylist, and
-  `strip_window_suffix` (`[1m]`/`[200k]` hints Claude Code appends to unknown ids).
+  rows; optional `desktop_aliases` rewriting for Claude Desktop's denylist;
+  `strip_window_suffix` for `[1m]`/`[200k]` hints Claude Code appends to unknown ids).
 - **`infra/opencode.rs`** — OpenCode state. Credentials ONLY from the SQLite
   `credential` table (read-only; never `auth.json` as source of truth; never
   parse `opencode.jsonc`). Catalog via `opencode api get /api/model`. DB path
   via `opencode debug paths db`.
-- **`infra/upstream.rs`** — pure translators (no HTTP):
-  - `anthropic_to_openai` / `openai_to_anthropic` (Chat Completions)
-  - `anthropic_to_responses` / `responses_to_anthropic` (Responses API)
-  - `StreamTranslator` / `ResponsesTranslator` (SSE → Anthropic SSE)
-  - `apply_variant` / `apply_variant_checked` — merge the selected variant into
+- **`infra/upstream/`** — pure translators (no HTTP; `upstream.rs` re-exports
+  the public surface plus `join_url`):
+  - `chat.rs`: `anthropic_to_openai` / `openai_to_anthropic` (Chat Completions)
+  - `responses.rs`: `anthropic_to_responses` / `responses_to_anthropic` (Responses API)
+  - `stream.rs`: `StreamTranslator` / `ResponsesTranslator` (SSE → Anthropic SSE)
+  - `variant.rs`: `apply_variant` / `apply_variant_checked` — merge the selected variant into
     the **translated** body (translators drop unknown fields). Key per protocol:
     Chat = `reasoning_effort` (removed for `none`), Responses = `reasoning`
     object + `include`, Anthropic = `thinking` object (`adaptive`/`disabled`)
     from the variant's `thinking`/`effort`. A Messages-API variant with no
     representable field (`reasoningEffort` alone) is a 400, not a silent no-op.
-  - catalog defaults — merge per-model `headers` and `body` fields (for example
-    fast-mode beta headers and `speed`) into forwarded requests.
-  - `floor_output_tokens` — raises `max_tokens` / `max_output_tokens` below 16
-    to 16 on translated protocols (the zen backend rejects smaller output
-    limits; Claude Code probes model switches with `max_tokens: 1`). The
-    Anthropic passthrough path is untouched.
-  - `estimate_tokens` — per-part local count for `count_tokens` (no tokenizer).
-  - `with_heartbeat` — injects `event: ping` during upstream silence.
-  - `sse_error` — Anthropic mid-stream `error` event, used when the upstream
-    stream fails or reports `response.failed` after opening.
+  - `shared.rs` (crate-internal): `floor_output_tokens` — raises `max_tokens` /
+    `max_output_tokens` below 16 to 16 on translated protocols (the zen backend
+    rejects smaller output limits; Claude Code probes model switches with
+    `max_tokens: 1`). The Anthropic passthrough path is untouched — plus the
+    shared image/tool-result/body shaping used by both converters; catalog
+    defaults (per-model `headers` and `body` fields, for example fast-mode
+    beta headers and `speed`) are merged into forwarded requests at the
+    `api/forward` layer.
+  - `estimate.rs`: `estimate_tokens` — per-part local count for `count_tokens`
+    (no tokenizer).
+  - `heartbeat.rs`: `with_heartbeat` — injects `event: ping` during upstream
+    silence; `sse` / `sse_error` — Anthropic mid-stream frames, `sse_error`
+    used when the upstream stream fails or reports `response.failed` after
+    opening.
 - **`api/server.rs`** — Axum handlers. `body` flows: resolve model → pick
   forward by `protocol_for_entry` (catalog `settings.endpoint` can override the
   package for mixed `github-copilot` rows) → translate → merge catalog defaults
