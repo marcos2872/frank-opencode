@@ -16,6 +16,43 @@ pub fn anthropic_to_responses(body: &Value, upstream_model: &str) -> Value {
     // `function_call_output`.
     let mut dropped_tool_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut input: Vec<Value> = vec![];
+    // The zen backend rejects a `role:"user"` item sitting between
+    // `function_call`s and their `function_call_output`s when 2+ calls are
+    // pending (`400 The request contains invalid parameters`) — Claude Code's
+    // mid-turn user injections (`The user sent a new message while you were
+    // working`) land exactly there. System items in the same position are
+    // fine, and 1 pending call passes, but the safe universal rule is: hold
+    // user items back until every seen call has its output, then flush.
+    // (Empirically bisected against opencode-go/muse-spark; chat path unaffected.)
+    let mut pending: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut deferred_user: Vec<Value> = vec![];
+    // User-role message items go after pending outputs when calls are open;
+    // anything else (assistant text, system) stays where the client put it.
+    macro_rules! push_msg {
+        ($item:expr) => {{
+            let item = $item;
+            if pending.is_empty() {
+                input.push(item);
+            } else {
+                deferred_user.push(item);
+            }
+        }};
+    }
+    // Outputs close their call; the first output that empties the pending set
+    // also releases every deferred user item, keeping them after the outputs.
+    macro_rules! extend_outputs {
+        ($outputs:expr) => {{
+            for o in &$outputs {
+                if let Some(id) = o.get("call_id").and_then(Value::as_str) {
+                    pending.remove(id);
+                }
+            }
+            input.extend($outputs);
+            if pending.is_empty() && !deferred_user.is_empty() {
+                input.append(&mut deferred_user);
+            }
+        }};
+    }
     if let Some(msgs) = body.get("messages").and_then(|m| m.as_array()) {
         for m in msgs {
             let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("user");
@@ -26,10 +63,15 @@ pub fn anthropic_to_responses(body: &Value, upstream_model: &str) -> Value {
                     } else {
                         "input_text"
                     };
-                    input.push(serde_json::json!({
+                    let item = serde_json::json!({
                         "role": role,
                         "content": [{"type": kind, "text": s}]
-                    }));
+                    });
+                    if role == "user" {
+                        push_msg!(item);
+                    } else {
+                        input.push(item);
+                    }
                 }
                 Some(Value::Array(blocks)) => {
                     let mut texts: Vec<String> = vec![];
@@ -85,7 +127,7 @@ pub fn anthropic_to_responses(body: &Value, upstream_model: &str) -> Value {
                                 // follow as a user input_image message. The
                                 // ordered input list keeps them in place.
                                 if !nested_images.is_empty() {
-                                    input.push(serde_json::json!({
+                                    push_msg!(serde_json::json!({
                                         "role": "user",
                                         "content": nested_images
                                     }));
@@ -101,8 +143,13 @@ pub fn anthropic_to_responses(body: &Value, upstream_model: &str) -> Value {
                                 "content": [{"type": "output_text", "text": texts.join("\n")}]
                             }));
                         }
+                        for c in &calls {
+                            if let Some(id) = c.get("call_id").and_then(Value::as_str) {
+                                pending.insert(id.to_string());
+                            }
+                        }
                         input.extend(calls);
-                        input.extend(outputs);
+                        extend_outputs!(outputs);
                     } else {
                         if !texts.join("\n").trim().is_empty() || !images.is_empty() {
                             let mut content: Vec<Value> = vec![];
@@ -111,14 +158,19 @@ pub fn anthropic_to_responses(body: &Value, upstream_model: &str) -> Value {
                                 content.push(serde_json::json!({"type": "input_text", "text": t}));
                             }
                             content.extend(images);
-                            input.push(serde_json::json!({"role": "user", "content": content}));
+                            push_msg!(serde_json::json!({"role": "user", "content": content}));
                         }
-                        input.extend(outputs);
+                        extend_outputs!(outputs);
                     }
                 }
                 _ => {}
             }
         }
+    }
+    // Calls that never got an output (orphan) keep user items deferred until
+    // here; release them so the orphan itself is what the backend rejects.
+    if !deferred_user.is_empty() {
+        input.append(&mut deferred_user);
     }
 
     let mut out = serde_json::json!({
@@ -324,5 +376,134 @@ mod tests {
         assert!(!content.iter().any(|c| c["type"] == "thinking"));
         assert_eq!(content[0]["type"], "text");
         assert_eq!(content[0]["text"], "answer");
+    }
+
+    /// Order signature of the translated input: `fc:<name>`, `fco:<call_id>`,
+    /// `role:<role>` — enough to assert interleaving without reading content.
+    fn order_sig(r: &Value) -> Vec<String> {
+        r["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| {
+                let s = |k: &str| i.get(k).and_then(Value::as_str).unwrap_or("?").to_string();
+                match i.get("type").and_then(Value::as_str) {
+                    Some("function_call") => format!("fc:{}", s("name")),
+                    Some("function_call_output") => format!("fco:{}", s("call_id")),
+                    _ => format!("role:{}", s("role")),
+                }
+            })
+            .collect()
+    }
+
+    /// The exact shape the zen backend rejects with `400 invalid parameters`:
+    /// a mid-turn user injection (Claude Code's "user sent a new message
+    /// while you were working") lands between two pending calls and their
+    /// outputs. The user item must be held back until the outputs land.
+    #[test]
+    fn user_text_between_pending_calls_flushes_after_outputs() {
+        let body = serde_json::json!({
+            "model": "x",
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "doing two things"},
+                    {"type": "tool_use", "id": "t1", "name": "TaskCreate", "input": {"subject": "a"}},
+                    {"type": "tool_use", "id": "t2", "name": "Bash", "input": {"command": "ls"}}
+                ]},
+                {"role": "user", "content": "The user sent a new message while you were working: ..."},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": "Task #1 created"},
+                    {"type": "tool_result", "tool_use_id": "t2", "content": "file list"}
+                ]}
+            ],
+            "tools": []
+        });
+        let r = anthropic_to_responses(&body, "upstream");
+        assert_eq!(
+            order_sig(&r),
+            vec![
+                "role:assistant",
+                "fc:TaskCreate",
+                "fc:Bash",
+                "fco:t1",
+                "fco:t2",
+                "role:user",
+            ],
+            "user injection must not sit between pending calls and outputs: {r}"
+        );
+    }
+
+    /// A single user message mixing text with the tool results produces the
+    /// same sandwich inside one translate step — same deferral applies.
+    #[test]
+    fn mixed_user_message_emits_outputs_before_deferred_text() {
+        let body = serde_json::json!({
+            "model": "x",
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "t1", "name": "A", "input": {}},
+                    {"type": "tool_use", "id": "t2", "name": "B", "input": {}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "context injection"},
+                    {"type": "tool_result", "tool_use_id": "t1", "content": "r1"},
+                    {"type": "tool_result", "tool_use_id": "t2", "content": "r2"}
+                ]}
+            ],
+            "tools": []
+        });
+        let r = anthropic_to_responses(&body, "upstream");
+        assert_eq!(
+            order_sig(&r),
+            vec!["fc:A", "fc:B", "fco:t1", "fco:t2", "role:user"],
+            "text of a mixed user message must follow its outputs: {r}"
+        );
+    }
+
+    /// System-role items between pending calls and outputs are accepted by
+    /// the backend (empirically), so they keep their original position.
+    #[test]
+    fn system_items_stay_between_pending_calls_and_outputs() {
+        let body = serde_json::json!({
+            "model": "x",
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "t1", "name": "A", "input": {}},
+                    {"type": "tool_use", "id": "t2", "name": "B", "input": {}}
+                ]},
+                {"role": "system", "content": "env note"},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": "r1"},
+                    {"type": "tool_result", "tool_use_id": "t2", "content": "r2"}
+                ]}
+            ],
+            "tools": []
+        });
+        let r = anthropic_to_responses(&body, "upstream");
+        assert_eq!(
+            order_sig(&r),
+            vec!["fc:A", "fc:B", "role:system", "fco:t1", "fco:t2",],
+            "system items are not deferred: {r}"
+        );
+    }
+
+    /// Without pending calls nothing moves: plain user turns keep order.
+    #[test]
+    fn user_text_without_pending_calls_is_not_reordered() {
+        let body = serde_json::json!({
+            "model": "x",
+            "messages": [
+                {"role": "user", "content": "first"},
+                {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
+                {"role": "user", "content": "second"}
+            ],
+            "tools": []
+        });
+        let r = anthropic_to_responses(&body, "upstream");
+        assert_eq!(
+            order_sig(&r),
+            vec!["role:user", "role:assistant", "role:user"],
+            "no pending calls means no reordering: {r}"
+        );
     }
 }

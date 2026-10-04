@@ -61,7 +61,12 @@ Layers:
 - **`infra/upstream/`** — pure translators (no HTTP; `upstream.rs` re-exports
   the public surface plus `join_url`):
   - `chat.rs`: `anthropic_to_openai` / `openai_to_anthropic` (Chat Completions)
-  - `responses.rs`: `anthropic_to_responses` / `responses_to_anthropic` (Responses API)
+  - `responses.rs`: `anthropic_to_responses` / `responses_to_anthropic` (Responses API).
+    User-role items seen while `function_call`s await their outputs are held
+    back and flushed after the outputs: the opencode-go backend rejects a
+    mid-turn user injection sitting between pending calls and their results
+    (`400 The request contains invalid parameters`). System items in the same
+    spot are accepted and stay put.
   - `stream.rs`: `StreamTranslator` / `ResponsesTranslator` (SSE → Anthropic SSE)
   - `variant.rs`: `apply_variant` / `apply_variant_checked` — merge the selected variant into
     the **translated** body (translators drop unknown fields). Key per protocol:
