@@ -332,6 +332,38 @@ pub(crate) async fn forward_anthropic(ctx: ForwardCtx<'_>) -> Response {
     }
 }
 
+/// TEMP-DEBUG: dump the translated Responses body when
+/// `FRANK_DUMP_RESPONSES_BODY` is set (a directory, or `1` for the system temp
+/// dir). One file per request, never committed. Remove after diagnosing the
+/// compact 400.
+fn dump_translated_body(resp_body: &Value, gateway_model: &str) {
+    let dir = match std::env::var("FRANK_DUMP_RESPONSES_BODY") {
+        Ok(v) if v != "1" && !v.is_empty() => std::path::PathBuf::from(v),
+        Ok(_) => std::env::temp_dir(),
+        Err(_) => return,
+    };
+    let safe_model: String = gateway_model
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '_' })
+        .collect();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let path = dir.join(format!("frank-resp-dump-{nanos}-{safe_model}.json"));
+    match serde_json::to_string_pretty(resp_body) {
+        Ok(text) => match std::fs::write(&path, text) {
+            Ok(()) => {
+                tracing::warn!(path = %path.display(), model = %gateway_model, "dumped translated responses body")
+            }
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "failed to dump translated responses body")
+            }
+        },
+        Err(e) => tracing::warn!(error = %e, "failed to serialize translated responses body"),
+    }
+}
+
 pub(crate) async fn forward_responses(ctx: ForwardCtx<'_>) -> Response {
     let ForwardCtx {
         s,
@@ -352,6 +384,7 @@ pub(crate) async fn forward_responses(ctx: ForwardCtx<'_>) -> Response {
         anthropic_to_responses(body, &entry.model_id)
     };
     apply_entry_body(&mut resp_body, entry);
+    dump_translated_body(&resp_body, gateway_model);
     let url = join_url(base, "responses");
     let req = with_session_headers(
         with_entry_headers(upstream_post(s, &url, bearer), entry),
