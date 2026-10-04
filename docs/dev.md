@@ -119,6 +119,38 @@ curl -s http://127.0.0.1:3737/health | jq '{default_model, models}'
 curl -s http://127.0.0.1:3737/v1/models | jq -r '.data[0].id'
 ```
 
+### Dump do corpo traduzido (Responses)
+
+Quando um upstream rejeita um `/responses` traduzido, o log só tem contagens
+(`request_summary`), nunca o corpo — impossível dizer qual campo quebrou.
+`FRANK_DUMP_RESPONSES_BODY` grava o JSON exato que seria enviado:
+
+```bash
+mkdir -p /tmp/frank-dump
+FRANK_DUMP_RESPONSES_BODY=/tmp/frank-dump \
+  RUST_LOG=frank_opencode=warn cargo run -- --serve --port 3737
+# valor "1" (ou vazio) grava no diretório temporário do sistema
+```
+
+Cada request gera `frank-resp-dump-<nanos>-<modelo>.json` e uma linha
+`dumped translated responses body path=...` (WARN) — cruze pelo horário com
+`upstream rejected request` para achar o corpo que falhou. Com o dump em mãos,
+replay/bisseção contra o upstream:
+
+```bash
+# repro e corte: full | ablate <chave> | front <n> | tailkeep <n> | pick <i,j,...>
+python3 scripts/replay_responses.py <dump.json> full
+```
+
+⚠️ O dump contém o **conteúdo integral do prompt** (diferente do log, que só
+tem contagens). Não commite, não publique; apague após o diagnóstico
+(`rm -rf /tmp/frank-dump`).
+
+Útil para diagnosticar `400 The request contains invalid parameters` — ex.: o
+sintoma que levou à regra de defer em `infra/upstream/responses.rs` (texto de
+usuário entre `function_call`s pendentes e seus outputs era rejeitado pelo
+backend opencode-go).
+
 ## Resetando o cache do Claude Code (dev)
 
 O discovery (`CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1`) busca
